@@ -940,6 +940,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
+    int32_t         n_layer_tgt        = 0;       // extract id == n_layer_tgt -> pre-final-norm state (nextn)
 
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
@@ -1042,14 +1043,27 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
-        // turn on extraction of the target layers' input embeddings
+        // turn on extraction of the target layers' input embeddings; an id equal
+        // to the target's layer count means the pre-final-norm hidden state,
+        // which is captured through the unmasked nextn path instead
+        n_layer_tgt = llama_model_n_layer(model_tgt);
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-            llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
+            if (target_layer_ids[k] == n_layer_tgt) {
+                llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
+            } else {
+                llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
+            }
         }
 
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
-        llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
+        // laguna drafter GGUFs predate dflash.attention.causal and carry only dflash.decoder_arch
+        char decoder_arch[32] = {};
+        const bool is_laguna_drafter =
+            llama_model_meta_val_str(model_dft, "dflash.decoder_arch", decoder_arch, sizeof(decoder_arch)) >= 0 &&
+            strcmp(decoder_arch, "laguna") == 0;
+
+        llama_set_causal_attn(ctx_dft, causal_attn || is_laguna_drafter);
     }
 
     ~common_speculative_impl_draft_dflash() override {
@@ -1138,7 +1152,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // injects them into the K/V cache at the target positions
                 batch_inject.n_tokens = n_chunk;
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                    const float * layer = target_layer_ids[k] == n_layer_tgt
+                        ? llama_get_embeddings_nextn(ctx_tgt)
+                        : llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
                     if (!layer) {
                         GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
                     }
