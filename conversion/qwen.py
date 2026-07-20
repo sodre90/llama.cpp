@@ -704,6 +704,9 @@ class DFlashModel(Qwen3Model):
         if embedding_scale is not None:
             self.gguf_writer.add_embedding_scale(float(embedding_scale))
 
+        block_size = dflash_config.get("block_size", self.hparams.get("block_size", 16))
+        self.gguf_writer.add_block_size(block_size)
+
         target_layer_ids = dflash_config.get("target_layer_ids", [])
         if target_layer_ids:
             extract_layer_ids = [i + 1 for i in target_layer_ids]
