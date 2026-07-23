@@ -1669,6 +1669,7 @@ static void ggml_compute_forward_mul_mat_id(
             }
         }
 
+        ggml_expert_cache_track(src0, matrix_row_counts, n_as);
         // MoE routing observation for the llama expert cache
         {
             void * moe_obs_ud = NULL;
