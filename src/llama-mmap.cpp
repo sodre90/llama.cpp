@@ -4,6 +4,9 @@
 
 #include "ggml.h"
 
+// from ggml-base (ggml/src/ggml-expert-cache.cpp)
+extern "C" void ggml_expert_cache_invalidate(const void * base, size_t size);
+
 #include <cstring>
 #include <climits>
 #include <stdexcept>
@@ -563,6 +566,7 @@ struct llama_mmap::impl {
     }
 
     ~impl() {
+        ggml_expert_cache_invalidate(addr, size);
         for (const auto & frag : mapped_fragments) {
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
                 LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
