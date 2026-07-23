@@ -1634,6 +1634,8 @@ static void ggml_compute_forward_mul_mat_id(
                 matrix_row_counts[i02] += 1;
             }
         }
+
+        ggml_expert_cache_track(src0, matrix_row_counts, n_as);
     }
 
     // reset current_chunk
