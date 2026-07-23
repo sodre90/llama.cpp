@@ -215,7 +215,11 @@ struct expert_cache {
                 continue;
             }
             if ((uintptr_t) st.data >= lo && (uintptr_t) st.data < hi) {
-                backed = path_off > 0 && line[path_off] == '/';
+                // require a live on-disk model file: CUDA host-pinned buffers of
+                // no-mmap models appear as "/dev/zero (deleted)" and must not qualify
+                const char * path = line + path_off;
+                backed = path_off > 0 && path[0] == '/' &&
+                         strstr(path, ".gguf") != NULL && strstr(path, "(deleted)") == NULL;
                 break;
             }
         }
