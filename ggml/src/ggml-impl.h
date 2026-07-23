@@ -360,6 +360,10 @@ GGML_API bool ggml_op_can_inplace(enum ggml_op op);
 GGML_API void * ggml_aligned_malloc(size_t size);
 GGML_API void ggml_aligned_free(void * ptr, size_t size);
 
+// expert-residency cache for CPU-resident MoE expert weights (ggml-expert-cache.cpp)
+GGML_API void ggml_expert_cache_track(const struct ggml_tensor * weights, const int64_t * row_counts, int n_as);
+GGML_API void ggml_expert_cache_invalidate(const void * base, size_t size);
+
 // FP16 <-> FP32
 // ref: https://github.com/Maratyszcza/FP16
 
