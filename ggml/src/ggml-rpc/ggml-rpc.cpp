@@ -5,6 +5,7 @@
 #include "transport.h"
 
 #include <array>
+#include <atomic>
 #include <cinttypes>
 #include <optional>
 #include <string>
@@ -295,9 +296,79 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
     return true;
 }
 
+// Client-side transport accounting, printed at exit when GGML_RPC_STATS is set.
+//
+// A sharded decode is a long chain of small commands, so the question is never how many bytes moved
+// but how much of the token went into waiting. Keep the two apart: send_us is time spent pushing
+// bytes out, wait_us is time blocked in recv before the reply arrives. wait_us on GET_TENSOR is the
+// interesting one, because that is where an all-reduce blocks until the peer has finished computing,
+// so it charges the peer's compute to the transport unless it is read as such. GRAPH_COMPUTE has no
+// reply and so no wait_us, but its send_us absorbs the same thing once the socket buffer fills and
+// the write blocks on a peer that is still busy.
+static const char * RPC_STATS = std::getenv("GGML_RPC_STATS");
+
+struct rpc_cmd_stats {
+    std::atomic<uint64_t> calls;
+    std::atomic<uint64_t> bytes_sent;
+    std::atomic<uint64_t> bytes_recv;
+    std::atomic<uint64_t> send_us;
+    std::atomic<uint64_t> wait_us;
+};
+static rpc_cmd_stats g_rpc_stats[RPC_CMD_COUNT];
+
+static const char * rpc_cmd_name(enum rpc_cmd cmd) {
+    switch (cmd) {
+        case RPC_CMD_ALLOC_BUFFER:      return "alloc_buffer";
+        case RPC_CMD_GET_ALIGNMENT:     return "get_alignment";
+        case RPC_CMD_GET_MAX_SIZE:      return "get_max_size";
+        case RPC_CMD_BUFFER_GET_BASE:   return "buffer_get_base";
+        case RPC_CMD_FREE_BUFFER:       return "free_buffer";
+        case RPC_CMD_BUFFER_CLEAR:      return "buffer_clear";
+        case RPC_CMD_SET_TENSOR:        return "set_tensor";
+        case RPC_CMD_SET_TENSOR_HASH:   return "set_tensor_hash";
+        case RPC_CMD_GET_TENSOR:        return "get_tensor";
+        case RPC_CMD_COPY_TENSOR:       return "copy_tensor";
+        case RPC_CMD_GRAPH_COMPUTE:     return "graph_compute";
+        case RPC_CMD_GET_DEVICE_MEMORY: return "get_device_memory";
+        case RPC_CMD_INIT_TENSOR:       return "init_tensor";
+        case RPC_CMD_GET_ALLOC_SIZE:    return "get_alloc_size";
+        case RPC_CMD_HELLO:             return "hello";
+        case RPC_CMD_DEVICE_COUNT:      return "device_count";
+        case RPC_CMD_GRAPH_RECOMPUTE:   return "graph_recompute";
+        case RPC_CMD_MEMSET_TENSOR:     return "memset_tensor";
+        default:                        return "?";
+    }
+}
+
+static struct rpc_stats_reporter {
+    ~rpc_stats_reporter() {
+        if (!RPC_STATS) {
+            return;
+        }
+        fprintf(stderr, "\nRPC client transport totals\n");
+        fprintf(stderr, "  %-18s %10s %12s %12s %10s %10s\n", "command", "calls", "MiB sent", "MiB recv", "send ms", "wait ms");
+        for (int i = 0; i < RPC_CMD_COUNT; i++) {
+            const uint64_t calls = g_rpc_stats[i].calls.load(std::memory_order_relaxed);
+            if (calls == 0) {
+                continue;
+            }
+            fprintf(stderr, "  %-18s %10" PRIu64 " %12.1f %12.1f %10.1f %10.1f\n", rpc_cmd_name((enum rpc_cmd) i), calls,
+                    g_rpc_stats[i].bytes_sent.load(std::memory_order_relaxed) / 1048576.0,
+                    g_rpc_stats[i].bytes_recv.load(std::memory_order_relaxed) / 1048576.0,
+                    g_rpc_stats[i].send_us.load(std::memory_order_relaxed) / 1000.0,
+                    g_rpc_stats[i].wait_us.load(std::memory_order_relaxed) / 1000.0);
+        }
+    }
+} g_rpc_stats_reporter;
+
+static void rpc_stats_add(std::atomic<uint64_t> & counter, uint64_t value) {
+    counter.fetch_add(value, std::memory_order_relaxed);
+}
+
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // No response
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+    const int64_t t_start = RPC_STATS ? ggml_time_us() : 0;
     uint8_t cmd_byte = cmd;
     if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
         return false;
@@ -308,15 +379,22 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     if (!sock->send_data(input, input_size)) {
         return false;
     }
+    if (RPC_STATS) {
+        rpc_stats_add(g_rpc_stats[cmd].calls, 1);
+        rpc_stats_add(g_rpc_stats[cmd].bytes_sent, input_size + sizeof(cmd_byte) + sizeof(input_size));
+        rpc_stats_add(g_rpc_stats[cmd].send_us, ggml_time_us() - t_start);
+    }
     return true;
 }
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
+// Accounting note: the send half is already charged by the call above, this only adds the wait.
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
     if (!send_rpc_cmd(sock, cmd, input, input_size)) {
         return false;
     }
+    const int64_t t_start = RPC_STATS ? ggml_time_us() : 0;
     uint64_t out_size;
     if (!sock->recv_data(&out_size, sizeof(out_size))) {
         return false;
@@ -326,6 +404,10 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     }
     if (!sock->recv_data(output, output_size)) {
         return false;
+    }
+    if (RPC_STATS) {
+        rpc_stats_add(g_rpc_stats[cmd].bytes_recv, output_size + sizeof(out_size));
+        rpc_stats_add(g_rpc_stats[cmd].wait_us, ggml_time_us() - t_start);
     }
     return true;
 }
