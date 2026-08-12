@@ -174,6 +174,7 @@ struct rpc_server_params {
     int                      port        = 50052;
     bool                     use_cache   = false;
     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
+    uint32_t                 poll        = 50;
     std::vector<std::string> devices;
 };
 
@@ -182,6 +183,9 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "options:\n");
     fprintf(stderr, "  -h, --help                       show this help message and exit\n");
     fprintf(stderr, "  -t, --threads N                  number of threads for the CPU device (default: %d)\n", params.n_threads);
+    fprintf(stderr, "      --poll N                     0-100, how hard idle threads spin before sleeping (default: %u).\n", params.poll);
+    fprintf(stderr, "                                   Use 0 when several servers share a host, so a waiting shard\n");
+    fprintf(stderr, "                                   does not burn the cores the other one is computing on.\n");
     fprintf(stderr, "  -d, --device <dev1,dev2,...>     comma-separated list of devices\n");
     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
@@ -207,6 +211,16 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
                 fprintf(stderr, "error: invalid number of threads: %d\n", params.n_threads);
                 return false;
             }
+        } else if (arg == "--poll") {
+            if (++i >= argc) {
+                return false;
+            }
+            const int poll = std::stoi(argv[i]);
+            if (poll < 0 || poll > 100) {
+                fprintf(stderr, "error: invalid polling level: %d\n", poll);
+                return false;
+            }
+            params.poll = (uint32_t) poll;
         } else if (arg == "-d" || arg == "--device") {
             if (++i >= argc) {
                 return false;
@@ -337,6 +351,6 @@ int main(int argc, char * argv[]) {
         return 1;
     }
 
-    start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data());
+    start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, params.poll, devices.size(), devices.data());
     return 0;
 }

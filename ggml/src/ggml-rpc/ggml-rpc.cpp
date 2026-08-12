@@ -1782,19 +1782,44 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     }
 }
 
+// A backend whose graph_compute gets a NULL threadpool builds a disposable one per call and tears it
+// down again, so every graph costs a full round of pthread create/join. One client graph per token
+// hides that, but a tensor-parallel client sends one graph per all-reduce boundary plus a one-node
+// reduction graph between each pair, which turns it into hundreds of rounds per token.
+static void ggml_backend_rpc_attach_threadpool(ggml_backend_reg_t reg, ggml_backend_t backend,
+                                               size_t n_threads, uint32_t poll,
+                                               std::vector<ggml_threadpool_t> & threadpools) {
+    auto threadpool_new_fn  = (ggml_threadpool_t (*)(ggml_threadpool_params *)) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
+    auto set_threadpool_fn  = (void (*)(ggml_backend_t, ggml_threadpool_t))     ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+    if (!threadpool_new_fn || !set_threadpool_fn) {
+        return;
+    }
+    ggml_threadpool_params tpp = ggml_threadpool_params_default((int) n_threads);
+    tpp.poll = poll;
+    ggml_threadpool_t threadpool = threadpool_new_fn(&tpp);
+    if (threadpool == nullptr) {
+        return;
+    }
+    set_threadpool_fn(backend, threadpool);
+    threadpools.push_back(threadpool);
+}
+
 void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
-                                   size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
+                                   size_t n_threads, uint32_t poll,
+                                   size_t n_devices, ggml_backend_dev_t * devices) {
     if (n_devices == 0 || devices == nullptr) {
         fprintf(stderr, "Invalid arguments to ggml_backend_rpc_start_server\n");
         return;
     }
-    std::vector<ggml_backend_t> backends;
+    std::vector<ggml_backend_t>    backends;
+    std::vector<ggml_threadpool_t> threadpools;
     printf("Starting RPC server v%d.%d.%d\n",
         RPC_PROTO_MAJOR_VERSION,
         RPC_PROTO_MINOR_VERSION,
         RPC_PROTO_PATCH_VERSION);
     printf("  endpoint       : %s\n", endpoint);
     printf("  local cache    : %s\n", cache_dir ? cache_dir : "n/a");
+    printf("  threads / poll : %zu / %u\n", n_threads, poll);
     printf("Devices:\n");
     for (size_t i = 0; i < n_devices; i++) {
         auto dev = devices[i];
@@ -1814,6 +1839,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
             if (ggml_backend_set_n_threads_fn) {
                 ggml_backend_set_n_threads_fn(backend, n_threads);
             }
+            ggml_backend_rpc_attach_threadpool(reg, backend, n_threads, poll, threadpools);
         }
     }
 
@@ -1852,6 +1878,13 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
     rpc_transport_shutdown();
     for (auto backend : backends) {
         ggml_backend_free(backend);
+    }
+    ggml_backend_reg_t cpu_reg = ggml_backend_reg_by_name("CPU");
+    auto threadpool_free_fn = cpu_reg ? (void (*)(ggml_threadpool_t)) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_threadpool_free") : nullptr;
+    for (auto threadpool : threadpools) {
+        if (threadpool_free_fn) {
+            threadpool_free_fn(threadpool);
+        }
     }
 }
 
