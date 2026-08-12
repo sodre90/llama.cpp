@@ -747,6 +747,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_flash_attn_ext = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // MLA compresses K and V into one latent head, so there is no head dimension to divide
+        // between devices. Attention is mirrored instead, and so is its result.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            GGML_ASSERT(                             src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(                             src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
         GGML_ASSERT(                             src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
         GGML_ASSERT(                             src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2);
         GGML_ASSERT(                             src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2);
@@ -988,7 +997,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_DSV4_HC_COMB:
             case GGML_OP_DSV4_HC_PRE:
-            case GGML_OP_DSV4_HC_POST: {
+            case GGML_OP_DSV4_HC_POST:
+            case GGML_OP_LIGHTNING_INDEXER: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
             case GGML_OP_UNARY: {
@@ -1469,6 +1479,29 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     }
 }
 
+static void ggml_backend_meta_buffer_memset_tensor(
+        ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
+    const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ true);
+
+    // A mirrored tensor is the same on every device, so one byte range applies to all of them.
+    // A split tensor only has a device-independent byte range if it is the whole tensor.
+    const bool whole = offset == 0 && size == ggml_nbytes(tensor);
+    GGML_ASSERT(split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || whole);
+
+    for (size_t i = 0; i < n_bufs; i++) {
+        ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, i);
+        if (simple_tensor == nullptr) {
+            continue;
+        }
+        const size_t simple_size = whole ? ggml_nbytes(simple_tensor) : size;
+        if (simple_size == 0) {
+            continue;
+        }
+        ggml_backend_tensor_memset(simple_tensor, value, whole ? 0 : offset, simple_size);
+    }
+}
+
 static void ggml_backend_meta_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     const size_t n_buffers = ggml_backend_meta_buffer_n_bufs(buffer);
     for (size_t i = 0; i < n_buffers; i++) {
@@ -1488,7 +1521,7 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
     /* .free_buffer     = */ ggml_backend_meta_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_meta_buffer_get_base,
     /* .init_tensor     = */ ggml_backend_meta_buffer_init_tensor,
-    /* .memset_tensor   = */ nullptr, // TODO implement
+    /* .memset_tensor   = */ ggml_backend_meta_buffer_memset_tensor,
     /* .set_tensor      = */ ggml_backend_meta_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_meta_buffer_get_tensor,
     /* .set_tensor_2d   = */ nullptr,
