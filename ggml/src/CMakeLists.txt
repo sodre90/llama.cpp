@@ -222,6 +222,10 @@ if (GGML_SCHED_NO_REALLOC)
     target_compile_definitions(ggml-base PUBLIC GGML_SCHED_NO_REALLOC)
 endif()
 
+if (GGML_SCHED_DEBUG_CAUSES)
+    target_compile_definitions(ggml-base PRIVATE GGML_SCHED_DEBUG_CAUSES)
+endif()
+
 if (GGML_OPENMP)
     find_package(OpenMP)
     if (OpenMP_FOUND)

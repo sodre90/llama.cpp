@@ -753,6 +753,8 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #define GGML_SCHED_MAX_BACKENDS 16
 #endif
 
+#define GGML_SCHED_CAUSE_LEN 128
+
 #ifndef GGML_SCHED_MAX_SPLIT_INPUTS
 #define GGML_SCHED_MAX_SPLIT_INPUTS 30
 #endif
@@ -827,6 +829,11 @@ struct ggml_backend_sched {
     int debug_realloc;
     int debug_graph_size;
     int debug_prev_graph_size;
+
+#ifdef GGML_SCHED_DEBUG_CAUSES
+    // why each tensor was assigned to its backend, indexed by hash_id [GGML_SCHED_DEBUG_CAUSES]
+    char (* causes)[GGML_SCHED_CAUSE_LEN];
+#endif
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -896,11 +903,13 @@ static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, co
     return -1;
 }
 
-#if 0
-#define GGML_SCHED_MAX_SPLITS_DEBUG 4096
-static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML_SCHED_MAX_SPLIT_INPUTS][128]; // debug only
-#define SET_CAUSE(node, ...) sprintf(causes[hash_id(node)], __VA_ARGS__)
-#define GET_CAUSE(node) causes[hash_id(node)]
+#ifdef GGML_SCHED_DEBUG_CAUSES
+// Indexed by hash_id, so it must be sized from the scheduler's own hash set. The upstream version of
+// this table is a fixed-size static sized off GGML_DEFAULT_GRAPH_SIZE, which any model whose
+// graph_max_nodes scales with its tensor count (DeepSeek-V4 among them) overruns -- an out-of-bounds
+// sprintf that only shows up when the debug build is the one you are trying to trust.
+#define SET_CAUSE(node, ...) snprintf(sched->causes[hash_id(node)], GGML_SCHED_CAUSE_LEN, __VA_ARGS__)
+#define GET_CAUSE(node) sched->causes[hash_id(node)]
 #else
 #define SET_CAUSE(node, ...)
 #define GET_CAUSE(node) ""
@@ -1001,21 +1010,28 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
             cur_split++;
         }
         struct ggml_tensor * node = graph->nodes[i];
-        if (ggml_is_view_op(node->op)) {
-            continue;
-        }
+        // A view is the one node kind that CANNOT be fixed up with a cross-backend copy, so when a
+        // split goes wrong it is the first thing worth looking at -- skipping it here hides the
+        // culprit. Backend names are endpoint-qualified ("RPC0[10.129.30.109:50052]"), so the field
+        // has to be wide enough to tell two shards apart.
         if (sched->debug > 1) {
             ggml_backend_t tensor_backend = ggml_backend_sched_get_tensor_backend(sched, node);
-            GGML_LOG_DEBUG("node #%3d (%10.10s): %20.20s (%5.5s) [%5.5s %8.8s] use=%d,c=%d:", i, ggml_op_desc(node), node->name,
+            GGML_LOG_DEBUG("node #%3d (%10.10s)%s: %32.32s (%5.5s) [%24.24s %8.8s] use=%d,c=%d:", i, ggml_op_desc(node),
+                ggml_is_view_op(node->op) ? " VIEW" : "     ", node->name,
                 fmt_size(ggml_nbytes(node)), tensor_backend ? ggml_backend_name(tensor_backend) : "NULL", GET_CAUSE(node),
                 graph->use_counts[ggml_hash_find(&graph->visited_hash_set, node)], node->flags & GGML_TENSOR_FLAG_COMPUTE ? 1 : 0);
+            if (node->view_src) {
+                ggml_backend_t vs_backend = ggml_backend_sched_get_tensor_backend(sched, node->view_src);
+                GGML_LOG_DEBUG(" view_src=%32.32s [%24.24s]", node->view_src->name,
+                    vs_backend ? ggml_backend_name(vs_backend) : "NULL");
+            }
             for (int j = 0; j < GGML_MAX_SRC; j++) {
                 struct ggml_tensor * src = node->src[j];
                 if (src == NULL) {
                     continue;
                 }
                 ggml_backend_t src_backend = ggml_backend_sched_get_tensor_backend(sched, src);
-                GGML_LOG_DEBUG(" %20.20s (%5.5s) [%5.5s %8.8s]", src->name,
+                GGML_LOG_DEBUG(" %32.32s (%5.5s) [%24.24s %8.8s]", src->name,
                     fmt_size(ggml_nbytes(src)), src_backend ? ggml_backend_name(src_backend) : "NULL", GET_CAUSE(src));
             }
             GGML_LOG_DEBUG("\n");
@@ -1808,6 +1824,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->hash_set    = ggml_hash_set_new(graph_size);
     sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
     sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+#ifdef GGML_SCHED_DEBUG_CAUSES
+    sched->causes = (char (*)[GGML_SCHED_CAUSE_LEN]) calloc(sched->hash_set.size, GGML_SCHED_CAUSE_LEN);
+#endif
 
     const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
     const size_t nodes_size = graph_size + ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2;
@@ -1868,6 +1887,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->graph_inputs);
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_copies);
+#ifdef GGML_SCHED_DEBUG_CAUSES
+    free(sched->causes);
+#endif
     free(sched->node_backend_ids);
     free(sched->leaf_backend_ids);
     free(sched->prev_node_backend_ids);
