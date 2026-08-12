@@ -1351,7 +1351,14 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
         return nullptr;
     }
     if (result->buffer == nullptr && result->data != nullptr) {
-        GGML_LOG_ERROR("[%s] invalid data ptr", __func__);
+        // The bare message hides everything needed to diagnose a cross-backend split: a tensor that
+        // lives in another shard's buffer is indistinguishable from a corrupt pointer without the
+        // op and the buffer handle.
+        GGML_LOG_ERROR("[%s] invalid data ptr: id=%" PRIu64 " name='%s' op=%s type=%s "
+                       "buffer=0x%" PRIx64 " data=0x%" PRIx64 " known_buffers=%zu\n",
+                       __func__, id, tensor->name, ggml_op_name((ggml_op) tensor->op),
+                       ggml_type_name((ggml_type) tensor->type),
+                       tensor->buffer, tensor->data, buffers.size());
         return nullptr;
     }
     tensor_map[id] = result;
@@ -1363,8 +1370,10 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
             result->src[i] = create_node(tensor->src[i], ctx, tensor_ptrs, tensor_map);
             // If the recursive call failed for a non-zero ID, propagate the error
             if (result->src[i] == nullptr) {
-                GGML_LOG_ERROR("[%s] failed to create source node %d (src_id=%" PRIu64 ") for node id %" PRIu64 "\n",
-                               __func__, i, tensor->src[i], id);
+                GGML_LOG_ERROR("[%s] failed to create source node %d (src_id=%" PRIu64 ") for node id %" PRIu64
+                               " name='%s' op=%s\n",
+                               __func__, i, tensor->src[i], id, tensor->name,
+                               ggml_op_name((ggml_op) tensor->op));
                 // Must return nullptr to signal failure up the call stack
                 return nullptr;
             }
