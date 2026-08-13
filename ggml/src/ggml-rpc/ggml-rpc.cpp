@@ -2353,18 +2353,18 @@ static bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx, ggml_tensor 
         requests[j].tensor = serialize_tensor(tensors[j]);
         requests[j].offset = 0;
         requests[j].size   = nbytes;
-        if (!send_rpc_cmd(ctx->sock, RPC_CMD_GET_TENSOR, &requests[j], sizeof(requests[j]))) {
-            return false;
-        }
+        // Past this point a partial collective would leave unread replies on the socket, so a
+        // transport failure is fatal rather than a fall back to the butterfly.
+        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_GET_TENSOR, &requests[j], sizeof(requests[j]));
+        RPC_STATUS_ASSERT(status);
     }
     for (size_t j = 0; j < n_backends; j++) {
         if (!computed[j]) {
             continue;
         }
         ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)tensors[j]->buffer->context;
-        if (!recv_rpc_rsp(ctx->sock, RPC_CMD_GET_TENSOR, comm->partial.data(), nbytes)) {
-            return false;
-        }
+        bool status = recv_rpc_rsp(ctx->sock, RPC_CMD_GET_TENSOR, comm->partial.data(), nbytes);
+        RPC_STATUS_ASSERT(status);
         const float * partial = (const float *)comm->partial.data();
         for (size_t i = 0; i < n_elements; i++) {
             comm->accum[i] += partial[i];
