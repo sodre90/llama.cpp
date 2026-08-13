@@ -753,6 +753,7 @@ static void ggml_backend_rpc_buffer_memset_tensor(
 
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    std::lock_guard<std::mutex> lock(ctx->sock->cmd_mutex);
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
     // fnv_hash is a byte at a time with a serial multiply chain, so asking costs a full pass over the
     // tensor at a few hundred MB/s. Worth it against a cache that might answer HIT, never worth it
@@ -794,6 +795,7 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
 static void ggml_backend_rpc_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    std::lock_guard<std::mutex> lock(ctx->sock->cmd_mutex);
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
     const size_t header_size    = sizeof(rpc_tensor) + 3*sizeof(uint64_t);
     const size_t rows_per_chunk = std::max<size_t>(1, SET_TENSOR_2D_CHUNK_SIZE / std::max<size_t>(1, size));

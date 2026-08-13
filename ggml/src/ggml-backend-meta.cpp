@@ -11,10 +11,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <set>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -1265,11 +1267,49 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
     return ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->get_simple_tensor_container(tensor), tensor);
 }
 
+// Runs one send per device concurrently instead of in device order.
+//
+// A device behind RPC is written by a blocking round trip, so a loop over devices leaves every link
+// but the current one idle, and a mirrored tensor pays that once per device for the same bytes: on a
+// ten shard run the mirrored share of the weights crosses the wire eleven times, strictly one after
+// the other. Every task here writes to a different device and reads a disjoint region of the caller's
+// buffer, or the identical region in the mirrored case, so they are independent.
+//
+// Small tensors stay on the calling thread, where spawning threads costs more than the sends. Set
+// GGML_META_FILL_PARALLEL=0 to force the old order, which is what makes this measurable without
+// shipping two binaries to the fleet.
+static void ggml_backend_meta_fill_parallel(std::vector<std::function<void()>> & sends, size_t bytes_per_send) {
+    static const size_t   min_bytes = 1024*1024;
+    static const char *   env       = getenv("GGML_META_FILL_PARALLEL");
+    static const bool     enabled   = env ? atoi(env) != 0 : true;
+
+    if (!enabled || sends.size() <= 1 || bytes_per_send < min_bytes) {
+        for (auto & send : sends) {
+            send();
+        }
+        return;
+    }
+    std::vector<std::thread> workers;
+    workers.reserve(sends.size() - 1);
+    for (size_t i = 1; i < sends.size(); i++) {
+        workers.emplace_back(sends[i]);
+    }
+    sends[0]();
+    for (std::thread & worker : workers) {
+        worker.join();
+    }
+}
+
 static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
+    // The segmented paths below still send in device order. Their positions in the caller's buffer
+    // accumulate across segments as well as devices, so lifting them out changes the offset
+    // arithmetic rather than just the order, and that is not worth doing blind. The knob on
+    // ggml_backend_meta_fill_parallel answers first whether the tensors reaching here carry enough of
+    // the weights to be worth the risk.
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
         GGML_ASSERT(split_state.nr[0] != 0);
@@ -1342,6 +1382,9 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             const int64_t i_start =  offset        /chunk_size_full;
             const int64_t i_stop  = (offset + size)/chunk_size_full;
             size_t offset_j = 0;
+            size_t bytes_j  = 0;
+            std::vector<std::function<void()>> sends;
+            sends.reserve(n_bufs);
             for (size_t j = 0; j < n_bufs; j++) {
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                 const size_t chunk_size_j = simple_tensor->nb[split_state.axis + 1];
@@ -1349,16 +1392,28 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                     continue;
                 }
                 const size_t simple_offset = i_start * chunk_size_j;
-                ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_j, simple_offset, chunk_size_j, i_stop - i_start, chunk_size_j, chunk_size_full);
+                // offset_j is the running position in the caller's buffer, so it is captured by value
+                // here rather than read when the send runs: the sends no longer run in this order.
+                const char * src = (const char *) data + offset_j;
+                sends.emplace_back([=] {
+                    ggml_backend_tensor_set_2d(simple_tensor, src, simple_offset, chunk_size_j, i_stop - i_start, chunk_size_j, chunk_size_full);
+                });
                 offset_j += chunk_size_j;
+                bytes_j   = std::max(bytes_j, chunk_size_j * size_t(i_stop - i_start));
             }
             GGML_ASSERT(offset_j == chunk_size_full);
+            ggml_backend_meta_fill_parallel(sends, bytes_j);
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
+            std::vector<std::function<void()>> sends;
+            sends.reserve(n_bufs);
             for (size_t j = 0; j < n_bufs; j++) {
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                ggml_backend_tensor_set(simple_tensor, data, offset, size);
+                sends.emplace_back([=] {
+                    ggml_backend_tensor_set(simple_tensor, data, offset, size);
+                });
             }
+            ggml_backend_meta_fill_parallel(sends, size);
         } break;
         case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
             GGML_ASSERT(tensor->type == GGML_TYPE_F32);

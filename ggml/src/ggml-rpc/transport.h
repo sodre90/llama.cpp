@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 
 struct socket_t;
 typedef std::shared_ptr<socket_t> socket_ptr;
@@ -39,6 +40,13 @@ struct socket_t {
     // Set once the peer answers that it keeps no tensor cache, so that set_tensor stops paying a
     // full serial hash pass over every tensor to ask a question whose answer cannot change.
     std::atomic<bool> tensor_cache_absent{false};
+
+    // Held across a whole tensor write, because two loader threads filling different shards can still
+    // land on one socket when a peer exposes several devices, and a half-written command is not
+    // recoverable. Only the write paths take it, since nothing else runs off the calling thread: graph
+    // collectives deliberately split send from recv across sockets, and buffer setup and teardown
+    // happen before and after the parallel fill.
+    std::mutex cmd_mutex;
 
     static socket_ptr create_server(const char * host, int port, int backlog = 1);
     static socket_ptr connect(const char * host, int port);
