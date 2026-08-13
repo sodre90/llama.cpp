@@ -385,6 +385,33 @@ static void rpc_stats_add(std::atomic<uint64_t> & counter, uint64_t value) {
     counter.fetch_add(value, std::memory_order_relaxed);
 }
 
+// Server-side counterpart, printed per connection when GGML_RPC_STATS is set.
+//
+// The client charges a peer's compute to whatever command it happened to block on, so its totals
+// cannot say whether a shard is the bottleneck or is itself waiting. Split the server's life into
+// time inside a handler and time blocked waiting for the next command byte: a shard that is the
+// bottleneck is busy, and one that is idle means the cost sits in the fabric or in the client.
+struct rpc_server_stats {
+    uint64_t calls[RPC_CMD_COUNT]   = {};
+    uint64_t busy_us[RPC_CMD_COUNT] = {};
+    uint64_t idle_us = 0;
+
+    ~rpc_server_stats() {
+        if (!RPC_STATS) {
+            return;
+        }
+        fprintf(stderr, "\nRPC server totals, idle between commands %.1f ms\n", idle_us / 1000.0);
+        fprintf(stderr, "  %-18s %10s %12s %12s\n", "command", "calls", "busy ms", "us/call");
+        for (int i = 0; i < RPC_CMD_COUNT; i++) {
+            if (calls[i] == 0) {
+                continue;
+            }
+            fprintf(stderr, "  %-18s %10" PRIu64 " %12.1f %12.1f\n", rpc_cmd_name((enum rpc_cmd) i),
+                    calls[i], busy_us[i] / 1000.0, (double) busy_us[i] / calls[i]);
+        }
+    }
+};
+
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // No response
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
@@ -1825,6 +1852,7 @@ rpc_server::~rpc_server() {
 static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
                              socket_ptr sock) {
     rpc_server server(backends, cache_dir);
+    rpc_server_stats stats;
     uint8_t cmd;
     if (!sock->recv_data(&cmd, 1)) {
         return;
@@ -1862,8 +1890,13 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     // Activate transport upgrade using client's caps
     sock->update_caps(req.conn_caps);
     while (true) {
+        const int64_t t_idle_start = RPC_STATS ? ggml_time_us() : 0;
         if (!sock->recv_data(&cmd, 1)) {
             break;
+        }
+        const int64_t t_cmd_start = RPC_STATS ? ggml_time_us() : 0;
+        if (RPC_STATS) {
+            stats.idle_us += t_cmd_start - t_idle_start;
         }
         if (cmd >= RPC_CMD_COUNT) {
             // fail fast if the command is invalid
@@ -2108,6 +2141,10 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 GGML_LOG_ERROR("Unknown command: %d\n", cmd);
                 return;
             }
+        }
+        if (RPC_STATS) {
+            stats.calls[cmd]++;
+            stats.busy_us[cmd] += ggml_time_us() - t_cmd_start;
         }
     }
 }
