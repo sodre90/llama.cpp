@@ -12,7 +12,9 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <chrono>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <cstring>
@@ -75,6 +77,9 @@ enum rpc_cmd {
     RPC_CMD_GRAPH_RECOMPUTE,
     RPC_CMD_MEMSET_TENSOR,
     RPC_CMD_SET_TENSOR_2D,
+    RPC_CMD_MESH_LISTEN,
+    RPC_CMD_MESH_CONNECT,
+    RPC_CMD_ALLREDUCE,
     RPC_CMD_COUNT,
 };
 
@@ -85,6 +90,28 @@ const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
 // Upper bound on the row data a single RPC_CMD_SET_TENSOR_2D gathers before sending
 const size_t SET_TENSOR_2D_CHUNK_SIZE = 64 * 1024 * 1024;
+
+// Shards reduce among themselves rather than through the client, see RPC_CMD_ALLREDUCE.
+//
+// A participant mask is a uint64_t, and sixty-four shards is already far past the point where the
+// mirrored weights each one has to read dominate anything the fabric does, so the cap is not worth
+// generalising away.
+const uint32_t RPC_MESH_MAX_RANKS = 64;
+
+// Largest all-reduce the mesh will carry. Every rank sends to all the others before it reads any of
+// them, so the exchange only stays deadlock free while a whole message fits in the peer's receive
+// buffer; above this the client keeps using the client-star path, which has no such constraint. A
+// decode boundary is 16 KiB and a four-wide speculative verify is 64 KiB, so this covers the cases
+// the mesh exists for, while a prefill chunk at -ub 512 is 8 MiB and takes the star.
+const size_t RPC_MESH_MAX_BYTES = 128 * 1024;
+
+// Requested peer socket buffer, clamped by net.core.{r,w}mem_max. The default clamp of 208 KiB still
+// leaves the invariant above intact.
+const size_t RPC_MESH_SOCK_BUF = 1024 * 1024;
+
+// A peer that never sends its partial would otherwise hang the shard forever: the collective has no
+// reply, so the client is not waiting on anything it could time out.
+const int RPC_MESH_TIMEOUT_SEC = 30;
 
 struct rpc_msg_hello_req {
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
@@ -203,6 +230,33 @@ struct rpc_msg_get_device_memory_rsp {
 struct rpc_msg_graph_recompute_req {
     uint32_t device;
     uint64_t graph_uid;
+};
+
+struct rpc_mesh_endpoint {
+    char     host[64];
+    uint32_t port;
+};
+
+struct rpc_msg_mesh_listen_req {
+    uint32_t rank;
+    uint32_t n_ranks;
+};
+
+struct rpc_msg_mesh_listen_rsp {
+    uint32_t port;
+};
+
+struct rpc_msg_mesh_connect_req {
+    rpc_mesh_endpoint peers[RPC_MESH_MAX_RANKS];
+};
+
+struct rpc_msg_mesh_connect_rsp {
+    uint8_t result;
+};
+
+struct rpc_msg_allreduce_req {
+    rpc_tensor tensor;
+    uint64_t   participant_mask;
 };
 
 #pragma pack(pop)
@@ -331,6 +385,10 @@ static const char * RPC_STATS = std::getenv("GGML_RPC_STATS");
 // have to spin for the full effect, since each one contributes a wakeup to the round trip.
 static const int64_t RPC_SPIN_US = std::getenv("GGML_RPC_SPIN_US") ? std::atoll(std::getenv("GGML_RPC_SPIN_US")) : 0;
 
+// Whether shards reduce among themselves instead of through the client, see RPC_CMD_ALLREDUCE.
+// On by default; GGML_RPC_MESH=0 restores the client-star path for an A/B against it.
+static const bool RPC_MESH = std::getenv("GGML_RPC_MESH") == nullptr || std::atoi(std::getenv("GGML_RPC_MESH")) != 0;
+
 struct rpc_cmd_stats {
     std::atomic<uint64_t> calls;
     std::atomic<uint64_t> bytes_sent;
@@ -361,6 +419,9 @@ static const char * rpc_cmd_name(enum rpc_cmd cmd) {
         case RPC_CMD_GRAPH_RECOMPUTE:   return "graph_recompute";
         case RPC_CMD_MEMSET_TENSOR:     return "memset_tensor";
         case RPC_CMD_SET_TENSOR_2D:     return "set_tensor_2d";
+        case RPC_CMD_MESH_LISTEN:       return "mesh_listen";
+        case RPC_CMD_MESH_CONNECT:      return "mesh_connect";
+        case RPC_CMD_ALLREDUCE:         return "allreduce";
         default:                        return "?";
     }
 }
@@ -1134,6 +1195,9 @@ public:
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
+    bool mesh_listen(const rpc_msg_mesh_listen_req & request, rpc_msg_mesh_listen_rsp & response);
+    bool mesh_connect(const rpc_msg_mesh_connect_req & request, rpc_msg_mesh_connect_rsp & response);
+    bool allreduce(const rpc_msg_allreduce_req & request);
 
     struct stored_graph {
         std::vector<uint8_t>   buffer;
@@ -1155,6 +1219,7 @@ private:
                               struct ggml_context * ctx,
                               const std::unordered_map<uint64_t, const rpc_tensor*> & tensor_ptrs,
                               std::unordered_map<uint64_t, struct ggml_tensor*> & tensor_map);
+    void accept_mesh_peers();
 
 
     std::vector<ggml_backend_t> backends;
@@ -1162,6 +1227,19 @@ private:
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // store the recently computed graphs for each backend
     std::vector<device_graph_cache> graph_caches;
+
+    // Peer connections for RPC_CMD_ALLREDUCE. Lower ranks dial higher ones, so a shard accepts
+    // exactly mesh_rank inbound connections while dialling the rest, and both halves have to run at
+    // once. The listener is bound and the accept thread started by MESH_LISTEN, so that every shard
+    // is reachable before any of them starts dialling in MESH_CONNECT.
+    uint32_t                mesh_rank    = 0;
+    uint32_t                mesh_n_ranks = 0;
+    socket_ptr              mesh_listener;
+    std::vector<socket_ptr> mesh_peers;
+    std::thread             mesh_accepter;
+    bool                    mesh_ready   = false;
+    std::vector<std::vector<uint8_t>> mesh_partials;
+    std::vector<float>                mesh_accum;
 };
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
@@ -1854,7 +1932,203 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
     return true;
 }
 
+// Shard side of the collective, see RPC_CMD_ALLREDUCE and the client's comm_allreduce_tensor.
+//
+// MESH_LISTEN and MESH_CONNECT are split so the client can bind every shard before any of them
+// starts dialling. Doing it in one command would have rank 0 dial peers whose listeners the client
+// has not asked for yet, and the retry loop that papers over that is where the unreproducible
+// startup hangs live.
+
+void rpc_server::accept_mesh_peers() {
+    for (uint32_t i = 0; i < mesh_rank; i++) {
+        socket_ptr peer = mesh_listener->accept();
+        if (peer == nullptr) {
+            GGML_LOG_ERROR("[%s] rank %u accepted %u of %u peers before giving up\n",
+                           __func__, mesh_rank, i, mesh_rank);
+            return;
+        }
+        peer->set_buffer_size(RPC_MESH_SOCK_BUF);
+        peer->set_recv_timeout(RPC_MESH_TIMEOUT_SEC);
+        uint32_t peer_rank;
+        if (!peer->recv_data(&peer_rank, sizeof(peer_rank)) || peer_rank >= mesh_rank) {
+            GGML_LOG_ERROR("[%s] rank %u got a bad handshake from an inbound peer\n", __func__, mesh_rank);
+            return;
+        }
+        mesh_peers[peer_rank] = peer;
+    }
+}
+
+bool rpc_server::mesh_listen(const rpc_msg_mesh_listen_req & request, rpc_msg_mesh_listen_rsp & response) {
+    if (request.n_ranks < 2 || request.n_ranks > RPC_MESH_MAX_RANKS || request.rank >= request.n_ranks) {
+        GGML_LOG_ERROR("[%s] invalid rank %u of %u\n", __func__, request.rank, request.n_ranks);
+        return false;
+    }
+    if (mesh_listener != nullptr) {
+        GGML_LOG_ERROR("[%s] mesh already set up for this connection\n", __func__);
+        return false;
+    }
+    mesh_rank    = request.rank;
+    mesh_n_ranks = request.n_ranks;
+    mesh_peers.assign(mesh_n_ranks, nullptr);
+    mesh_listener = socket_t::create_server("0.0.0.0", 0, (int) mesh_n_ranks);
+    if (mesh_listener == nullptr) {
+        GGML_LOG_ERROR("[%s] failed to bind a mesh listener\n", __func__);
+        return false;
+    }
+    // So a bring-up that never completes unblocks the accept thread instead of leaking it.
+    mesh_listener->set_recv_timeout(RPC_MESH_TIMEOUT_SEC);
+    response.port = mesh_listener->local_port();
+    if (response.port == 0) {
+        GGML_LOG_ERROR("[%s] mesh listener has no port\n", __func__);
+        return false;
+    }
+    mesh_accepter = std::thread([this] { accept_mesh_peers(); });
+    LOG_DBG("[%s] rank %u of %u listening on port %u\n", __func__, mesh_rank, mesh_n_ranks, response.port);
+    return true;
+}
+
+bool rpc_server::mesh_connect(const rpc_msg_mesh_connect_req & request, rpc_msg_mesh_connect_rsp & response) {
+    response.result = 0;
+    if (mesh_listener == nullptr) {
+        GGML_LOG_ERROR("[%s] mesh connect before mesh listen\n", __func__);
+        return false;
+    }
+    const int64_t deadline = ggml_time_us() + (int64_t) RPC_MESH_TIMEOUT_SEC * 1000000;
+    for (uint32_t r = mesh_rank + 1; r < mesh_n_ranks; r++) {
+        const rpc_mesh_endpoint & ep = request.peers[r];
+        const std::string host(ep.host, strnlen(ep.host, sizeof(ep.host)));
+        socket_ptr peer;
+        // The peer's listener is up as soon as it answered MESH_LISTEN, but the client fires those
+        // in parallel and TCP still has to get there, so a refused connect is normal here.
+        while ((peer = socket_t::connect(host.c_str(), (int) ep.port)) == nullptr &&
+               ggml_time_us() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        if (peer == nullptr) {
+            GGML_LOG_ERROR("[%s] rank %u cannot reach rank %u at %s:%u\n",
+                           __func__, mesh_rank, r, host.c_str(), ep.port);
+            break;
+        }
+        peer->set_buffer_size(RPC_MESH_SOCK_BUF);
+        peer->set_recv_timeout(RPC_MESH_TIMEOUT_SEC);
+        if (!peer->send_data(&mesh_rank, sizeof(mesh_rank))) {
+            GGML_LOG_ERROR("[%s] rank %u failed to announce itself to rank %u\n", __func__, mesh_rank, r);
+            break;
+        }
+        mesh_peers[r] = peer;
+    }
+    if (mesh_accepter.joinable()) {
+        mesh_accepter.join();
+    }
+    mesh_listener.reset();
+
+    mesh_ready = true;
+    for (uint32_t r = 0; r < mesh_n_ranks; r++) {
+        if (r != mesh_rank && mesh_peers[r] == nullptr) {
+            GGML_LOG_ERROR("[%s] rank %u has no connection to rank %u\n", __func__, mesh_rank, r);
+            mesh_ready = false;
+        }
+    }
+    response.result = mesh_ready ? 1 : 0;
+    LOG_DBG("[%s] rank %u of %u mesh %s\n", __func__, mesh_rank, mesh_n_ranks, mesh_ready ? "up" : "incomplete");
+    return true;
+}
+
+bool rpc_server::allreduce(const rpc_msg_allreduce_req & request) {
+    if (!mesh_ready) {
+        GGML_LOG_ERROR("[%s] allreduce before the mesh is up\n", __func__);
+        return false;
+    }
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_tensor * tensor = deserialize_tensor(ctx_ptr.get(), &request.tensor);
+    if (tensor == nullptr || tensor->buffer == nullptr ||
+        tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor)) {
+        GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+        return false;
+    }
+    const size_t nbytes = ggml_nbytes(tensor);
+    if (nbytes > RPC_MESH_MAX_BYTES) {
+        GGML_LOG_ERROR("[%s] %zu bytes exceeds the mesh limit of %zu\n", __func__, nbytes, RPC_MESH_MAX_BYTES);
+        return false;
+    }
+    {
+        const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
+        const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+        if (request.tensor.data < p0 || request.tensor.data >= p1 || nbytes > (p1 - request.tensor.data)) {
+            GGML_LOG_ERROR("[%s] tensor region (data=0x%" PRIx64 ", size=%zu) out of buffer bounds [0x%zx, 0x%zx)\n",
+                           __func__, request.tensor.data, nbytes, p0, p1);
+            return false;
+        }
+    }
+
+    const auto participates = [&request](uint32_t rank) {
+        return ((request.participant_mask >> rank) & 1) != 0;
+    };
+    mesh_partials.resize(mesh_n_ranks);
+
+    // Every rank pushes its partial to all the others before reading any of them. That only holds
+    // without a deadlock because a whole message fits in the peer's receive buffer, see
+    // RPC_MESH_MAX_BYTES. A rank whose slice was empty never ran and has no partial to contribute,
+    // but it still needs the sum, so it skips the send half and takes part in the rest.
+    if (participates(mesh_rank)) {
+        mesh_partials[mesh_rank].resize(nbytes);
+        ggml_backend_tensor_get(tensor, mesh_partials[mesh_rank].data(), 0, nbytes);
+        for (uint32_t r = 0; r < mesh_n_ranks; r++) {
+            if (r != mesh_rank && !mesh_peers[r]->send_data(mesh_partials[mesh_rank].data(), nbytes)) {
+                GGML_ABORT("rank %u failed to send its partial to rank %u", mesh_rank, r);
+            }
+        }
+    }
+    for (uint32_t r = 0; r < mesh_n_ranks; r++) {
+        if (r == mesh_rank || !participates(r)) {
+            continue;
+        }
+        mesh_partials[r].resize(nbytes);
+        if (RPC_SPIN_US > 0) {
+            mesh_peers[r]->spin_until_readable(RPC_SPIN_US);
+        }
+        if (!mesh_peers[r]->recv_data(mesh_partials[r].data(), nbytes)) {
+            GGML_ABORT("rank %u got no partial from rank %u within %d s", mesh_rank, r, RPC_MESH_TIMEOUT_SEC);
+        }
+    }
+
+    // Summing in rank order rather than arrival order keeps every shard bit for bit identical to
+    // every other and to what the client-star path would have produced.
+    const size_t n_elements = nbytes / sizeof(float);
+    mesh_accum.resize(n_elements);
+    bool accum_seeded = false;
+    for (uint32_t r = 0; r < mesh_n_ranks; r++) {
+        if (!participates(r)) {
+            continue;
+        }
+        const float * GGML_RESTRICT partial = (const float *) mesh_partials[r].data();
+        float       * GGML_RESTRICT accum   = mesh_accum.data();
+        if (!accum_seeded) {
+            std::memcpy(accum, partial, nbytes);
+            accum_seeded = true;
+            continue;
+        }
+        for (size_t i = 0; i < n_elements; i++) {
+            accum[i] += partial[i];
+        }
+    }
+    if (!accum_seeded) {
+        std::fill(mesh_accum.begin(), mesh_accum.end(), 0.0f);
+    }
+    ggml_backend_tensor_set(tensor, mesh_accum.data(), 0, nbytes);
+    return true;
+}
+
 rpc_server::~rpc_server() {
+    if (mesh_accepter.joinable()) {
+        mesh_accepter.join();
+    }
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
     }
@@ -2151,6 +2425,44 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_MESH_LISTEN: {
+                rpc_msg_mesh_listen_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_mesh_listen_rsp response;
+                if (!server.mesh_listen(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_MESH_CONNECT: {
+                rpc_msg_mesh_connect_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_mesh_connect_rsp response;
+                if (!server.mesh_connect(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_ALLREDUCE: {
+                rpc_msg_allreduce_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                if (!server.allreduce(request)) {
+                    return;
+                }
+                break;
+            }
             default: {
                 GGML_LOG_ERROR("Unknown command: %d\n", cmd);
                 return;
@@ -2396,11 +2708,87 @@ static ggml_backend_dev_t ggml_backend_rpc_reg_get_device(ggml_backend_reg_t reg
 // The shape below trades bytes for latency, which is the right trade when the payload is a single
 // hidden state: gather every shard's partial in one pipelined round trip, sum on the client, and
 // scatter the result. One round trip per boundary regardless of shard count.
+//
+// That star still costs two hops, shard to client and client back to shard, and a round trip
+// between two of these guests is 1.9 ms at any payload from 64 B to 64 KB, so forty-three boundaries
+// spend most of a token in the fabric. The mesh below removes the client from the boundary
+// entirely: each shard broadcasts its partial straight to the other N-1 and sums locally, which is
+// one hop, and the client stops blocking on boundaries at all. Measured on ten of these nodes at
+// 16 KiB, a barrier costs 760 us that way against 2109 us through a client.
 struct ggml_backend_rpc_comm {
     size_t n_backends;
     std::vector<float>   accum;
     std::vector<uint8_t> partial;
+    bool mesh_ready = false;
+
+    // The socket cache holds weak references, so without a strong one here the connections carrying
+    // the mesh would be closed the moment bring-up returned, and the shards would tear the mesh down
+    // with them. Holding them also pins the cache entries, so the buffers the model is loaded into
+    // later get these same sockets rather than fresh, mesh-less ones.
+    std::vector<socket_ptr> mesh_socks;
 };
+
+// Stands up the shard-to-shard mesh in two passes so that no shard dials a peer that has not been
+// asked to listen yet. Peer addresses are the same hosts the client reaches the shards on, which
+// assumes the shards can reach each other the same way.
+static bool ggml_backend_rpc_comm_mesh_init(ggml_backend_rpc_comm * comm, ggml_backend_t * backends, size_t n_backends) {
+    if (n_backends < 2 || n_backends > RPC_MESH_MAX_RANKS) {
+        return false;
+    }
+    std::vector<socket_ptr> & socks = comm->mesh_socks;
+    socks.assign(n_backends, nullptr);
+    std::vector<std::string> hosts(n_backends);
+    std::unordered_set<std::string> endpoints;
+    for (size_t j = 0; j < n_backends; j++) {
+        ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *) backends[j]->context;
+        int port;
+        if (!parse_endpoint(ctx->endpoint, hosts[j], port) || hosts[j].size() >= sizeof(rpc_mesh_endpoint::host)) {
+            return false;
+        }
+        // Two ranks on one endpoint would share a socket and a rank, which the mesh cannot express.
+        if (!endpoints.insert(ctx->endpoint).second) {
+            return false;
+        }
+        socks[j] = get_socket(ctx->endpoint);
+        if (socks[j] == nullptr) {
+            return false;
+        }
+    }
+
+    std::vector<rpc_msg_mesh_listen_req> listen_req(n_backends);
+    std::vector<rpc_msg_mesh_listen_rsp> listen_rsp(n_backends);
+    for (size_t j = 0; j < n_backends; j++) {
+        listen_req[j].rank    = (uint32_t) j;
+        listen_req[j].n_ranks = (uint32_t) n_backends;
+        // Past this point a shard that fails leaves an unread reply on its socket, so bring-up
+        // failures are fatal rather than a silent fall back to the star; GGML_RPC_MESH=0 opts out.
+        bool status = send_rpc_cmd(socks[j], RPC_CMD_MESH_LISTEN, &listen_req[j], sizeof(listen_req[j]));
+        RPC_STATUS_ASSERT(status);
+    }
+    for (size_t j = 0; j < n_backends; j++) {
+        bool status = recv_rpc_rsp(socks[j], RPC_CMD_MESH_LISTEN, &listen_rsp[j], sizeof(listen_rsp[j]));
+        RPC_STATUS_ASSERT(status);
+    }
+
+    rpc_msg_mesh_connect_req connect_req = {};
+    for (size_t j = 0; j < n_backends; j++) {
+        std::strncpy(connect_req.peers[j].host, hosts[j].c_str(), sizeof(connect_req.peers[j].host) - 1);
+        connect_req.peers[j].port = listen_rsp[j].port;
+    }
+    for (size_t j = 0; j < n_backends; j++) {
+        bool status = send_rpc_cmd(socks[j], RPC_CMD_MESH_CONNECT, &connect_req, sizeof(connect_req));
+        RPC_STATUS_ASSERT(status);
+    }
+    bool all_up = true;
+    for (size_t j = 0; j < n_backends; j++) {
+        rpc_msg_mesh_connect_rsp response;
+        bool status = recv_rpc_rsp(socks[j], RPC_CMD_MESH_CONNECT, &response, sizeof(response));
+        RPC_STATUS_ASSERT(status);
+        all_up = all_up && response.result != 0;
+    }
+    GGML_LOG_INFO("RPC mesh across %zu shards: %s\n", n_backends, all_up ? "up" : "incomplete, using the client-star path");
+    return all_up;
+}
 
 static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_backends) {
     for (size_t i = 0; i < n_backends; i++) {
@@ -2410,6 +2798,7 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
     }
     ggml_backend_rpc_comm * comm = new ggml_backend_rpc_comm;
     comm->n_backends = n_backends;
+    comm->mesh_ready = RPC_MESH && ggml_backend_rpc_comm_mesh_init(comm, backends, n_backends);
     return comm;
 }
 
@@ -2432,15 +2821,37 @@ static bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx, ggml_tensor 
         }
     }
 
-    comm->accum.resize(n_elements);
-    comm->partial.resize(nbytes);
-    bool accum_seeded = false;
-
     // A shard whose slice was empty never ran, so its buffer holds no partial to add in.
     std::vector<bool> computed(n_backends);
     for (size_t j = 0; j < n_backends; j++) {
         computed[j] = (tensors[j]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
     }
+
+    // The shards can reduce among themselves as long as the whole partial fits in a peer's receive
+    // buffer, see RPC_MESH_MAX_BYTES; a prefill chunk does not and takes the star below. Nothing is
+    // read back here, so the client does not block on the boundary at all: the next graph command
+    // queues behind the collective on each shard's socket and the ordering comes for free.
+    if (comm->mesh_ready && nbytes <= RPC_MESH_MAX_BYTES) {
+        uint64_t participant_mask = 0;
+        for (size_t j = 0; j < n_backends; j++) {
+            if (computed[j]) {
+                participant_mask |= 1ull << j;
+            }
+        }
+        for (size_t j = 0; j < n_backends; j++) {
+            ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)tensors[j]->buffer->context;
+            rpc_msg_allreduce_req request;
+            request.tensor           = serialize_tensor(tensors[j]);
+            request.participant_mask = participant_mask;
+            bool status = send_rpc_cmd(ctx->sock, RPC_CMD_ALLREDUCE, &request, sizeof(request));
+            RPC_STATUS_ASSERT(status);
+        }
+        return true;
+    }
+
+    comm->accum.resize(n_elements);
+    comm->partial.resize(nbytes);
+    bool accum_seeded = false;
 
     std::vector<rpc_msg_get_tensor_req> requests(n_backends);
     for (size_t j = 0; j < n_backends; j++) {

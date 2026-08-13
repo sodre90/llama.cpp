@@ -583,6 +583,31 @@ void socket_t::spin_until_readable(int64_t max_us) {
     } while (ggml_time_us() < deadline);
 }
 
+uint16_t socket_t::local_port() {
+    struct sockaddr_in addr = {};
+    socklen_t addr_len = sizeof(addr);
+    if (getsockname(pimpl->fd, (struct sockaddr *) &addr, &addr_len) != 0) {
+        return 0;
+    }
+    return ntohs(addr.sin_port);
+}
+
+bool socket_t::set_buffer_size(size_t bytes) {
+    const int size = (int) bytes;
+    const bool rcv = setsockopt(pimpl->fd, SOL_SOCKET, SO_RCVBUF, (char *) &size, sizeof(size)) == 0;
+    const bool snd = setsockopt(pimpl->fd, SOL_SOCKET, SO_SNDBUF, (char *) &size, sizeof(size)) == 0;
+    return rcv && snd;
+}
+
+bool socket_t::set_recv_timeout(int seconds) {
+#ifdef _WIN32
+    DWORD timeout = (DWORD) seconds * 1000;
+#else
+    struct timeval timeout = { seconds, 0 };
+#endif
+    return setsockopt(pimpl->fd, SOL_SOCKET, SO_RCVTIMEO, (char *) &timeout, sizeof(timeout)) == 0;
+}
+
 void socket_t::get_caps(uint8_t * local_caps) {
     return pimpl->get_caps(local_caps);
 }
@@ -624,7 +649,7 @@ socket_ptr socket_t::accept() {
     return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
 }
 
-socket_ptr socket_t::create_server(const char * host, int port) {
+socket_ptr socket_t::create_server(const char * host, int port, int backlog) {
     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (!is_valid_fd(sockfd)) {
         return nullptr;
@@ -645,7 +670,7 @@ socket_ptr socket_t::create_server(const char * host, int port) {
     if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
         return nullptr;
     }
-    if (listen(sockfd, 1) < 0) {
+    if (listen(sockfd, backlog) < 0) {
         return nullptr;
     }
     return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));

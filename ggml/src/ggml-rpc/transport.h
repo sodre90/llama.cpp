@@ -22,10 +22,20 @@ struct socket_t {
 
     socket_ptr accept();
 
+    // Port the socket actually bound to, for a listener created on port 0.
+    uint16_t local_port();
+
+    // Sizing the peer receive buffers above the largest message the mesh will carry is what keeps a
+    // send-all-then-recv-all exchange from deadlocking, see RPC_MESH_MAX_BYTES.
+    bool set_buffer_size(size_t bytes);
+
+    // A collective has no reply for the client to time out on, so a dead peer has to surface here.
+    bool set_recv_timeout(int seconds);
+
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
 
-    static socket_ptr create_server(const char * host, int port);
+    static socket_ptr create_server(const char * host, int port, int backlog = 1);
     static socket_ptr connect(const char * host, int port);
 
 private:
