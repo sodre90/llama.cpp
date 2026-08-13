@@ -406,6 +406,27 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
 // Accounting note: the send half is already charged by the call above, this only adds the wait.
+// Second half of a send_rpc_cmd, split out so a caller with several sockets can put all the requests
+// on the wire before blocking on the first reply instead of paying one full round trip per socket.
+static bool recv_rpc_rsp(socket_ptr sock, enum rpc_cmd cmd, void * output, size_t output_size) {
+    const int64_t t_start = RPC_STATS ? ggml_time_us() : 0;
+    uint64_t out_size;
+    if (!sock->recv_data(&out_size, sizeof(out_size))) {
+        return false;
+    }
+    if (out_size != output_size) {
+        return false;
+    }
+    if (!sock->recv_data(output, output_size)) {
+        return false;
+    }
+    if (RPC_STATS) {
+        rpc_stats_add(g_rpc_stats[cmd].bytes_recv, output_size + sizeof(out_size));
+        rpc_stats_add(g_rpc_stats[cmd].wait_us, ggml_time_us() - t_start);
+    }
+    return true;
+}
+
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
     if (!send_rpc_cmd(sock, cmd, input, input_size)) {
         return false;
@@ -2267,12 +2288,110 @@ static ggml_backend_dev_t ggml_backend_rpc_reg_get_device(ggml_backend_reg_t reg
     }
 }
 
+// Collective interface used by the meta backend under -sm tensor.
+//
+// Its generic fallback expresses an all-reduce as a butterfly of pairwise copies, and each of those
+// copies is a ggml_backend_tensor_copy_async that RPC cannot do device to device, so it degrades to
+// a blocking get_tensor followed by a set_tensor through the client. That is n*log2(n) strictly
+// serialized round trips per all-reduce boundary; on ten shards across forty-one boundaries it is
+// over a thousand round trips per token, and network latency alone then sets the token rate.
+//
+// The shape below trades bytes for latency, which is the right trade when the payload is a single
+// hidden state: gather every shard's partial in one pipelined round trip, sum on the client, and
+// scatter the result. One round trip per boundary regardless of shard count.
+struct ggml_backend_rpc_comm {
+    size_t n_backends;
+    std::vector<float>   accum;
+    std::vector<uint8_t> partial;
+};
+
+static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_backends) {
+    for (size_t i = 0; i < n_backends; i++) {
+        if (!ggml_backend_is_rpc(backends[i])) {
+            return nullptr;
+        }
+    }
+    ggml_backend_rpc_comm * comm = new ggml_backend_rpc_comm;
+    comm->n_backends = n_backends;
+    return comm;
+}
+
+static void ggml_backend_rpc_comm_free(void * comm_ctx) {
+    delete (ggml_backend_rpc_comm *)comm_ctx;
+}
+
+static bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx, ggml_tensor ** tensors) {
+    ggml_backend_rpc_comm * comm = (ggml_backend_rpc_comm *)comm_ctx;
+    const size_t n_backends = comm->n_backends;
+    const size_t nbytes     = ggml_nbytes(tensors[0]);
+    const size_t n_elements = ggml_nelements(tensors[0]);
+
+    // Bail out before touching anything, so the caller's butterfly stays a usable fallback.
+    for (size_t j = 0; j < n_backends; j++) {
+        if (tensors[j]->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensors[j]) ||
+            ggml_nbytes(tensors[j]) != nbytes || tensors[j]->buffer == nullptr ||
+            !ggml_backend_buffer_is_rpc(tensors[j]->buffer)) {
+            return false;
+        }
+    }
+
+    comm->accum.assign(n_elements, 0.0f);
+    comm->partial.resize(nbytes);
+
+    // A shard whose slice was empty never ran, so its buffer holds no partial to add in.
+    std::vector<bool> computed(n_backends);
+    for (size_t j = 0; j < n_backends; j++) {
+        computed[j] = (tensors[j]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+    }
+
+    std::vector<rpc_msg_get_tensor_req> requests(n_backends);
+    for (size_t j = 0; j < n_backends; j++) {
+        if (!computed[j]) {
+            continue;
+        }
+        ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)tensors[j]->buffer->context;
+        requests[j].tensor = serialize_tensor(tensors[j]);
+        requests[j].offset = 0;
+        requests[j].size   = nbytes;
+        if (!send_rpc_cmd(ctx->sock, RPC_CMD_GET_TENSOR, &requests[j], sizeof(requests[j]))) {
+            return false;
+        }
+    }
+    for (size_t j = 0; j < n_backends; j++) {
+        if (!computed[j]) {
+            continue;
+        }
+        ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)tensors[j]->buffer->context;
+        if (!recv_rpc_rsp(ctx->sock, RPC_CMD_GET_TENSOR, comm->partial.data(), nbytes)) {
+            return false;
+        }
+        const float * partial = (const float *)comm->partial.data();
+        for (size_t i = 0; i < n_elements; i++) {
+            comm->accum[i] += partial[i];
+        }
+    }
+
+    for (size_t j = 0; j < n_backends; j++) {
+        ggml_backend_tensor_set(tensors[j], comm->accum.data(), 0, nbytes);
+    }
+    return true;
+}
+
 static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (std::strcmp(name, "ggml_backend_rpc_add_server") == 0) {
         return (void *)ggml_backend_rpc_add_server;
     }
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
+    }
+    if (std::strcmp(name, "ggml_backend_comm_init") == 0) {
+        return (void *)ggml_backend_rpc_comm_init;
+    }
+    if (std::strcmp(name, "ggml_backend_comm_free") == 0) {
+        return (void *)ggml_backend_rpc_comm_free;
+    }
+    if (std::strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
+        return (void *)ggml_backend_rpc_comm_allreduce_tensor;
     }
     return NULL;
 
