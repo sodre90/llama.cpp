@@ -442,15 +442,18 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     // MLA compresses K and V into a single latent head (n_head_kv == 1), so attention has no head
-    // dimension to divide between devices. Mirror it and split only the FFN. The MLA projections
-    // (attn_q_a/attn_q_b/attn_kv/attn_output_a/attn_output_b) are named differently from the
-    // standard ones and already fall through to MIRRORED; attn_sinks and the KV cache do match the
-    // standard patterns, and those ask for a blk.N.attn_output.weight that this arch does not have.
-    const bool mirror_attention = ud->model->arch == LLM_ARCH_DEEPSEEK4;
+    // dimension to divide between devices. Mirror it and split only the FFN. Most MLA projections
+    // (attn_q_a/attn_q_b/attn_kv/attn_k_b/attn_v_b) are named differently from the standard ones and
+    // already fall through to MIRRORED. The rest have to be caught here: attn_sinks and the KV cache
+    // match the standard patterns, and glm-dsa calls its output projection attn_output.weight, which
+    // would otherwise be row split and then feed a mirrored activation into a mul_mat combination
+    // handle_mul_mat aborts on.
+    const bool mirror_attention = ud->model->arch == LLM_ARCH_DEEPSEEK4 || ud->model->arch == LLM_ARCH_GLM_DSA;
 
     auto get_tensor_config = [&]() -> tensor_config {
         if (mirror_attention &&
-                (std::regex_match(tensor_name, pattern_attn_sinks) || std::regex_match(tensor_name, pattern_kv_cache))) {
+                (std::regex_match(tensor_name, pattern_attn_sinks) || std::regex_match(tensor_name, pattern_kv_cache) ||
+                 std::regex_match(tensor_name, pattern_attn_out_weight))) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
 
