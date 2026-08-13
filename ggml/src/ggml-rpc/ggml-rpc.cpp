@@ -387,14 +387,16 @@ static const int64_t RPC_SPIN_US = std::getenv("GGML_RPC_SPIN_US") ? std::atoll(
 
 // Whether shards reduce among themselves instead of through the client, see RPC_CMD_ALLREDUCE.
 //
-// On by default, but only worth having if the shards keep a couple of cores free. A shard sends its
-// partial the moment it finishes, so it lands on peers that are still computing, and their NET_RX
-// softirq then preempts a compute thread. A ggml graph is a chain of thread barriers, so one
-// preempted worker stalls the rest. With a 22-thread pool on 24 vCPUs that costs 8% against the star
-// (192.09 vs 177.89 ms/token); at 20 threads the mesh wins by 10% (163.48 vs 181.08), which is the
-// best this fleet has measured. The mesh and the shard thread count are one setting, not two.
+// Off by default so that a harness which does not set it keeps the star it was written against.
+//
+// Worth turning on only if the shards keep a couple of cores free, because the two are one setting.
+// A shard sends its partial the moment it finishes, so it arrives at peers that are still computing;
+// with a 22-thread pool on 24 vCPUs that costs 8% against the star (192.09 vs 177.89 ms/token), and
+// at 20 threads the mesh wins by 10% (163.48 vs 181.08). The cost is an arrival landing on a busy
+// shard and spare cores removing it; which of NET_RX softirq stealing a core, the displaced compute
+// worker being migrated, or spin-wait contention does the damage is not established.
 // See DESIGN 2.7.25.
-static const bool RPC_MESH = std::getenv("GGML_RPC_MESH") == nullptr || std::atoi(std::getenv("GGML_RPC_MESH")) != 0;
+static const bool RPC_MESH = std::getenv("GGML_RPC_MESH") != nullptr && std::atoi(std::getenv("GGML_RPC_MESH")) != 0;
 
 struct rpc_cmd_stats {
     std::atomic<uint64_t> calls;
