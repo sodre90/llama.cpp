@@ -88,6 +88,14 @@ static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
+// RPC_CMD_SET_TENSOR_HASH reply. NO_CACHE lets a server without a tensor cache say so once, instead
+// of answering MISS forever while the client pays fnv_hash over every tensor to ask again.
+enum rpc_set_tensor_hash_result : uint8_t {
+    RPC_SET_TENSOR_HASH_MISS     = 0,
+    RPC_SET_TENSOR_HASH_HIT      = 1,
+    RPC_SET_TENSOR_HASH_NO_CACHE = 2,
+};
+
 // Upper bound on the row data a single RPC_CMD_SET_TENSOR_2D gathers before sending
 const size_t SET_TENSOR_2D_CHUNK_SIZE = 64 * 1024 * 1024;
 
@@ -536,6 +544,35 @@ static bool recv_rpc_rsp(socket_ptr sock, enum rpc_cmd cmd, void * output, size_
     return true;
 }
 
+// Same wire bytes as send_rpc_cmd on a concatenated buffer, but the payload is written straight from
+// the caller's memory. Building the combined buffer costs an allocation, a zero fill and a copy of
+// the whole tensor before the first byte reaches the socket.
+static bool send_rpc_cmd_with_payload(socket_ptr sock, enum rpc_cmd cmd,
+                                      const void * head, size_t head_size,
+                                      const void * body, size_t body_size) {
+    const int64_t t_start = RPC_STATS ? ggml_time_us() : 0;
+    uint8_t cmd_byte = cmd;
+    size_t input_size = head_size + body_size;
+    if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
+        return false;
+    }
+    if (!sock->send_data(&input_size, sizeof(input_size))) {
+        return false;
+    }
+    if (!sock->send_data(head, head_size)) {
+        return false;
+    }
+    if (!sock->send_data(body, body_size)) {
+        return false;
+    }
+    if (RPC_STATS) {
+        rpc_stats_add(g_rpc_stats[cmd].calls, 1);
+        rpc_stats_add(g_rpc_stats[cmd].bytes_sent, input_size + sizeof(cmd_byte) + sizeof(input_size));
+        rpc_stats_add(g_rpc_stats[cmd].send_us, ggml_time_us() - t_start);
+    }
+    return true;
+}
+
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
     if (!send_rpc_cmd(sock, cmd, input, input_size)) {
         return false;
@@ -717,7 +754,11 @@ static void ggml_backend_rpc_buffer_memset_tensor(
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
-    if (size > HASH_THRESHOLD) {
+    // fnv_hash is a byte at a time with a serial multiply chain, so asking costs a full pass over the
+    // tensor at a few hundred MB/s. Worth it against a cache that might answer HIT, never worth it
+    // against a server that has no cache at all -- on a 436 GB model that is one wasted pass per
+    // expert tensor, which is most of the model.
+    if (size > HASH_THRESHOLD && !ctx->sock->tensor_cache_absent.load(std::memory_order_relaxed)) {
         rpc_msg_set_tensor_hash_req request;
         request.tensor = rpc_tensor;
         request.offset = offset;
@@ -725,18 +766,19 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
         rpc_msg_set_tensor_hash_rsp response;
         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
         RPC_STATUS_ASSERT(status);
-        if (response.result) {
+        if (response.result == RPC_SET_TENSOR_HASH_HIT) {
             // the server has the same data, no need to send it
             return;
         }
+        if (response.result == RPC_SET_TENSOR_HASH_NO_CACHE) {
+            ctx->sock->tensor_cache_absent.store(true, std::memory_order_relaxed);
+        }
     }
     // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
-    size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
-    std::vector<uint8_t> input(input_size, 0);
-    memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
-    memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
-    memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
+    uint8_t head[sizeof(rpc_tensor) + sizeof(uint64_t)];
+    memcpy(head, &rpc_tensor, sizeof(rpc_tensor));
+    memcpy(head + sizeof(rpc_tensor), &offset, sizeof(offset));
+    bool status = send_rpc_cmd_with_payload(ctx->sock, RPC_CMD_SET_TENSOR, head, sizeof(head), data, size);
     RPC_STATUS_ASSERT(status);
 }
 
@@ -1605,9 +1647,13 @@ bool rpc_server::set_tensor_2d(const std::vector<uint8_t> & input) {
 
 bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response)
 {
+    if (!cache_dir) {
+        response.result = RPC_SET_TENSOR_HASH_NO_CACHE;
+        return true;
+    }
     std::vector<uint8_t> cached_file;
     if (!get_cached_file(request.hash, cached_file)) {
-        response.result = 0;
+        response.result = RPC_SET_TENSOR_HASH_MISS;
         return true;
     }
     size_t size = cached_file.size();
@@ -1641,7 +1687,7 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
         }
     }
     ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size);
-    response.result = 1;
+    response.result = RPC_SET_TENSOR_HASH_HIT;
     return true;
 }
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -34,6 +35,10 @@ struct socket_t {
 
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
+
+    // Set once the peer answers that it keeps no tensor cache, so that set_tensor stops paying a
+    // full serial hash pass over every tensor to ask a question whose answer cannot change.
+    std::atomic<bool> tensor_cache_absent{false};
 
     static socket_ptr create_server(const char * host, int port, int backlog = 1);
     static socket_ptr connect(const char * host, int port);
