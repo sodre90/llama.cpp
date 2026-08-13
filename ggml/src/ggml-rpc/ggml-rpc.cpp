@@ -74,6 +74,7 @@ enum rpc_cmd {
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
     RPC_CMD_MEMSET_TENSOR,
+    RPC_CMD_SET_TENSOR_2D,
     RPC_CMD_COUNT,
 };
 
@@ -81,6 +82,9 @@ static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
+
+// Upper bound on the row data a single RPC_CMD_SET_TENSOR_2D gathers before sending
+const size_t SET_TENSOR_2D_CHUNK_SIZE = 64 * 1024 * 1024;
 
 struct rpc_msg_hello_req {
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
@@ -347,6 +351,7 @@ static const char * rpc_cmd_name(enum rpc_cmd cmd) {
         case RPC_CMD_DEVICE_COUNT:      return "device_count";
         case RPC_CMD_GRAPH_RECOMPUTE:   return "graph_recompute";
         case RPC_CMD_MEMSET_TENSOR:     return "memset_tensor";
+        case RPC_CMD_SET_TENSOR_2D:     return "set_tensor_2d";
         default:                        return "?";
     }
 }
@@ -602,6 +607,39 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     RPC_STATUS_ASSERT(status);
 }
 
+// Write n_copies equally sized rows in one command instead of one command per row.
+//
+// A tensor split across devices hands each device a strided slice, so every row of it is a separate
+// contiguous region and the generic path in ggml_backend_tensor_set_2d turns each one into its own
+// set_tensor. Loading deepseek4 across two shards issued 90.2 million of them for 181 GiB, about
+// 2 KiB per network round trip, and the count grows with the number of shards.
+//
+// Rows travel packed, so the message carries exactly n_copies*size bytes and the server strides
+// them out on arrival. Chunked so the gather buffer stays bounded no matter how tall the slice is.
+static void ggml_backend_rpc_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
+        size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    rpc_tensor rpc_tensor = serialize_tensor(tensor);
+    const size_t header_size    = sizeof(rpc_tensor) + 3*sizeof(uint64_t);
+    const size_t rows_per_chunk = std::max<size_t>(1, SET_TENSOR_2D_CHUNK_SIZE / std::max<size_t>(1, size));
+    std::vector<uint8_t> input;
+    for (size_t row = 0; row < n_copies; row += rows_per_chunk) {
+        const size_t   rows         = std::min(rows_per_chunk, n_copies - row);
+        const uint64_t chunk_offset = offset + row*stride_tensor;
+        input.resize(header_size + rows*size);
+        uint8_t * dst = input.data();
+        memcpy(dst, &rpc_tensor, sizeof(rpc_tensor));    dst += sizeof(rpc_tensor);
+        memcpy(dst, &chunk_offset, sizeof(uint64_t));    dst += sizeof(uint64_t);
+        memcpy(dst, &size, sizeof(uint64_t));            dst += sizeof(uint64_t);
+        memcpy(dst, &stride_tensor, sizeof(uint64_t));   dst += sizeof(uint64_t);
+        for (size_t i = 0; i < rows; i++) {
+            memcpy(dst + i*size, (const char *) data + (row + i)*stride_data, size);
+        }
+        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_2D, input.data(), input.size());
+        RPC_STATUS_ASSERT(status);
+    }
+}
+
 static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_msg_get_tensor_req request;
@@ -648,7 +686,7 @@ static ggml_backend_buffer_i ggml_backend_rpc_buffer_interface = {
     /* .memset_tensor   = */ ggml_backend_rpc_buffer_memset_tensor,
     /* .set_tensor      = */ ggml_backend_rpc_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_rpc_buffer_get_tensor,
-    /* .set_tensor_2d   = */ NULL,
+    /* .set_tensor_2d   = */ ggml_backend_rpc_buffer_set_tensor_2d,
     /* .get_tensor_2d   = */ NULL,
     /* .cpy_tensor      = */ ggml_backend_rpc_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_rpc_buffer_clear,
@@ -982,6 +1020,7 @@ public:
     bool buffer_clear(const rpc_msg_buffer_clear_req & request);
     bool memset_tensor(const rpc_msg_memset_tensor_req & request);
     bool set_tensor(const std::vector<uint8_t> & input);
+    bool set_tensor_2d(const std::vector<uint8_t> & input);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
@@ -1312,6 +1351,63 @@ bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
     ifs.seekg(0, std::ios::beg);
     data.resize(size);
     ifs.read((char *)data.data(), size);
+    return true;
+}
+
+bool rpc_server::set_tensor_2d(const std::vector<uint8_t> & input) {
+    // serialization format: | rpc_tensor | offset (8) | size (8) | stride_tensor (8) | rows packed back to back |
+    const size_t header_size = sizeof(rpc_tensor) + 3*sizeof(uint64_t);
+    if (input.size() < header_size) {
+        return false;
+    }
+    const rpc_tensor * in_tensor = (const rpc_tensor *)input.data();
+    uint64_t offset, size, stride_tensor;
+    memcpy(&offset,        input.data() + sizeof(rpc_tensor),                    sizeof(offset));
+    memcpy(&size,          input.data() + sizeof(rpc_tensor) +   sizeof(offset), sizeof(size));
+    memcpy(&stride_tensor, input.data() + sizeof(rpc_tensor) + 2*sizeof(offset), sizeof(stride_tensor));
+    if (size == 0 || (input.size() - header_size) % size != 0) {
+        GGML_LOG_ERROR("[%s] payload of %zu bytes is not a whole number of %" PRIu64 " byte rows\n",
+                       __func__, input.size() - header_size, size);
+        return false;
+    }
+    const uint64_t n_copies = (input.size() - header_size) / size;
+
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+    ggml_tensor * tensor = deserialize_tensor(ctx, in_tensor);
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+        return false;
+    }
+    LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %" PRIu64 ", n_copies: %" PRIu64 ", stride: %" PRIu64 "\n",
+            __func__, (void*)tensor->buffer, tensor->data, offset, size, n_copies, stride_tensor);
+
+    // sanitize tensor->data, against the last row rather than the first
+    {
+        const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
+        const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+        const uint64_t last_offset = offset + (n_copies - 1)*stride_tensor;
+
+        if (stride_tensor < size || last_offset < offset ||
+            in_tensor->data + offset < p0 || in_tensor->data + offset >= p1 ||
+            size > (p1 - in_tensor->data - last_offset)) {
+            GGML_LOG_ERROR("[%s] tensor data region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%" PRIu64 ", n_copies=%" PRIu64
+                           ", stride=%" PRIu64 ") out of buffer bounds [0x%zx, 0x%zx)\n",
+                           __func__, in_tensor->data, offset, size, n_copies, stride_tensor, p0, p1);
+            return false;
+        }
+    }
+
+    const char * data = (const char *)input.data() + header_size;
+    for (uint64_t i = 0; i < n_copies; i++) {
+        ggml_backend_tensor_set(tensor, data + i*size, offset + i*stride_tensor, size);
+    }
     return true;
 }
 
@@ -1838,6 +1934,16 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!server.set_tensor(input)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_SET_TENSOR_2D: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                if (!server.set_tensor_2d(input)) {
                     return;
                 }
                 break;
