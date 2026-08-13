@@ -237,6 +237,10 @@ struct ggml_backend_rpc_buffer_type_context {
     std::string name;
     size_t      alignment;
     size_t      max_size;
+
+    // Answers to get_alloc_size, keyed by everything the answer can depend on.
+    std::mutex                                  alloc_size_mutex;
+    std::unordered_map<std::string, uint64_t>   alloc_sizes;
 };
 
 struct ggml_backend_rpc_context {
@@ -763,6 +767,37 @@ static size_t ggml_backend_rpc_get_max_size(ggml_backend_buffer_type_t buft) {
     return buft_ctx->max_size;
 }
 
+// An allocation size is a function of the shape of a tensor, never of which tensor it is. The
+// serialized request cannot be used as a cache key because it carries the tensor's id, data pointer
+// and name, which differ for every tensor and would make the cache miss every time. Key on the
+// fields the server can actually read instead: the layout and op of the tensor and of each src, and
+// whether a buffer is attached, since that is what selects the buffer type on the far side.
+//
+// Worth caching because the call is a blocking round trip per MUL_MAT_ID and FLASH_ATTN_EXT tensor
+// per device: measured 87,290 calls and 146 s of pure waiting to load deepseek4 across ten shards,
+// more than the 140 GiB of weights cost.
+static void alloc_size_key_append(std::string & key, const rpc_tensor & t) {
+    const auto put = [&key](const void * p, size_t n) { key.append((const char *) p, n); };
+    put(&t.type, sizeof(t.type));
+    put(t.ne, sizeof(t.ne));
+    put(t.nb, sizeof(t.nb));
+    put(&t.op, sizeof(t.op));
+    put(t.op_params, sizeof(t.op_params));
+    put(&t.flags, sizeof(t.flags));
+    const uint8_t has_buffer = t.buffer != 0;
+    put(&has_buffer, sizeof(has_buffer));
+}
+
+static std::string alloc_size_key(const rpc_msg_get_alloc_size_req & request) {
+    std::string key;
+    key.append((const char *) &request.device, sizeof(request.device));
+    alloc_size_key_append(key, request.tensor);
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        alloc_size_key_append(key, request.srcs[i]);
+    }
+    return key;
+}
+
 static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     // should we query the remote server for the actual size
     bool rpc_get = false;
@@ -790,11 +825,23 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
             request.srcs[i] = serialize_tensor(tensor->src[i]);
         }
 
-        // TODO: cache the alloc responses to avoid extra RPC calls?
+        const std::string key = alloc_size_key(request);
+        {
+            std::lock_guard<std::mutex> lock(buft_ctx->alloc_size_mutex);
+            auto it = buft_ctx->alloc_sizes.find(key);
+            if (it != buft_ctx->alloc_sizes.end()) {
+                return it->second;
+            }
+        }
+
         rpc_msg_get_alloc_size_rsp response;
         bool status = send_rpc_cmd(sock, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
         RPC_STATUS_ASSERT(status);
 
+        {
+            std::lock_guard<std::mutex> lock(buft_ctx->alloc_size_mutex);
+            buft_ctx->alloc_sizes[key] = response.alloc_size;
+        }
         return response.alloc_size;
     }
 
@@ -964,13 +1011,12 @@ ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, u
     }
     size_t alignment = get_alignment(sock, device);
     size_t max_size = get_max_size(sock, device);
-    ggml_backend_rpc_buffer_type_context * buft_ctx = new ggml_backend_rpc_buffer_type_context {
-        /* .endpoint  = */ endpoint,
-        /* .device    = */ device,
-        /* .name      = */ buft_name,
-        /* .alignment = */ alignment,
-        /* .max_size  = */ max_size
-    };
+    ggml_backend_rpc_buffer_type_context * buft_ctx = new ggml_backend_rpc_buffer_type_context();
+    buft_ctx->endpoint  = endpoint;
+    buft_ctx->device    = device;
+    buft_ctx->name      = buft_name;
+    buft_ctx->alignment = alignment;
+    buft_ctx->max_size  = max_size;
     auto reg = ggml_backend_rpc_add_server(endpoint);
     ggml_backend_buffer_type_t buft = new ggml_backend_buffer_type {
         /* .iface   = */ ggml_backend_rpc_buffer_type_interface,
