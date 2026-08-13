@@ -386,8 +386,12 @@ static const char * RPC_STATS = std::getenv("GGML_RPC_STATS");
 static const int64_t RPC_SPIN_US = std::getenv("GGML_RPC_SPIN_US") ? std::atoll(std::getenv("GGML_RPC_SPIN_US")) : 0;
 
 // Whether shards reduce among themselves instead of through the client, see RPC_CMD_ALLREDUCE.
-// On by default; GGML_RPC_MESH=0 restores the client-star path for an A/B against it.
-static const bool RPC_MESH = std::getenv("GGML_RPC_MESH") == nullptr || std::atoi(std::getenv("GGML_RPC_MESH")) != 0;
+//
+// Off by default: it is exact and it does take the client out of the boundary, but measured on ten
+// shards it costs 8% (192.09 against 177.89 ms/token). The boundary turned out to be a barrier paced
+// by the slowest shard's compute rather than a wire cost, and the mesh does nine sends and nine
+// receives per shard where the star did one of each. See DESIGN 2.7.24.
+static const bool RPC_MESH = std::getenv("GGML_RPC_MESH") != nullptr && std::atoi(std::getenv("GGML_RPC_MESH")) != 0;
 
 struct rpc_cmd_stats {
     std::atomic<uint64_t> calls;
