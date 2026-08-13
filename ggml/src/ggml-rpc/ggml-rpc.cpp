@@ -326,6 +326,10 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
 // the write blocks on a peer that is still busy.
 static const char * RPC_STATS = std::getenv("GGML_RPC_STATS");
 
+// How long a server waits for the next command by spinning before it parks. Off by default: it
+// costs a core, and only a latency bound workload such as a sharded decode gets anything back.
+static const int64_t RPC_SPIN_US = std::getenv("GGML_RPC_SPIN_US") ? std::atoll(std::getenv("GGML_RPC_SPIN_US")) : 0;
+
 struct rpc_cmd_stats {
     std::atomic<uint64_t> calls;
     std::atomic<uint64_t> bytes_sent;
@@ -1891,6 +1895,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     sock->update_caps(req.conn_caps);
     while (true) {
         const int64_t t_idle_start = RPC_STATS ? ggml_time_us() : 0;
+        if (RPC_SPIN_US > 0) {
+            sock->spin_until_readable(RPC_SPIN_US);
+        }
         if (!sock->recv_data(&cmd, 1)) {
             break;
         }

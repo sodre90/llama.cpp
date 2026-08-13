@@ -16,6 +16,10 @@ struct socket_t {
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
 
+    // Burn up to max_us waiting for the socket to become readable, so that the following recv_data
+    // finds the data already there instead of sleeping and being woken. Returns early once readable.
+    void spin_until_readable(int64_t max_us);
+
     socket_ptr accept();
 
     void get_caps(uint8_t * local_caps);

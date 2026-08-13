@@ -15,6 +15,7 @@
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
 #  include <netdb.h>
+#  include <poll.h>
 #  include <unistd.h>
 #endif
 #include <cstdlib>
@@ -554,6 +555,32 @@ bool socket_t::send_data(const void * data, size_t size) {
 
 bool socket_t::recv_data(void * data, size_t size) {
     return pimpl->recv_data(data, size);
+}
+
+// A sharded decode blocks on the next command about forty times per token, and on a virtualised
+// network the wakeup is a large share of the round trip: a 16 KiB ping pong between two of these
+// nodes costs 1.94 ms blocking and 1.22 ms with both ends spinning, against 15 us of wire time.
+// The spin is bounded so an idle server still parks instead of burning a core forever.
+void socket_t::spin_until_readable(int64_t max_us) {
+#ifdef GGML_RPC_RDMA
+    if (pimpl->use_rdma) {
+        return;
+    }
+#endif // GGML_RPC_RDMA
+    const int64_t deadline = ggml_time_us() + max_us;
+    do {
+#ifdef _WIN32
+        WSAPOLLFD pfd = { pimpl->fd, POLLRDNORM, 0 };
+        if (WSAPoll(&pfd, 1, 0) != 0) {
+            return;
+        }
+#else
+        struct pollfd pfd = { pimpl->fd, POLLIN, 0 };
+        if (poll(&pfd, 1, 0) != 0) {
+            return;
+        }
+#endif
+    } while (ggml_time_us() < deadline);
 }
 
 void socket_t::get_caps(uint8_t * local_caps) {
