@@ -2432,8 +2432,9 @@ static bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx, ggml_tensor 
         }
     }
 
-    comm->accum.assign(n_elements, 0.0f);
+    comm->accum.resize(n_elements);
     comm->partial.resize(nbytes);
+    bool accum_seeded = false;
 
     // A shard whose slice was empty never ran, so its buffer holds no partial to add in.
     std::vector<bool> computed(n_backends);
@@ -2462,10 +2463,21 @@ static bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx, ggml_tensor 
         ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)tensors[j]->buffer->context;
         bool status = recv_rpc_rsp(ctx->sock, RPC_CMD_GET_TENSOR, comm->partial.data(), nbytes);
         RPC_STATUS_ASSERT(status);
-        const float * partial = (const float *)comm->partial.data();
-        for (size_t i = 0; i < n_elements; i++) {
-            comm->accum[i] += partial[i];
+        // partial comes out of a byte vector, and a char pointer may alias anything, so without
+        // GGML_RESTRICT the compiler has to assume it overlaps accum and refuses to vectorize.
+        const float * GGML_RESTRICT partial = (const float *)comm->partial.data();
+        float       * GGML_RESTRICT accum   = comm->accum.data();
+        if (!accum_seeded) {
+            std::memcpy(accum, partial, nbytes);
+            accum_seeded = true;
+            continue;
         }
+        for (size_t i = 0; i < n_elements; i++) {
+            accum[i] += partial[i];
+        }
+    }
+    if (!accum_seeded) {
+        std::fill(comm->accum.begin(), comm->accum.end(), 0.0f);
     }
 
     for (size_t j = 0; j < n_backends; j++) {
