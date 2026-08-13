@@ -7,7 +7,12 @@ extern "C" {
 #endif
 
 #define RPC_PROTO_MAJOR_VERSION    8
-#define RPC_PROTO_MINOR_VERSION    0
+// Bumped for RPC_SET_TENSOR_HASH_NO_CACHE, which a client older than this reads as a cache hit and
+// answers by not sending the tensor at all. That is silent: the weights above HASH_THRESHOLD simply
+// never arrive and the model generates fluent nonsense. negotiate_hello rejects a server whose minor
+// exceeds the client's, so the bump turns a half-updated fleet into a failed handshake. The reverse
+// pairing stays fine, since a newer client reads an older server's MISS and sends the tensor.
+#define RPC_PROTO_MINOR_VERSION    1
 #define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
