@@ -1353,7 +1353,15 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 }
             }
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa);
+            // Prefetching maps the whole file with MAP_POPULATE, which reads every byte off disk
+            // before the loader looks at the first tensor. That is a win when the weights stay
+            // resident and a loss when they cannot: a client forwarding a 436 GB model to ten shards
+            // holds none of it, and 251 GB of page cache means the tail evicts the head, so the file
+            // is read twice. LLAMA_NO_PREFETCH=1 leaves the pages to fault in as they are shipped.
+            static const char * no_prefetch_env = getenv("LLAMA_NO_PREFETCH");
+            const bool no_prefetch = no_prefetch_env && atoi(no_prefetch_env) != 0;
+
+            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch && !no_prefetch ? -1 : 0, is_numa);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
