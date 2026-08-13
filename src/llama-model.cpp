@@ -448,6 +448,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     // standard patterns, and those ask for a blk.N.attn_output.weight that this arch does not have.
     const bool mirror_attention = ud->model->arch == LLM_ARCH_DEEPSEEK4;
 
+    // A split output head has to be gathered before sampling, and a speculative drafter that borrows
+    // the target head (DSpark carries no output.weight of its own) cannot reach it at all once it
+    // lives in the meta backend. Mirroring costs every device a full head read per token and buys
+    // back the gather, which is the cheaper half of that trade only because the head is small.
+    const bool mirror_output_head = mirror_attention;
+
     auto get_tensor_config = [&]() -> tensor_config {
         if (mirror_attention &&
                 (std::regex_match(tensor_name, pattern_attn_sinks) || std::regex_match(tensor_name, pattern_kv_cache))) {
@@ -522,7 +528,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
         // output
         if (std::regex_match(tensor_name, pattern_output_weight)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+            return get_tensor_config_impl(mirror_output_head ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_1);
         }
         if (std::regex_match(tensor_name, pattern_output_bias)) {
             const ggml_tensor * output_weight = ud->model->get_tensor("output.weight");
