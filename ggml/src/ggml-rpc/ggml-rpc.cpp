@@ -326,8 +326,9 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
 // the write blocks on a peer that is still busy.
 static const char * RPC_STATS = std::getenv("GGML_RPC_STATS");
 
-// How long a server waits for the next command by spinning before it parks. Off by default: it
-// costs a core, and only a latency bound workload such as a sharded decode gets anything back.
+// How long either end waits for the peer by spinning before it parks. Off by default: it costs a
+// core, and only a latency bound workload such as a sharded decode gets anything back. Both ends
+// have to spin for the full effect, since each one contributes a wakeup to the round trip.
 static const int64_t RPC_SPIN_US = std::getenv("GGML_RPC_SPIN_US") ? std::atoll(std::getenv("GGML_RPC_SPIN_US")) : 0;
 
 struct rpc_cmd_stats {
@@ -445,6 +446,9 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 // on the wire before blocking on the first reply instead of paying one full round trip per socket.
 static bool recv_rpc_rsp(socket_ptr sock, enum rpc_cmd cmd, void * output, size_t output_size) {
     const int64_t t_start = RPC_STATS ? ggml_time_us() : 0;
+    if (RPC_SPIN_US > 0) {
+        sock->spin_until_readable(RPC_SPIN_US);
+    }
     uint64_t out_size;
     if (!sock->recv_data(&out_size, sizeof(out_size))) {
         return false;
@@ -467,6 +471,9 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
         return false;
     }
     const int64_t t_start = RPC_STATS ? ggml_time_us() : 0;
+    if (RPC_SPIN_US > 0) {
+        sock->spin_until_readable(RPC_SPIN_US);
+    }
     uint64_t out_size;
     if (!sock->recv_data(&out_size, sizeof(out_size))) {
         return false;
