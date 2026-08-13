@@ -387,11 +387,14 @@ static const int64_t RPC_SPIN_US = std::getenv("GGML_RPC_SPIN_US") ? std::atoll(
 
 // Whether shards reduce among themselves instead of through the client, see RPC_CMD_ALLREDUCE.
 //
-// Off by default: it is exact and it does take the client out of the boundary, but measured on ten
-// shards it costs 8% (192.09 against 177.89 ms/token). The boundary turned out to be a barrier paced
-// by the slowest shard's compute rather than a wire cost, and the mesh does nine sends and nine
-// receives per shard where the star did one of each. See DESIGN 2.7.24.
-static const bool RPC_MESH = std::getenv("GGML_RPC_MESH") != nullptr && std::atoi(std::getenv("GGML_RPC_MESH")) != 0;
+// On by default, but only worth having if the shards keep a couple of cores free. A shard sends its
+// partial the moment it finishes, so it lands on peers that are still computing, and their NET_RX
+// softirq then preempts a compute thread. A ggml graph is a chain of thread barriers, so one
+// preempted worker stalls the rest. With a 22-thread pool on 24 vCPUs that costs 8% against the star
+// (192.09 vs 177.89 ms/token); at 20 threads the mesh wins by 10% (163.48 vs 181.08), which is the
+// best this fleet has measured. The mesh and the shard thread count are one setting, not two.
+// See DESIGN 2.7.25.
+static const bool RPC_MESH = std::getenv("GGML_RPC_MESH") == nullptr || std::atoi(std::getenv("GGML_RPC_MESH")) != 0;
 
 struct rpc_cmd_stats {
     std::atomic<uint64_t> calls;
