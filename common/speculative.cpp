@@ -2252,6 +2252,14 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.n_gpu_layers          = params_spec.n_gpu_layers;
         result.tensor_buft_overrides = params_spec.tensor_buft_overrides;
 
+        // The split mode is copied from the target along with the rest of the params, but a draft
+        // pinned to the host with -devd none has nothing to split across and LLAMA_SPLIT_MODE_TENSOR
+        // then fails its >= 1 device check. Keeping the drafter whole is the reason to pin it: it is
+        // small and latency bound, so sharding it would cost a fabric round trip per draft step.
+        if (result.devices.size() == 1 && result.devices[0] == nullptr) {
+            result.split_mode = LLAMA_SPLIT_MODE_NONE;
+        }
+
         if (params_spec.cpuparams.n_threads > 0) {
             result.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
             result.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
