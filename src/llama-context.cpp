@@ -3572,6 +3572,19 @@ llama_context * llama_init_from_model(
         }
     }
 
+    // A SPLIT_MODE_TENSOR target keeps its weights in a meta buffer that spans the RPC shards. A draft
+    // model that borrows the target's token embeddings and lm_head would then feed pre-allocated
+    // tensors from that buffer into its own graph, which the scheduler cannot place on the draft's
+    // backends and aborts on. Give the draft private copies so the two split modes stay independent.
+    if (model->arch == LLM_ARCH_EAGLE3 || model->arch == LLM_ARCH_DFLASH) {
+        if ((model->tok_embd == nullptr || model->output == nullptr) && params.ctx_other != nullptr) {
+            const llama_model * target = llama_get_model(params.ctx_other);
+            if (target->split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+                model->copy_shared_head_from_target(*target);
+            }
+        }
+    }
+
     if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) && params.type_k != params.type_v) {
         LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
         return nullptr;

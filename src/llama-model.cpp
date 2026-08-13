@@ -2055,6 +2055,65 @@ bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }
 
+// Draft models that reuse the target's token embeddings and lm_head ship without those tensors and
+// reach into the target model instead. That only works while the target's weights sit in a buffer the
+// draft's own backends can run on. Take private copies so the draft stops depending on where the
+// target keeps them; the reads go through the target's buffer interface, which reassembles split
+// tensors, so this works for a target spread across devices.
+void llama_model::copy_shared_head_from_target(const llama_model & target) {
+    std::vector<std::pair<ggml_tensor **, ggml_tensor *>> missing;
+    if (tok_embd == nullptr && target.tok_embd != nullptr) { missing.emplace_back(&tok_embd, target.tok_embd); }
+    if (output   == nullptr && target.output   != nullptr) { missing.emplace_back(&output,   target.output);   }
+    if (output_s == nullptr && target.output_s != nullptr) { missing.emplace_back(&output_s, target.output_s); }
+
+    if (missing.empty()) {
+        return;
+    }
+
+    ggml_init_params ctx_params = {
+        /*.mem_size   =*/ ggml_tensor_overhead()*missing.size(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(ctx_params) };
+    if (!ctx_ptr) {
+        throw std::runtime_error(format("%s: failed to create ggml context", __func__));
+    }
+
+    std::vector<ggml_tensor *> copies;
+    for (const auto & [slot, src] : missing) {
+        ggml_tensor * dst = ggml_dup_tensor(ctx_ptr.get(), src);
+        ggml_set_name(dst, ggml_get_name(src));
+        copies.push_back(dst);
+    }
+
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!dev) {
+        throw std::runtime_error(format("%s: no CPU backend found", __func__));
+    }
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_ptr.get(), ggml_backend_dev_buffer_type(dev));
+    if (!buf) {
+        throw std::runtime_error(format("%s: failed to allocate buffer for the shared head", __func__));
+    }
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    size_t n_bytes = 0;
+    for (size_t i = 0; i < missing.size(); i++) {
+        const auto & [slot, src] = missing[i];
+        ggml_backend_tensor_get(src, copies[i]->data, 0, ggml_nbytes(src));
+        n_bytes += ggml_nbytes(src);
+        *slot = copies[i];
+    }
+
+    std::vector<ggml_backend_buffer_ptr> bufs;
+    bufs.emplace_back(buf);
+    pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
+
+    LLAMA_LOG_INFO("%s: copied %zu shared head tensor(s) from the target model, %.2f MiB\n",
+            __func__, copies.size(), n_bytes/1024.0/1024.0);
+}
+
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
             [name](const std::pair<std::string, ggml_tensor *> & it) {
