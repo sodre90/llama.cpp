@@ -166,6 +166,19 @@ public:
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
+    // Claim cells at the given positions for seq_id without computing their contents.
+    //
+    // Sequence-parallel prefill splits the token rows across processes, so a rank holds the full
+    // weights but computes only its own slice and receives the rest of the cache from its peers. The
+    // attention mask is built from cell metadata before the graph runs, so those cells have to exist
+    // and carry the right positions by then -- the data lands later, written directly into the buffer.
+    //
+    // Positions are passed explicitly rather than as a range because the DSV4 compressed caches are
+    // indexed by window: row w holds the window starting at w*ratio, so their positions are strided.
+    //
+    // Returns the slot so the caller knows where to write. false if the cache has no room.
+    bool reserve_external(llama_seq_id seq_id, const std::vector<llama_pos> & positions, slot_info & sinfo);
+
     //
     // graph_build API
     //

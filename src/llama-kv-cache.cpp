@@ -2214,6 +2214,44 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
+bool llama_kv_cache::reserve_external(llama_seq_id seq_id, const std::vector<llama_pos> & positions, slot_info & sinfo) {
+    if (positions.empty()) {
+        LLAMA_LOG_ERROR("%s: no positions given\n", __func__);
+        return false;
+    }
+
+    // The extra position planes of M-RoPE cannot be reconstructed from a position alone, which is
+    // also why state_read_meta has to carry them explicitly.
+    if (hparams.n_pos_per_embd() > 1) {
+        LLAMA_LOG_ERROR("%s: not supported for multi-plane positions\n", __func__);
+        return false;
+    }
+
+    const uint32_t cell_count = (uint32_t) positions.size();
+
+    llama_batch_allocr balloc(hparams.n_pos_per_embd());
+
+    llama_ubatch ubatch = balloc.ubatch_reserve(cell_count, 1);
+
+    ubatch.seq_id_unq[0] = seq_id;
+
+    for (uint32_t i = 0; i < cell_count; ++i) {
+        ubatch.pos[i]      = positions[i];
+        ubatch.n_seq_id[i] = 1;
+        ubatch.seq_id[i]   = &seq_id;
+    }
+
+    sinfo = find_slot(ubatch, false);
+    if (sinfo.empty()) {
+        LLAMA_LOG_ERROR("%s: failed to find %u available cells in kv cache\n", __func__, cell_count);
+        return false;
+    }
+
+    apply_ubatch(sinfo, ubatch);
+
+    return true;
+}
+
 bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
