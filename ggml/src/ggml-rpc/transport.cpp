@@ -599,6 +599,15 @@ bool socket_t::set_buffer_size(size_t bytes) {
     return rcv && snd;
 }
 
+size_t socket_t::send_buffer_size() {
+    int size = 0;
+    socklen_t len = sizeof(size);
+    if (getsockopt(pimpl->fd, SOL_SOCKET, SO_SNDBUF, (char *) &size, &len) != 0 || size < 0) {
+        return 0;
+    }
+    return (size_t) size;
+}
+
 bool socket_t::set_recv_timeout(int seconds) {
 #ifdef _WIN32
     DWORD timeout = (DWORD) seconds * 1000;

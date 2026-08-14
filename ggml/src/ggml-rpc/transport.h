@@ -28,8 +28,12 @@ struct socket_t {
     uint16_t local_port();
 
     // Sizing the peer receive buffers above the largest message the mesh will carry is what keeps a
-    // send-all-then-recv-all exchange from deadlocking, see RPC_MESH_MAX_BYTES.
+    // send-all-then-recv-all exchange from deadlocking, see RPC_MESH_CHUNK_BYTES.
     bool set_buffer_size(size_t bytes);
+
+    // What the kernel actually granted. setsockopt reports success even when net.core.wmem_max clamps
+    // the request, so the size that governs the deadlock bound can only be learned by reading it back.
+    size_t send_buffer_size();
 
     // A collective has no reply for the client to time out on, so a dead peer has to surface here.
     bool set_recv_timeout(int seconds);

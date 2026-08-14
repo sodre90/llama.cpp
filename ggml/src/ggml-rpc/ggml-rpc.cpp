@@ -107,15 +107,26 @@ const size_t SET_TENSOR_2D_CHUNK_SIZE = 64 * 1024 * 1024;
 const uint32_t RPC_MESH_MAX_RANKS = 64;
 
 // Unit of every mesh exchange. Both partners of a butterfly step send before either reads, so a
-// transfer only stays deadlock free while it fits in the peer's receive buffer. Splitting a payload
-// into chunks of this size keeps that invariant at any tensor size: a rank runs at most one chunk
-// ahead of a partner, so a socket holds at most two, which the clamped buffer below still covers.
-// Ranks derive identical chunk boundaries from the payload size, so no coordination is needed.
-const size_t RPC_MESH_CHUNK_BYTES = 128 * 1024;
+// transfer only stays deadlock free while it fits in the socket buffers along the path. Splitting a
+// payload into chunks of this size keeps that invariant at any tensor size, and ranks derive identical
+// boundaries from the payload size, so no coordination is needed.
+//
+// Settable because the chunk count IS the exchange count, and the chunk loop overlaps nothing: chunk
+// i+1 is not sent until chunk i has been received and added, so every exchange pays the fabric latency
+// on its own. A 4 MiB prefill boundary is 32 chunks and 64 serialized exchanges at the default.
+// Raising net.core.{r,w}mem_max and this together trades that latency for fewer, larger transfers.
+// EVERY RANK MUST AGREE -- a mismatch hangs the collective, so one launcher sets it for the whole mesh.
+static size_t rpc_mesh_chunk_bytes() {
+    const char * env = std::getenv("GGML_RPC_MESH_CHUNK_KIB");
+    return std::max<size_t>(env ? std::atoll(env) : 128, 4) * 1024;
+}
 
-// Requested peer socket buffer, clamped by net.core.{r,w}mem_max. The default clamp of 208 KiB still
-// leaves the invariant above intact.
-const size_t RPC_MESH_SOCK_BUF = 1024 * 1024;
+const size_t RPC_MESH_CHUNK_BYTES = rpc_mesh_chunk_bytes();
+
+// Requested peer socket buffer, clamped by net.core.{r,w}mem_max. It has to track the chunk size
+// rather than sit at a fixed 1 MiB: once the sysctls are raised so a larger chunk is possible, this
+// would silently become the binding limit and the mutual send would deadlock instead.
+const size_t RPC_MESH_SOCK_BUF = std::max<size_t>(1024 * 1024, 2 * RPC_MESH_CHUNK_BYTES);
 
 // A peer that never sends its partial would otherwise hang the shard forever: the collective has no
 // reply, so the client is not waiting on anything it could time out.
@@ -2081,6 +2092,24 @@ bool rpc_server::mesh_connect(const rpc_msg_mesh_connect_req & request, rpc_msg_
         mesh_accepter.join();
     }
     mesh_listener.reset();
+
+    // A chunk larger than the granted buffer wedges both partners inside their mutual send, which
+    // presents as a hung fleet rather than an error. setsockopt reported success either way, so the
+    // clamp net.core.wmem_max applied is only visible on readback.
+    size_t smallest_granted_buffer = SIZE_MAX;
+    for (uint32_t r = 0; r < mesh_n_ranks; r++) {
+        if (r != mesh_rank && mesh_peers[r] != nullptr) {
+            smallest_granted_buffer = std::min(smallest_granted_buffer, mesh_peers[r]->send_buffer_size());
+        }
+    }
+    if (smallest_granted_buffer < RPC_MESH_CHUNK_BYTES) {
+        GGML_LOG_ERROR("[%s] rank %u was granted only a %zu KiB socket buffer for a %zu KiB chunk; "
+                       "raise net.core.wmem_max or lower GGML_RPC_MESH_CHUNK_KIB\n",
+                       __func__, mesh_rank, smallest_granted_buffer / 1024, RPC_MESH_CHUNK_BYTES / 1024);
+        return false;
+    }
+    LOG_DBG("[%s] rank %u chunk %zu KiB, smallest granted socket buffer %zu KiB\n",
+            __func__, mesh_rank, RPC_MESH_CHUNK_BYTES / 1024, smallest_granted_buffer / 1024);
 
     mesh_ready = true;
     for (uint32_t r = 0; r < mesh_n_ranks; r++) {
