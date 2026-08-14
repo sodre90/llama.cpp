@@ -1276,6 +1276,9 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             model, offload, unified_compressed, n_seq_max, DSV4_CSA_RATIO, 2*DSV4_CSA_RATIO,
             2*model.hparams.indexer_head_size, n_rs_seq, "lid", filter_csa);
 
+    // NOTE: reserve_external() below mirrors the ratios and filters chosen here. kv_lid deliberately
+    // shares filter_csa, so it lives on the same layers as kv_csa and is claimed at the same ratio.
+
     // DSV4 attention reads compressed-K / compressor-state rows that the current
     // graph does not necessarily overwrite; uninitialized buffer contents would
     // otherwise leak in (instance-specific garbage) and corrupt recall. Zero all
@@ -1641,6 +1644,57 @@ llama_dsv4_comp_state * llama_kv_cache_dsv4::get_hca_state() const {
 
 llama_dsv4_comp_state * llama_kv_cache_dsv4::get_lid_state() const {
     return lid_state.get();
+}
+
+bool llama_kv_cache_dsv4::reserve_external(llama_seq_id seq_id, llama_pos block_start) {
+    // Rank 0 owns the whole prefix, so there is nothing to claim on its behalf.
+    if (block_start <= 0) {
+        return true;
+    }
+
+    llama_kv_cache::slot_info sinfo;
+
+    // Raw attention is sliding-window, so only the n_swa positions immediately before the block are
+    // ever read. Claiming the whole prefix here would waste cells and, at long context, exhaust them.
+    {
+        const llama_pos p0 = std::max<llama_pos>(0, block_start - (llama_pos) hparams_raw.n_swa);
+
+        std::vector<llama_pos> positions;
+        positions.reserve((size_t) (block_start - p0));
+        for (llama_pos p = p0; p < block_start; ++p) {
+            positions.push_back(p);
+        }
+
+        if (!positions.empty() && !kv_raw->get_swa()->reserve_external(seq_id, positions, sinfo)) {
+            LLAMA_LOG_ERROR("%s: could not claim raw cells [%d, %d)\n", __func__, p0, block_start);
+            return false;
+        }
+    }
+
+    // A window is visible to a query only once it is COMPLETE -- see n_visible = (pos+1)/ratio in
+    // dsv4_build_comp_plan -- so the partial window straddling block_start is not claimed. The peer
+    // that owns block_start-1 also owns the rest of that window and commits it itself.
+    const auto reserve_windows = [&](llama_kv_cache * kv, uint32_t ratio) {
+        std::vector<llama_pos> positions;
+        for (llama_pos w = 0; (w + 1)*(llama_pos) ratio <= block_start; ++w) {
+            positions.push_back(w*(llama_pos) ratio);
+        }
+
+        if (positions.empty()) {
+            return true;
+        }
+
+        return kv->reserve_external(seq_id, positions, sinfo);
+    };
+
+    if (!reserve_windows(kv_csa.get(), DSV4_CSA_RATIO) ||
+        !reserve_windows(kv_hca.get(), DSV4_HCA_RATIO) ||
+        !reserve_windows(kv_lid.get(), DSV4_CSA_RATIO)) {
+        LLAMA_LOG_ERROR("%s: could not claim compressed rows before %d\n", __func__, block_start);
+        return false;
+    }
+
+    return true;
 }
 
 uint32_t llama_kv_cache_dsv4::get_n_rs_seq() const {

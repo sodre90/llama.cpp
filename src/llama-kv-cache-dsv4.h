@@ -152,6 +152,15 @@ public:
     const std::vector<uint32_t> & get_rs_idx() const;
     void reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches);
 
+    // Claim every cell a rank starting at block_start will read but not compute, so the attention
+    // mask covers them before the graph runs. Sequence-parallel prefill fills them from a peer.
+    //
+    // The fan-out is not uniform. Only the SWA window immediately before the block is ever read from
+    // the raw cache, so the rest of the prefix is not claimed there. The compressed caches are indexed
+    // by window -- row w holds the window starting at w*ratio -- and a query sees a window only once
+    // it is complete, so the last partial window is deliberately left out.
+    bool reserve_external(llama_seq_id seq_id, llama_pos block_start);
+
 private:
     llama_hparams hparams_raw;
     llama_hparams hparams_csa;
