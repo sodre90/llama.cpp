@@ -2755,7 +2755,12 @@ static void ggml_backend_rpc_device_get_props(ggml_backend_dev_t dev, struct ggm
         /* .host_buffer           = */ false,
         /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ false,
-        /* .mmap_support          = */ true,
+        // A remote device cannot read the client's mapping: every weight has to cross the wire
+        // regardless. Claiming otherwise let load_mode auto keep mmap on, and mmap prefetch adds
+        // MAP_POPULATE, which faults the whole file in before the loader ever contacts a server. A
+        // model larger than the client's RAM then thrashes inside mmap() and never reaches the
+        // shards at all -- silently, since nothing errors. Smaller models hide it by fitting.
+        /* .mmap_support          = */ false,
     };
 }
 
