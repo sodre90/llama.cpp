@@ -6,12 +6,18 @@
 extern "C" {
 #endif
 
-// Bumped for the recursive-doubling mesh allreduce. The wire format is unchanged, but the exchange
-// SCHEDULE is not: a tree shard expects log2(N) paired exchanges where an all-gather shard sends
-// N-1 unsolicited partials, so a half-updated fleet does not disagree, it hangs mid-token with no
-// error. The minor check only rejects a server NEWER than the client, which would let exactly the
-// dangerous pairing through; major is compared for inequality and catches both directions.
-#define RPC_PROTO_MAJOR_VERSION    9
+// Bumped for the chunked mesh allreduce, which lets the mesh carry any payload size. Same reasoning
+// as the bump it replaces: the wire format is unchanged but the exchange SCHEDULE is not, since a
+// chunked shard splits a payload into RPC_MESH_CHUNK_BYTES exchanges where an older one expects a
+// single transfer and rejects anything past that limit outright. A new client would otherwise only
+// find out at the first prefill boundary, one full model upload into the run.
+//
+// Bumped before that for the recursive-doubling mesh allreduce. The wire format was unchanged, but
+// the exchange SCHEDULE was not: a tree shard expects log2(N) paired exchanges where an all-gather
+// shard sends N-1 unsolicited partials, so a half-updated fleet does not disagree, it hangs mid-token
+// with no error. The minor check only rejects a server NEWER than the client, which would let exactly
+// the dangerous pairing through; major is compared for inequality and catches both directions.
+#define RPC_PROTO_MAJOR_VERSION    10
 // Bumped for RPC_SET_TENSOR_HASH_NO_CACHE, which a client older than this reads as a cache hit and
 // answers by not sending the tensor at all. That is silent: the weights above HASH_THRESHOLD simply
 // never arrive and the model generates fluent nonsense. negotiate_hello rejects a server whose minor

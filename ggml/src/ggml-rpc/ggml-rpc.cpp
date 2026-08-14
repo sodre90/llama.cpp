@@ -106,12 +106,12 @@ const size_t SET_TENSOR_2D_CHUNK_SIZE = 64 * 1024 * 1024;
 // generalising away.
 const uint32_t RPC_MESH_MAX_RANKS = 64;
 
-// Largest all-reduce the mesh will carry. Every rank sends to all the others before it reads any of
-// them, so the exchange only stays deadlock free while a whole message fits in the peer's receive
-// buffer; above this the client keeps using the client-star path, which has no such constraint. A
-// decode boundary is 16 KiB and a four-wide speculative verify is 64 KiB, so this covers the cases
-// the mesh exists for, while a prefill chunk at -ub 512 is 8 MiB and takes the star.
-const size_t RPC_MESH_MAX_BYTES = 128 * 1024;
+// Unit of every mesh exchange. Both partners of a butterfly step send before either reads, so a
+// transfer only stays deadlock free while it fits in the peer's receive buffer. Splitting a payload
+// into chunks of this size keeps that invariant at any tensor size: a rank runs at most one chunk
+// ahead of a partner, so a socket holds at most two, which the clamped buffer below still covers.
+// Ranks derive identical chunk boundaries from the payload size, so no coordination is needed.
+const size_t RPC_MESH_CHUNK_BYTES = 128 * 1024;
 
 // Requested peer socket buffer, clamped by net.core.{r,w}mem_max. The default clamp of 208 KiB still
 // leaves the invariant above intact.
@@ -1252,6 +1252,7 @@ public:
     bool mesh_connect(const rpc_msg_mesh_connect_req & request, rpc_msg_mesh_connect_rsp & response);
     bool allreduce(const rpc_msg_allreduce_req & request);
     bool mesh_reduce_recursive_doubling(size_t nbytes);
+    bool mesh_reduce_chunk(size_t off, size_t len);
 
     struct stored_graph {
         std::vector<uint8_t>   buffer;
@@ -2105,17 +2106,27 @@ bool rpc_server::mesh_connect(const rpc_msg_mesh_connect_req & request, rpc_msg_
 // two accumulated values, and IEEE addition is commutative even where it is not associative. The
 // result will NOT match the rank-order all-gather below, which groups the additions differently.
 bool rpc_server::mesh_reduce_recursive_doubling(size_t nbytes) {
-    const size_t n_elements = nbytes / sizeof(float);
-    mesh_incoming.resize(n_elements);
+    mesh_incoming.resize(std::min(nbytes, RPC_MESH_CHUNK_BYTES) / sizeof(float));
+    for (size_t off = 0; off < nbytes; off += RPC_MESH_CHUNK_BYTES) {
+        if (!mesh_reduce_chunk(off, std::min(RPC_MESH_CHUNK_BYTES, nbytes - off))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool rpc_server::mesh_reduce_chunk(size_t off, size_t len) {
+    const size_t n_elements = len / sizeof(float);
+    float * const chunk = (float *) ((char *) mesh_accum.data() + off);
 
     const auto recv_and_add = [&](uint32_t peer) {
         if (RPC_SPIN_US > 0) {
             mesh_peers[peer]->spin_until_readable(RPC_SPIN_US);
         }
-        if (!mesh_peers[peer]->recv_data(mesh_incoming.data(), nbytes)) {
+        if (!mesh_peers[peer]->recv_data(mesh_incoming.data(), len)) {
             return false;
         }
-        float       * GGML_RESTRICT accum    = mesh_accum.data();
+        float       * GGML_RESTRICT accum    = chunk;
         const float * GGML_RESTRICT incoming = mesh_incoming.data();
         for (size_t i = 0; i < n_elements; i++) {
             accum[i] += incoming[i];
@@ -2131,13 +2142,13 @@ bool rpc_server::mesh_reduce_recursive_doubling(size_t nbytes) {
 
     if (mesh_rank >= pof2) {
         const uint32_t owner = mesh_rank - pof2;
-        if (!mesh_peers[owner]->send_data(mesh_accum.data(), nbytes)) {
+        if (!mesh_peers[owner]->send_data(chunk, len)) {
             return false;
         }
         if (RPC_SPIN_US > 0) {
             mesh_peers[owner]->spin_until_readable(RPC_SPIN_US);
         }
-        return mesh_peers[owner]->recv_data(mesh_accum.data(), nbytes);
+        return mesh_peers[owner]->recv_data(chunk, len);
     }
 
     if (mesh_rank < folded && !recv_and_add(mesh_rank + pof2)) {
@@ -2145,12 +2156,12 @@ bool rpc_server::mesh_reduce_recursive_doubling(size_t nbytes) {
     }
     for (uint32_t mask = 1; mask < pof2; mask *= 2) {
         const uint32_t partner = mesh_rank ^ mask;
-        if (!mesh_peers[partner]->send_data(mesh_accum.data(), nbytes) || !recv_and_add(partner)) {
+        if (!mesh_peers[partner]->send_data(chunk, len) || !recv_and_add(partner)) {
             return false;
         }
     }
     if (mesh_rank < folded) {
-        return mesh_peers[mesh_rank + pof2]->send_data(mesh_accum.data(), nbytes);
+        return mesh_peers[mesh_rank + pof2]->send_data(chunk, len);
     }
     return true;
 }
@@ -2174,10 +2185,6 @@ bool rpc_server::allreduce(const rpc_msg_allreduce_req & request) {
         return false;
     }
     const size_t nbytes = ggml_nbytes(tensor);
-    if (nbytes > RPC_MESH_MAX_BYTES) {
-        GGML_LOG_ERROR("[%s] %zu bytes exceeds the mesh limit of %zu\n", __func__, nbytes, RPC_MESH_MAX_BYTES);
-        return false;
-    }
     {
         const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
         const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
@@ -2211,29 +2218,38 @@ bool rpc_server::allreduce(const rpc_msg_allreduce_req & request) {
 
     mesh_partials.resize(mesh_n_ranks);
 
-    // Every rank pushes its partial to all the others before reading any of them. That only holds
-    // without a deadlock because a whole message fits in the peer's receive buffer, see
-    // RPC_MESH_MAX_BYTES. A rank whose slice was empty never ran and has no partial to contribute,
+    // Every rank pushes its partial to all the others before reading any of them, so a whole
+    // transfer has to fit in the peer's receive buffer -- hence the chunk loop, see
+    // RPC_MESH_CHUNK_BYTES. A rank whose slice was empty never ran and has no partial to contribute,
     // but it still needs the sum, so it skips the send half and takes part in the rest.
     if (participates(mesh_rank)) {
         mesh_partials[mesh_rank].resize(nbytes);
         ggml_backend_tensor_get(tensor, mesh_partials[mesh_rank].data(), 0, nbytes);
-        for (uint32_t r = 0; r < mesh_n_ranks; r++) {
-            if (r != mesh_rank && !mesh_peers[r]->send_data(mesh_partials[mesh_rank].data(), nbytes)) {
-                GGML_ABORT("rank %u failed to send its partial to rank %u", mesh_rank, r);
-            }
-        }
     }
     for (uint32_t r = 0; r < mesh_n_ranks; r++) {
-        if (r == mesh_rank || !participates(r)) {
-            continue;
+        if (r != mesh_rank && participates(r)) {
+            mesh_partials[r].resize(nbytes);
         }
-        mesh_partials[r].resize(nbytes);
-        if (RPC_SPIN_US > 0) {
-            mesh_peers[r]->spin_until_readable(RPC_SPIN_US);
+    }
+    for (size_t off = 0; off < nbytes; off += RPC_MESH_CHUNK_BYTES) {
+        const size_t len = std::min(RPC_MESH_CHUNK_BYTES, nbytes - off);
+        if (participates(mesh_rank)) {
+            for (uint32_t r = 0; r < mesh_n_ranks; r++) {
+                if (r != mesh_rank && !mesh_peers[r]->send_data(mesh_partials[mesh_rank].data() + off, len)) {
+                    GGML_ABORT("rank %u failed to send its partial to rank %u", mesh_rank, r);
+                }
+            }
         }
-        if (!mesh_peers[r]->recv_data(mesh_partials[r].data(), nbytes)) {
-            GGML_ABORT("rank %u got no partial from rank %u within %d s", mesh_rank, r, RPC_MESH_TIMEOUT_SEC);
+        for (uint32_t r = 0; r < mesh_n_ranks; r++) {
+            if (r == mesh_rank || !participates(r)) {
+                continue;
+            }
+            if (RPC_SPIN_US > 0) {
+                mesh_peers[r]->spin_until_readable(RPC_SPIN_US);
+            }
+            if (!mesh_peers[r]->recv_data(mesh_partials[r].data() + off, len)) {
+                GGML_ABORT("rank %u got no partial from rank %u within %d s", mesh_rank, r, RPC_MESH_TIMEOUT_SEC);
+            }
         }
     }
 
@@ -2971,11 +2987,11 @@ static bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx, ggml_tensor 
         computed[j] = (tensors[j]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
     }
 
-    // The shards can reduce among themselves as long as the whole partial fits in a peer's receive
-    // buffer, see RPC_MESH_MAX_BYTES; a prefill chunk does not and takes the star below. Nothing is
-    // read back here, so the client does not block on the boundary at all: the next graph command
-    // queues behind the collective on each shard's socket and the ordering comes for free.
-    if (comm->mesh_ready && nbytes <= RPC_MESH_MAX_BYTES) {
+    // The shards reduce among themselves at any payload size, chunking the exchange to stay inside a
+    // peer's receive buffer. Nothing is read back here, so the client does not block on the boundary
+    // at all: the next graph command queues behind the collective on each shard's socket and the
+    // ordering comes for free. The star below survives only for a mesh that never came up.
+    if (comm->mesh_ready) {
         uint64_t participant_mask = 0;
         for (size_t j = 0; j < n_backends; j++) {
             if (computed[j]) {
