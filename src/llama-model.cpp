@@ -366,6 +366,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
     static const std::regex pattern_attn_out_weight ("blk\\.\\d*\\.attn_output.weight");
     static const std::regex pattern_attn_out_bias   ("blk\\.\\d*\\.attn_output.bias");
+    // MLA keeps its projections under their own names, so these do not overlap the patterns above:
+    // regex_match is a full match and "attn_output.weight" cannot reach past "attn_output_a.weight".
+    static const std::regex pattern_attn_q_b        ("blk\\.\\d*\\.attn_q_b\\.weight");
+    static const std::regex pattern_attn_out_a      ("blk\\.\\d*\\.attn_output_a\\.weight");
+    static const std::regex pattern_attn_out_b      ("blk\\.\\d*\\.attn_output_b\\.weight");
     static const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
 
     static const std::regex pattern_ssm_dt          ("blk\\.\\d*\\.ssm_dt.bias");
@@ -450,7 +455,34 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     // handle_mul_mat aborts on.
     const bool mirror_attention = ud->model->arch == LLM_ARCH_DEEPSEEK4 || ud->model->arch == LLM_ARCH_GLM_DSA;
 
+    // The comment above is about KV heads, and MLA really does leave none to divide. The QUERY heads
+    // are a different dimension and they are still there: 64 of them on Flash, 128 on Pro, and every
+    // op from attn_q_b through attn_output_a is head local. Splitting those gives a device a slice of
+    // attention instead of the full copy mirroring hands it.
+    //
+    // wo_a holds one matrix per head group, so a device has to own whole groups. When the group count
+    // does not divide the device count some device would end up with an empty slice, so fall back to
+    // mirroring -- that is the N=10 case on this fleet, since neither 8 nor 16 divides 10.
+    // The latent KV cache stays mirrored either way: there is only one of it and every head reads it.
+    const bool split_mla_heads = ud->model->arch == LLM_ARCH_DEEPSEEK4 &&
+        hparams.dsv4_o_group_count > 0 && hparams.dsv4_o_group_count % ud->n_devices == 0;
+
     auto get_tensor_config = [&]() -> tensor_config {
+        if (split_mla_heads) {
+            if (std::regex_match(tensor_name, pattern_attn_q_b)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output_b.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_attn_out_a)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "attn_output_b.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_attn_out_b)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+            }
+            if (std::regex_match(tensor_name, pattern_attn_sinks)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output_b.weight");
+            }
+        }
+
         if (mirror_attention &&
                 (std::regex_match(tensor_name, pattern_attn_sinks) || std::regex_match(tensor_name, pattern_kv_cache) ||
                  std::regex_match(tensor_name, pattern_attn_out_weight))) {
@@ -609,6 +641,25 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
     auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<std::pair<int64_t, uint32_t>> & segments) -> std::vector<int64_t> {
         // for better performance it may make sense to round up blck_size to a higher power of 2 so that more efficient kernels can be used
+        // The MLA tensors have to divide on head-group boundaries, and the generic attention cases below
+        // cannot express that: they derive granularity from n_embd_q = n_gqa * n_embd_head, which for
+        // n_head_kv == 1 is the whole query projection and would put every head on one device.
+        if (split_mla_heads) {
+            const int64_t n_heads_group = int64_t(hparams.n_head(il)) / int64_t(hparams.dsv4_o_group_count);
+            const int64_t o_group_dim   = n_heads_group * int64_t(hparams.n_embd_head_k(il));
+            if (std::regex_match(tensor_name, pattern_attn_q_b)) {
+                return {std::lcm(o_group_dim, blck_size)};
+            }
+            if (std::regex_match(tensor_name, pattern_attn_out_a)) {
+                return {1}; // splitting whole group matrices, so the quantisation block never straddles a cut
+            }
+            if (std::regex_match(tensor_name, pattern_attn_out_b)) {
+                return {std::lcm(int64_t(hparams.dsv4_o_lora_rank), blck_size)};
+            }
+            if (std::regex_match(tensor_name, pattern_attn_sinks)) {
+                return {n_heads_group};
+            }
+        }
         if (hparams.is_recr(il)) {
             // linear attention
             const int64_t head_dim        = hparams.ssm_d_state;

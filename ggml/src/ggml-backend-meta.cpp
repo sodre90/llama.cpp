@@ -536,7 +536,20 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (scalar_only && ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
             ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
         }
-        GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
+        if (ret.axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
+            // Naming the op and every operand's axis here is the difference between one rebuild and a
+            // guess: a scalar_only violation and two operands that merely disagree abort identically.
+            std::string operands;
+            for (size_t i = 0; i < GGML_MAX_SRC; i++) {
+                if (tensor->src[i] == nullptr) {
+                    continue;
+                }
+                operands += " src" + std::to_string(i) + "=" + tensor->src[i]->name +
+                            "(axis " + std::to_string(src_ss[i].axis) + ")";
+            }
+            GGML_ABORT("handle_generic: no split state for %s op=%s scalar_only=%d%s",
+                       tensor->name, ggml_op_name(tensor->op), scalar_only ? 1 : 0, operands.c_str());
+        }
         return ret;
     };
 
@@ -593,6 +606,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0) {
             GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+        }
+        // dims 2 and 3 broadcast, so a mul_mat is really one matrix per batch entry. DeepSeek4's output
+        // projection is grouped exactly that way: wo_a holds one matrix per head group and the attention
+        // output is permuted so groups land on the same axis. Splitting that axis on both operands hands
+        // each device whole groups and wholly independent matrices, so unlike the row split above there
+        // is no partial sum to reconcile afterwards.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2) {
+            GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
+            return src_ss[0];
         }
         GGML_ABORT("fatal error");
         //return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
@@ -758,6 +780,18 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
         }
+        // The comment above is about K and V, and it holds: the latent head cannot be divided. The QUERY
+        // heads are a separate dimension and they can be. flash_attn_ext already broadcasts a single KV
+        // head across all query heads, so a device given a slice of query heads reads the whole mirrored
+        // cache and computes those heads to completion -- no peer contribution, nothing to reconcile.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+                src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            GGML_ASSERT(                             src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
+            return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+        }
+
         GGML_ASSERT(                             src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
         GGML_ASSERT(                             src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2);
         GGML_ASSERT(                             src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2);
@@ -929,11 +963,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_SOFT_MAX_BACK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
-            case GGML_OP_ROPE: {
-                split_state = handle_rope(src_ss);
-            } break;
+            // ROPE_BACK shares the forward rope's layout contract: the rotation pairs values inside
+            // dim 0, so a split on heads keeps every rotation device local. It sat in the scalar_only
+            // bucket only because no split had ever reached it, which MLA's out_pe now does.
+            case GGML_OP_ROPE:
             case GGML_OP_ROPE_BACK: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+                split_state = handle_rope(src_ss);
             } break;
             case GGML_OP_CLAMP: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
