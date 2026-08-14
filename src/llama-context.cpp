@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache-dsv4.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -3906,6 +3907,26 @@ void llama_memory_clear(llama_memory_t mem, bool data) {
     }
 
     mem->clear(data);
+}
+
+bool llama_memory_reserve_external(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos block_start) {
+    if (!mem) {
+        return false;
+    }
+
+    // Which cells a rank reads but does not compute depends on the cache layout, so each memory type
+    // that supports the split answers for itself. Anything else has no meaningful answer and says so
+    // rather than silently claiming nothing and leaving the mask short at run time.
+    if (auto * dsv4 = dynamic_cast<llama_kv_cache_dsv4 *>(mem)) {
+        return dsv4->reserve_external(seq_id, block_start);
+    }
+
+    LLAMA_LOG_ERROR("%s: not implemented for this memory type\n", __func__);
+
+    return false;
 }
 
 bool llama_memory_seq_rm(

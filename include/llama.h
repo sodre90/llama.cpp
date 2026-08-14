@@ -729,6 +729,20 @@ extern "C" {
             llama_memory_t mem,
                       bool data);
 
+    // Claim the cells a sequence-parallel rank owning [block_start, ...) will read but not compute.
+    //
+    // Splitting a prefill by token rows leaves each rank holding the full weights but computing only
+    // its own slice; the cells before its block are filled from a peer. The attention mask is built
+    // from cell metadata before the graph runs, so those cells must exist and carry the right
+    // positions by then, with the data written into the buffers afterwards.
+    //
+    // Only claims what is actually read: the sliding window before the block for token caches, and
+    // completed windows only for compressed ones. Returns false if the cache has no room.
+    LLAMA_API bool llama_memory_reserve_external(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos block_start);
+
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
     // Returns false if a partial sequence cannot be removed. Removing a whole sequence never fails
     // seq_id < 0 : match any sequence
