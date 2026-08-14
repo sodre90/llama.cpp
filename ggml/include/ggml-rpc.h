@@ -6,7 +6,12 @@
 extern "C" {
 #endif
 
-#define RPC_PROTO_MAJOR_VERSION    8
+// Bumped for the recursive-doubling mesh allreduce. The wire format is unchanged, but the exchange
+// SCHEDULE is not: a tree shard expects log2(N) paired exchanges where an all-gather shard sends
+// N-1 unsolicited partials, so a half-updated fleet does not disagree, it hangs mid-token with no
+// error. The minor check only rejects a server NEWER than the client, which would let exactly the
+// dangerous pairing through; major is compared for inequality and catches both directions.
+#define RPC_PROTO_MAJOR_VERSION    9
 // Bumped for RPC_SET_TENSOR_HASH_NO_CACHE, which a client older than this reads as a cache hit and
 // answers by not sending the tensor at all. That is silent: the weights above HASH_THRESHOLD simply
 // never arrive and the model generates fluent nonsense. negotiate_hello rejects a server whose minor

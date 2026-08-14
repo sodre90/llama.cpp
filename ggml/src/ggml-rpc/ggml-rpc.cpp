@@ -1251,6 +1251,7 @@ public:
     bool mesh_listen(const rpc_msg_mesh_listen_req & request, rpc_msg_mesh_listen_rsp & response);
     bool mesh_connect(const rpc_msg_mesh_connect_req & request, rpc_msg_mesh_connect_rsp & response);
     bool allreduce(const rpc_msg_allreduce_req & request);
+    bool mesh_reduce_recursive_doubling(size_t nbytes);
 
     struct stored_graph {
         std::vector<uint8_t>   buffer;
@@ -1293,6 +1294,7 @@ private:
     bool                    mesh_ready   = false;
     std::vector<std::vector<uint8_t>> mesh_partials;
     std::vector<float>                mesh_accum;
+    std::vector<float>                mesh_incoming;
 };
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
@@ -2091,6 +2093,68 @@ bool rpc_server::mesh_connect(const rpc_msg_mesh_connect_req & request, rpc_msg_
     return true;
 }
 
+// log2(N) full-payload exchanges in place of the N-1 the all-gather below costs. The all-gather's
+// measured price is linear in N -- us per boundary divided by N is flat at 138/128/133 for N=2/4/8 --
+// and a token crosses 44 of these, so N-1 is what caps the useful shard count rather than any
+// property of the fabric.
+//
+// Ranks at or above the largest power of two fold into the low ranks first and collect the result
+// at the end. That costs two extra exchanges and keeps the butterfly itself a plain XOR pairing.
+//
+// Every rank finishes bit for bit identical to every other: at each step both partners add the same
+// two accumulated values, and IEEE addition is commutative even where it is not associative. The
+// result will NOT match the rank-order all-gather below, which groups the additions differently.
+bool rpc_server::mesh_reduce_recursive_doubling(size_t nbytes) {
+    const size_t n_elements = nbytes / sizeof(float);
+    mesh_incoming.resize(n_elements);
+
+    const auto recv_and_add = [&](uint32_t peer) {
+        if (RPC_SPIN_US > 0) {
+            mesh_peers[peer]->spin_until_readable(RPC_SPIN_US);
+        }
+        if (!mesh_peers[peer]->recv_data(mesh_incoming.data(), nbytes)) {
+            return false;
+        }
+        float       * GGML_RESTRICT accum    = mesh_accum.data();
+        const float * GGML_RESTRICT incoming = mesh_incoming.data();
+        for (size_t i = 0; i < n_elements; i++) {
+            accum[i] += incoming[i];
+        }
+        return true;
+    };
+
+    uint32_t pof2 = 1;
+    while (pof2 * 2 <= mesh_n_ranks) {
+        pof2 *= 2;
+    }
+    const uint32_t folded = mesh_n_ranks - pof2;
+
+    if (mesh_rank >= pof2) {
+        const uint32_t owner = mesh_rank - pof2;
+        if (!mesh_peers[owner]->send_data(mesh_accum.data(), nbytes)) {
+            return false;
+        }
+        if (RPC_SPIN_US > 0) {
+            mesh_peers[owner]->spin_until_readable(RPC_SPIN_US);
+        }
+        return mesh_peers[owner]->recv_data(mesh_accum.data(), nbytes);
+    }
+
+    if (mesh_rank < folded && !recv_and_add(mesh_rank + pof2)) {
+        return false;
+    }
+    for (uint32_t mask = 1; mask < pof2; mask *= 2) {
+        const uint32_t partner = mesh_rank ^ mask;
+        if (!mesh_peers[partner]->send_data(mesh_accum.data(), nbytes) || !recv_and_add(partner)) {
+            return false;
+        }
+    }
+    if (mesh_rank < folded) {
+        return mesh_peers[mesh_rank + pof2]->send_data(mesh_accum.data(), nbytes);
+    }
+    return true;
+}
+
 bool rpc_server::allreduce(const rpc_msg_allreduce_req & request) {
     if (!mesh_ready) {
         GGML_LOG_ERROR("[%s] allreduce before the mesh is up\n", __func__);
@@ -2127,6 +2191,24 @@ bool rpc_server::allreduce(const rpc_msg_allreduce_req & request) {
     const auto participates = [&request](uint32_t rank) {
         return ((request.participant_mask >> rank) & 1) != 0;
     };
+
+    bool all_participate = true;
+    for (uint32_t r = 0; r < mesh_n_ranks; r++) {
+        all_participate = all_participate && participates(r);
+    }
+    // A rank whose slice was empty has nothing to contribute but still needs the sum, and pairing
+    // that into a butterfly is fiddly. The all-gather below already handles it, so the cheap path
+    // only runs when every rank is in -- which is the case a symmetric split produces anyway.
+    if (all_participate) {
+        mesh_accum.resize(nbytes / sizeof(float));
+        ggml_backend_tensor_get(tensor, mesh_accum.data(), 0, nbytes);
+        if (!mesh_reduce_recursive_doubling(nbytes)) {
+            GGML_ABORT("rank %u failed a recursive-doubling exchange", mesh_rank);
+        }
+        ggml_backend_tensor_set(tensor, mesh_accum.data(), 0, nbytes);
+        return true;
+    }
+
     mesh_partials.resize(mesh_n_ranks);
 
     // Every rank pushes its partial to all the others before reading any of them. That only holds
