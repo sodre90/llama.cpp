@@ -79,6 +79,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <cstdarg>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
@@ -201,6 +202,28 @@ struct sp_state {
 
 static sp_state g;
 static bool  g_armed = true;
+
+// A peer dying used to call exit(1), which is right for a benchmark driver and fatal for a server:
+// one worker hiccup took the whole process down. Instead the session is marked failed, every
+// subsequent exchange becomes a no-op so the in-flight llama_decode can unwind instead of blocking on
+// a dead socket, and the caller turns that into a failed REQUEST. The decode's output is meaningless
+// once this is set, which is exactly why the caller must check it rather than trust rc.
+static bool g_failed = false;
+
+static void fail(const char * fmt, ...) {
+    if (!g_failed) {
+        va_list ap;
+        va_start(ap, fmt);
+        fprintf(stderr, "!! sp: ");
+        vfprintf(stderr, fmt, ap);
+        fprintf(stderr, "\n");
+        va_end(ap);
+    }
+    g_failed = true;
+}
+
+bool failed() { return g_failed; }
+
 static bool  g_trace = false;
 static FILE *g_dump  = nullptr;   // per-cell hashes, so a diff names the exact cell rather than a layer
 static int   g_occ[64] = {0};
@@ -372,7 +395,7 @@ static void sender_loop() {
             g.outbox.pop_front();
         }
         for (int fd : g.to_higher) {
-            if (!send_all(fd, buf.data(), buf.size())) { fprintf(stderr, "!! send failed\n"); exit(1); }
+            if (!send_all(fd, buf.data(), buf.size())) { fail("send failed"); return; }
             g.st.bytes_sent += buf.size();
         }
     }
@@ -384,18 +407,18 @@ static void sender_loop() {
 // N=2 run's 57.04 s and 47.6 s only reconcile through a ~9 s load skew. One byte never fills a socket
 // buffer, so sending to everyone before reading from anyone cannot deadlock.
 void barrier(const char * what) {
-    if (g.world == 1) return;
+    if (g.world == 1 || g_failed) return;
     const uint8_t tok = 0xB0;
-    for (int fd : g.to_higher)  if (!send_all(fd, &tok, 1)) { fprintf(stderr, "!! barrier send failed\n"); exit(1); }
-    for (int fd : g.from_lower) if (!send_all(fd, &tok, 1)) { fprintf(stderr, "!! barrier send failed\n"); exit(1); }
+    for (int fd : g.to_higher)  if (!send_all(fd, &tok, 1)) { fail("barrier send failed"); return; }
+    for (int fd : g.from_lower) if (!send_all(fd, &tok, 1)) { fail("barrier send failed"); return; }
     uint8_t got = 0;
-    for (int fd : g.to_higher)  if (!recv_all(fd, &got, 1)) { fprintf(stderr, "!! barrier recv failed\n"); exit(1); }
-    for (int fd : g.from_lower) if (!recv_all(fd, &got, 1)) { fprintf(stderr, "!! barrier recv failed\n"); exit(1); }
+    for (int fd : g.to_higher)  if (!recv_all(fd, &got, 1)) { fail("barrier recv failed"); return; }
+    for (int fd : g.from_lower) if (!recv_all(fd, &got, 1)) { fail("barrier recv failed"); return; }
     printf("== barrier %s passed\n", what);
 }
 
 static void flush_layer(int il) {
-    if (g.world == 1) { if (g_trace) trace_cache(il); g.pend.clear(); return; }
+    if (g.world == 1 || g_failed) { if (g_trace) trace_cache(il); g.pend.clear(); return; }
     const auto t0 = std::chrono::steady_clock::now();
 
     if (!g.to_higher.empty()) {
@@ -440,11 +463,11 @@ static void flush_layer(int il) {
     for (int fd : g.from_lower) {
         wire_header h{};
         if (!recv_all(fd, &h, sizeof h) || h.magic != SP_MAGIC || (int) h.layer != il) {
-            fprintf(stderr, "!! bad header at layer %d (magic %08x layer %u)\n", il, h.magic, h.layer);
-            exit(1);
+            fail("bad header at layer %d (magic %08x layer %u)", il, h.magic, h.layer);
+            return;
         }
         g.rbuf.resize(h.total_bytes - sizeof h);
-        if (!recv_all(fd, g.rbuf.data(), g.rbuf.size())) { fprintf(stderr, "!! recv body failed\n"); exit(1); }
+        if (!recv_all(fd, g.rbuf.data(), g.rbuf.size())) { fail("recv body failed"); return; }
         g.st.bytes_recv += h.total_bytes;
 
         const uint8_t * p = g.rbuf.data();
@@ -454,8 +477,8 @@ static void flush_layer(int il) {
             const pending_write * dst = nullptr;
             for (const auto & w : g.pend) if (w.slot == (int) ww.slot) { dst = &w; break; }
             if (!dst || dst->row_bytes != ww.row_bytes) {
-                fprintf(stderr, "!! layer %d slot %u has no matching local write\n", il, ww.slot);
-                exit(1);
+                fail("layer %d slot %u has no matching local write", il, ww.slot);
+                return;
             }
             const cache_geometry cg = geometry_of(*dst);
             for (uint32_t k = 0; k < ww.n_cells; k++, p += ww.row_bytes) {
@@ -521,6 +544,7 @@ void reset() {
     // ordinary request armed with a stale world > 1 and hang it against peers that no longer exist.
     // connect() arms, which ties armed-ness to having a session rather than to having been reset.
     g_armed      = false;
+    g_failed     = false;
     for (int & o : g_occ) o = 0;
 }
 

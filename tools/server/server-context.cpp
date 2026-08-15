@@ -20,6 +20,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <numeric>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -1211,18 +1212,12 @@ private:
             params_base.cb_eval = sp::eval_callback;
             sp::disarm();
 
-            // Prompt caching is switched OFF rather than worked around. A cached prefix would leave
-            // this server holding cache the lower ranks never received, and there is no way to hand
-            // it to them short of re-broadcasting the whole thing -- the serial handover v2 exists to
-            // avoid. Turning it off also makes n_past == 0 an invariant rather than a precondition to
-            // test, and sidesteps state_seq save/restore over reserve_external'd cells, which is
-            // untested. The cost is real: every turn of a conversation re-prefills. It is also 8x
-            // faster than it was, which is the trade this feature is for.
-            if (params_base.cache_prompt) {
-                SRV_WRN("%s", "sequence-parallel prefill disables prompt caching; every request "
-                              "prefills from scratch across the fleet\n");
-                params_base.cache_prompt = false;
-            }
+            // Prompt caching stays ON. Forward-only propagation means the TAIL rank -- this server --
+            // ends holding cache for the whole prompt, so a cached prefix lives exactly where the next
+            // turn needs it. The two paths do not have to agree: sp_prefill always starts at position
+            // 0 and takes the request only when the work it displaces is large, so a follow-up turn
+            // adding a few hundred tokens to a 16k conversation stays on the ordinary incremental path
+            // and costs seconds instead of re-prefilling the fleet.
             SRV_INF("sequence-parallel prefill: %zu workers, this server is rank %zu, min prompt %d\n",
                     params_base.sp_workers.size(), params_base.sp_workers.size(), params_base.sp_min_prompt);
         }
@@ -2827,40 +2822,86 @@ private:
     // remainder is left to that path on purpose: it keeps logits, sampling and every other slot
     // invariant untouched, and costs one short ubatch.
     //
-    // KNOWN SHARP EDGE, v1: every socket failure inside sp-prefill.cpp calls exit(1). That is right
-    // for a benchmark driver and wrong for a server -- one worker hiccup takes the process down. The
-    // fix is error returns that fail the REQUEST, and it is not done here.
+    // Always prefills [0, rows): propagation is forward-only, so there is nothing a cached prefix on
+    // this node could hand the lower ranks. Any cache the slot did hold is dropped, which is why the
+    // caller must only offer prompts where that trade pays.
     int sp_prefill(server_slot & slot) {
         if (params_base.sp_workers.empty()) {
             return 0;
         }
 
         const int n_tokens = slot.task->n_tokens();
-        const int world    = (int) params_base.sp_workers.size() + 1;
 
         // ((n-1)/128)*128 leaves at least one token for the ordinary path. A zero remainder would land
         // on the server's own [TAG_PROMPT_LOGITS] special case, which exists precisely because a slot
         // with nothing left to evaluate cannot produce logits.
         const int rows = ((n_tokens - 1) / 128) * 128;
-        if (n_tokens < params_base.sp_min_prompt || rows < world * 128) {
+        if (n_tokens < params_base.sp_min_prompt || rows < 2 * 128) {
             return 0;
         }
 
+        // Dial every worker BEFORE planning, because WHICH workers answer decides the partition. A
+        // fleet of ten that is missing one should run on nine, not collapse to this node alone: nine
+        // ranks still prefill 16k in ~87 s where one node needs ~686 s. A request is a commitment --
+        // the worker blocks waiting to be met -- so nothing is dispatched until the fleet is known.
+        std::vector<std::string> live;
+        std::vector<int> fds;
+        for (const auto & host : params_base.sp_workers) {
+            const int fd = spwire::dial(host, params_base.sp_worker_port, 2, 750);
+            if (fd < 0) {
+                SLT_WRN(slot, "sp: worker %s unreachable, continuing without it\n", host.c_str());
+                continue;
+            }
+            live.push_back(host);
+            fds.push_back(fd);
+        }
+        const bool degraded = live.size() != params_base.sp_workers.size();
+        const int  world    = (int) live.size() + 1;
+
+        auto give_up = [&](void) {
+            for (int f : fds) { close(f); }
+            return 0;
+        };
+
+        if (live.empty()) {
+            SLT_WRN(slot, "%s", "sp: no workers reachable -- single-node prefill\n");
+            return 0;
+        }
+        if (rows < world * 128) {
+            SLT_WRN(slot, "sp: %d rows is too little for %d ranks -- single-node prefill\n", rows, world);
+            return give_up();
+        }
+        if (degraded) {
+            SLT_WRN(slot, "sp: running degraded on %d of %zu workers\n", (int) live.size(),
+                    params_base.sp_workers.size());
+        }
+
         sp::config cfg;
-        cfg.hosts = params_base.sp_workers;
+        cfg.hosts = live;
         cfg.hosts.push_back("");   // this server holds the last rank; its own address is never dialled
         cfg.rank  = world - 1;
         cfg.rows  = rows;
         cfg.port  = params_base.sp_port;
-        cfg.sizes = params_base.sp_sizes.empty()
-                        ? sp::partition(rows, world)
-                        : std::vector<int>(params_base.sp_sizes.begin(), params_base.sp_sizes.end());
+
+        // A hand-given partition names one absolute block per rank, so it fits exactly one fleet size
+        // and one prompt length. Anything else -- a rank down, a prompt that is not the one it was
+        // tuned for -- takes the uniform split. It must never take the fallback to SOLO instead: a
+        // partition that does not fit is a reason to pick another partition, not to abandon nine
+        // healthy nodes and spend 686 s where 87 s would do.
+        const std::vector<int> tuned(params_base.sp_sizes.begin(), params_base.sp_sizes.end());
+        const bool tuned_fits = !tuned.empty() && (int) tuned.size() == world &&
+                                std::accumulate(tuned.begin(), tuned.end(), 0) == rows;
+        if (!tuned.empty() && !tuned_fits) {
+            SLT_WRN(slot, "sp: --sp-sizes does not fit %d rows over %d ranks -- using a uniform split\n",
+                    rows, world);
+        }
+        cfg.sizes = tuned_fits ? tuned : sp::partition(rows, world);
 
         sp::split blk;
         std::string err;
         if (!sp::plan(cfg, blk, err)) {
             SLT_WRN(slot, "sp: %s -- falling back to single-node prefill\n", err.c_str());
-            return 0;
+            return give_up();
         }
 
         // The head's block plus its halo must fit ONE ubatch: the exchange fires once per layer on the
@@ -2872,26 +2913,12 @@ private:
         if (n_head > n_ubatch || n_head > n_batch) {
             SLT_WRN(slot, "sp: head block %d exceeds n_ubatch %d / n_batch %d -- falling back\n",
                     n_head, n_ubatch, n_batch);
-            return 0;
+            return give_up();
         }
 
         std::vector<int32_t> ids(rows);
         for (int i = 0; i < rows; i++) {
             ids[i] = slot.task->tokens[i];
-        }
-
-        // Dial EVERY worker before sending ANY request. A request is a commitment -- the worker then
-        // blocks waiting to be met -- so a half-dispatched fleet cannot be abandoned, and dialling
-        // first makes "some worker is down" a clean fallback instead of a wedged fleet.
-        std::vector<int> fds;
-        for (const auto & host : params_base.sp_workers) {
-            const int fd = spwire::dial(host, params_base.sp_worker_port, 25);
-            if (fd < 0) {
-                SLT_WRN(slot, "sp: worker %s unreachable -- falling back\n", host.c_str());
-                for (int f : fds) { close(f); }
-                return 0;
-            }
-            fds.push_back(fd);
         }
 
         for (int r = 0; r < world - 1; r++) {
@@ -2913,10 +2940,16 @@ private:
             return 0;
         }
 
-        // Gate C proved exactly one ordering: seq_rm, then reserve_external, then prefill. n_past == 0
-        // says the SERVER holds no cached prefix for this slot, not that the cells are free.
+        // Gate C proved exactly one ordering: seq_rm, then reserve_external, then prefill.
+        //
+        // The slot's own record of its cache is dropped in the same breath as the cache itself. Every
+        // exit below this line -- success or failure -- then agrees with memory: either the fleet
+        // filled [0, rows), or the slot has nothing and the ordinary path prefills from position 0.
         llama_memory_t mem = llama_get_memory(ctx_tgt);
         llama_memory_seq_rm(mem, slot.id, -1, -1);
+        slot.prompt.clear();   // tokens AND checkpoints: a checkpoint of a cache that no longer exists
+        slot.n_prompt_tokens_cache = 0;
+
         if (blk.first > 0 && !llama_memory_reserve_external(mem, slot.id, blk.first)) {
             SLT_ERR(slot, "sp: reserve_external(%d) failed\n", blk.first);
             for (int f : fds) { close(f); }
@@ -2945,11 +2978,15 @@ private:
         llama_batch_free(sp_batch);
         for (int f : fds) { close(f); }
 
-        const sp::stats st = sp::get_stats();
+        const sp::stats st     = sp::get_stats();
+        const bool      peer_ok = !sp::failed();
         sp::reset();
 
-        if (rc != 0) {
-            SLT_ERR(slot, "sp: distributed prefill failed rc=%d\n", rc);
+        // A peer that dies mid-decode turns the exchange into a no-op so this rank can unwind instead
+        // of blocking on a dead socket. The decode then RETURNS ZERO over a cache with holes in it, so
+        // rc alone is not enough to trust the result.
+        if (rc != 0 || !peer_ok) {
+            SLT_ERR(slot, "sp: distributed prefill failed (rc=%d, peers=%s)\n", rc, peer_ok ? "ok" : "lost");
             llama_memory_seq_rm(mem, slot.id, -1, -1);
             return 0;
         }
@@ -3580,13 +3617,17 @@ private:
 
                         slot.prompt.tokens.keep_first(n_past);
 
-                        // Hand a long cold prompt to the worker fleet. Only a COLD one qualifies: the
-                        // fleet fills [0, rows) from scratch and propagation is forward-only, so a
-                        // slot already holding a prefix has nothing it could hand the lower ranks
-                        // short of re-broadcasting the whole cache, which is the serial handover this
-                        // design exists to avoid. Multimodal and alora prompts keep the ordinary path
-                        // because their chunking is not a flat token array.
-                        if (n_past == 0 && !slot.task->tokens.has_mtmd && slot.alora_invocation_start < 0) {
+                        // Hand a long prompt to the worker fleet. The fleet always starts at position
+                        // 0 and discards whatever prefix this slot had cached, so the test is on the
+                        // work that decision DISPLACES, not on the cache being empty: a follow-up turn
+                        // adding a few hundred tokens to a 16k conversation keeps the incremental path,
+                        // while a fresh 16k prompt that merely shares a system prefix still goes to the
+                        // fleet -- 16k alone is ~686 s against ~80 s split ten ways. Multimodal and
+                        // alora prompts keep the ordinary path: their chunking is not a flat token
+                        // array.
+                        const int n_uncached = slot.task->n_tokens() - n_past;
+                        if (n_uncached >= params_base.sp_min_prompt && !slot.task->tokens.has_mtmd &&
+                            slot.alora_invocation_start < 0) {
                             sp_prefill(slot);
                         }
 

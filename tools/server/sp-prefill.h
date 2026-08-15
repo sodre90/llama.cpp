@@ -71,6 +71,11 @@ void disarm();
 bool is_tail();
 int  world();
 
+// True if a peer died during the session. The exchange then becomes a no-op so the in-flight
+// llama_decode can unwind rather than block on a dead socket -- which means its OUTPUT IS MEANINGLESS
+// and rc alone must not be trusted. Always check this before using a decode's results.
+bool failed();
+
 // Compose these into your own cb_eval if you also want tracing; use eval_callback directly if not.
 bool wants(const ggml_tensor * t);
 bool on_tensor(ggml_tensor * t);

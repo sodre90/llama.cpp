@@ -6,8 +6,10 @@
 #pragma once
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -52,12 +54,33 @@ inline bool write_all(int fd, const void * p, size_t n) {
     return true;
 }
 
-inline int dial(const std::string & host, int port, int tries) {
+// A blocking connect() is not a liveness probe. A host that is merely down answers with RST and fails
+// in microseconds, but a host that is powered off or partitioned swallows the SYN, and the kernel then
+// retries for over a minute before returning. That is fine for a benchmark driver waiting on a fleet
+// that is still booting; it is fatal for a server deciding, per request, who is alive. Every attempt
+// here is bounded, which is what makes degrading onto the surviving ranks worth doing.
+inline int dial(const std::string & host, int port, int tries, int timeout_ms = 60000) {
     for (int i = 0; i < tries; i++) {
-        int s = socket(AF_INET, SOCK_STREAM, 0);
+        const int s = socket(AF_INET, SOCK_STREAM, 0);
+        if (s < 0) return -1;
+
         sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(port);
         inet_pton(AF_INET, host.c_str(), &a.sin_addr);
-        if (connect(s, (sockaddr *) &a, sizeof a) == 0) {
+
+        const int flags = fcntl(s, F_GETFL, 0);
+        fcntl(s, F_SETFL, flags | O_NONBLOCK);
+
+        bool up = connect(s, (sockaddr *) &a, sizeof a) == 0;
+        if (!up && errno == EINPROGRESS) {
+            pollfd pfd{s, POLLOUT, 0};
+            if (poll(&pfd, 1, timeout_ms) == 1) {
+                int soerr = 0;
+                socklen_t len = sizeof soerr;
+                up = getsockopt(s, SOL_SOCKET, SO_ERROR, &soerr, &len) == 0 && soerr == 0;
+            }
+        }
+        if (up) {
+            fcntl(s, F_SETFL, flags);
             int one = 1;
             setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
             return s;
