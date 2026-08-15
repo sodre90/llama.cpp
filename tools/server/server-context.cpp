@@ -1209,6 +1209,36 @@ private:
                         params_base.n_parallel);
                 return false;
             }
+            // The head's block plus its halo must fit one ubatch, and the head is the LAST rank, so
+            // it takes the FLOOR of the granule split -- the smallest block on the fleet. At the
+            // default -ub 512 that floor is still too big for every prompt worth splitting, so the
+            // fleet would be dialled, planned, and then skipped at warn level on every request, and
+            // the operator would see only that prefill was slow. Decide it here, while it is fixable.
+            const int sp_world = (int) params_base.sp_workers.size() + 1;
+            auto head_rows = [&](int rows) { return sp::partition(rows, sp_world).back() + 128; };
+
+            const int need = head_rows(params_base.sp_min_prompt);
+            if (need > (int) params_base.n_ubatch) {
+                SRV_ERR("--sp-workers cannot run at -ub %d: splitting the smallest eligible prompt "
+                        "(%d rows) over %d ranks leaves the head %d rows, which must fit one ubatch. "
+                        "Raise -ub (and -b) to at least %d.\n",
+                        params_base.n_ubatch, params_base.sp_min_prompt, sp_world, need, need);
+                return false;
+            }
+
+            int sp_max_prompt = 0;
+            for (int rows = params_base.sp_min_prompt; rows <= (int) params_base.n_ctx; rows += 128) {
+                if (head_rows(rows) > (int) params_base.n_ubatch) { break; }
+                sp_max_prompt = rows;
+            }
+            if (sp_max_prompt < (int) params_base.n_ctx) {
+                SRV_WRN("sequence-parallel prefill covers prompts up to %d rows; above that the head's "
+                        "block outgrows -ub %d and the request falls back to single-node prefill. "
+                        "Raise -ub (and -b) to %d to cover the whole %d-token context.\n",
+                        sp_max_prompt, params_base.n_ubatch,
+                        head_rows((int) params_base.n_ctx), params_base.n_ctx);
+            }
+
             params_base.cb_eval = sp::eval_callback;
             sp::disarm();
 
