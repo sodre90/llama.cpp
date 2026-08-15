@@ -614,6 +614,15 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
+    // sequence-parallel prefill: the prompt's ROWS are split across nodes, every node holding full
+    // weights. This server is the LAST rank, because propagation is forward-only and only the last
+    // rank ends holding a cache for the whole prompt -- generation then continues in this context.
+    std::vector<std::string> sp_workers;          // prefill workers, ranks 0..n-1; this server is rank n
+    int32_t sp_worker_port   = 5500;              // control port the workers listen on
+    int32_t sp_port          = 5400;              // base port for the rank-to-rank KV exchange
+    int32_t sp_min_prompt    = 4096;              // below this the split costs more than it saves
+    std::vector<int32_t> sp_sizes;                // per-rank row counts; empty means a uniform split
+
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT

@@ -1653,6 +1653,49 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--sp-workers"}, "HOST,HOST,...",
+        "comma-separated prefill workers for sequence-parallel prompt processing. They become ranks "
+        "0..n-1 and this server becomes rank n, which is forced: propagation is forward-only, so only "
+        "the last rank ends holding a cache for the whole prompt, and generation continues here",
+        [](common_params & params, const std::string & value) {
+            params.sp_workers.clear();
+            std::string cur;
+            for (char c : value + ",") {
+                if (c == ',') { if (!cur.empty()) params.sp_workers.push_back(cur); cur.clear(); }
+                else cur += c;
+            }
+        }
+    ).set_env("LLAMA_ARG_SP_WORKERS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--sp-worker-port"}, "N",
+        string_format("control port the prefill workers listen on (default: %d)", params.sp_worker_port),
+        [](common_params & params, int value) { params.sp_worker_port = value; }
+    ).set_env("LLAMA_ARG_SP_WORKER_PORT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--sp-port"}, "N",
+        string_format("base port for the rank-to-rank KV exchange (default: %d)", params.sp_port),
+        [](common_params & params, int value) { params.sp_port = value; }
+    ).set_env("LLAMA_ARG_SP_PORT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--sp-min-prompt"}, "N",
+        string_format("only split prompts of at least N tokens; below this the exchange costs more "
+                      "than the split saves (default: %d)", params.sp_min_prompt),
+        [](common_params & params, int value) { params.sp_min_prompt = value; }
+    ).set_env("LLAMA_ARG_SP_MIN_PROMPT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--sp-sizes"}, "N,N,...",
+        "per-rank row counts, each a multiple of 128, summing to the split length. Overrides the "
+        "uniform split; use it to pass a speed-weighted partition on a heterogeneous fleet",
+        [](common_params & params, const std::string & value) {
+            params.sp_sizes.clear();
+            std::string cur;
+            for (char c : value + ",") {
+                if (c == ',') { if (!cur.empty()) params.sp_sizes.push_back(std::stoi(cur)); cur.clear(); }
+                else cur += c;
+            }
+        }
+    ).set_env("LLAMA_ARG_SP_SIZES").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

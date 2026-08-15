@@ -23,6 +23,9 @@ add_library(${TARGET} STATIC
     server-mcp.h
     server-schema.cpp
     server-schema.h
+    sp-prefill.cpp
+    sp-prefill.h
+    sp-wire.h
 )
 
 if (BUILD_SHARED_LIBS)
