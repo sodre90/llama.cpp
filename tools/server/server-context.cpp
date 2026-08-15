@@ -2816,30 +2816,14 @@ private:
     };
 #endif
 
-    // Prefill a long prompt across the worker fleet instead of on this node alone.
-    //
-    // Returns how many prompt tokens the fleet consumed, or 0 to fall back to the ordinary path. The
-    // remainder is left to that path on purpose: it keeps logits, sampling and every other slot
-    // invariant untouched, and costs one short ubatch.
-    //
-    // Always prefills [0, rows): propagation is forward-only, so there is nothing a cached prefix on
-    // this node could hand the lower ranks. Any cache the slot did hold is dropped, which is why the
-    // caller must only offer prompts where that trade pays.
-    int sp_prefill(server_slot & slot) {
-        if (params_base.sp_workers.empty()) {
-            return 0;
-        }
+    // How one distributed prefill attempt ended. `torn` is the only one worth repeating: a peer died
+    // mid-flight, which says nothing about the other workers -- they are still loaded, still idle, and
+    // the next attempt simply finds a smaller fleet.
+    enum class sp_attempt { done, torn, fallback };
 
-        const int n_tokens = slot.task->n_tokens();
-
-        // ((n-1)/128)*128 leaves at least one token for the ordinary path. A zero remainder would land
-        // on the server's own [TAG_PROMPT_LOGITS] special case, which exists precisely because a slot
-        // with nothing left to evaluate cannot produce logits.
-        const int rows = ((n_tokens - 1) / 128) * 128;
-        if (n_tokens < params_base.sp_min_prompt || rows < 2 * 128) {
-            return 0;
-        }
-
+    // One distributed prefill of [0, rows). Leaves the slot consistent with llama_memory on every
+    // path, so a caller may retry or give up without repairing anything.
+    sp_attempt sp_prefill_once(server_slot & slot, int rows, const std::vector<int32_t> & ids) {
         // Dial every worker BEFORE planning, because WHICH workers answer decides the partition. A
         // fleet of ten that is missing one should run on nine, not collapse to this node alone: nine
         // ranks still prefill 16k in ~87 s where one node needs ~686 s. A request is a commitment --
@@ -2860,12 +2844,12 @@ private:
 
         auto give_up = [&](void) {
             for (int f : fds) { close(f); }
-            return 0;
+            return sp_attempt::fallback;
         };
 
         if (live.empty()) {
             SLT_WRN(slot, "%s", "sp: no workers reachable -- single-node prefill\n");
-            return 0;
+            return sp_attempt::fallback;
         }
         if (rows < world * 128) {
             SLT_WRN(slot, "sp: %d rows is too little for %d ranks -- single-node prefill\n", rows, world);
@@ -2916,11 +2900,6 @@ private:
             return give_up();
         }
 
-        std::vector<int32_t> ids(rows);
-        for (int i = 0; i < rows; i++) {
-            ids[i] = slot.task->tokens[i];
-        }
-
         for (int r = 0; r < world - 1; r++) {
             const spwire::request rq{spwire::MAGIC, (uint32_t) r, (uint32_t) world, (uint32_t) rows,
                                      (uint32_t) cfg.halo, (uint32_t) cfg.port,
@@ -2929,7 +2908,7 @@ private:
             if (!spwire::send_request(fds[r], rq, cfg.hosts, cfg.sizes, ids)) {
                 SLT_ERR(slot, "sp: dispatch to rank %d failed after the fleet was committed\n", r);
                 for (int f : fds) { close(f); }
-                return 0;
+                return sp_attempt::torn;
             }
         }
 
@@ -2937,7 +2916,7 @@ private:
             SLT_ERR(slot, "sp: connect failed (%s); workers may need restarting\n", err.c_str());
             for (int f : fds) { close(f); }
             sp::reset();
-            return 0;
+            return sp_attempt::torn;
         }
 
         // Gate C proved exactly one ordering: seq_rm, then reserve_external, then prefill.
@@ -2954,7 +2933,7 @@ private:
             SLT_ERR(slot, "sp: reserve_external(%d) failed\n", blk.first);
             for (int f : fds) { close(f); }
             sp::reset();
-            return 0;
+            return sp_attempt::fallback;
         }
 
         llama_batch sp_batch = llama_batch_init(n_head, 0, 1);
@@ -2988,7 +2967,7 @@ private:
         if (rc != 0 || !peer_ok) {
             SLT_ERR(slot, "sp: distributed prefill failed (rc=%d, peers=%s)\n", rc, peer_ok ? "ok" : "lost");
             llama_memory_seq_rm(mem, slot.id, -1, -1);
-            return 0;
+            return peer_ok ? sp_attempt::fallback : sp_attempt::torn;
         }
 
         SLT_INF(slot, "sp: %d tokens over %d ranks in %.2fs (%.1f tok/s), recv %.1f MiB, %d exchanges\n",
@@ -3000,7 +2979,62 @@ private:
             slot.prompt.tokens.push_back(ids[i]);
         }
         slot.n_prompt_tokens_processed += rows;
-        return rows;
+        return sp_attempt::done;
+    }
+
+    // Prefill a long prompt across the worker fleet instead of on this node alone.
+    //
+    // Returns how many prompt tokens the fleet consumed, or 0 to fall back to the ordinary path. The
+    // remainder is left to that path on purpose: it keeps logits, sampling and every other slot
+    // invariant untouched, and costs one short ubatch.
+    //
+    // Always prefills [0, rows): propagation is forward-only, so there is nothing a cached prefix on
+    // this node could hand the lower ranks. Any cache the slot did hold is dropped, which is why the
+    // caller must only offer prompts where that trade pays.
+    int sp_prefill(server_slot & slot) {
+        if (params_base.sp_workers.empty()) {
+            return 0;
+        }
+
+        const int n_tokens = slot.task->n_tokens();
+
+        // ((n-1)/128)*128 leaves at least one token for the ordinary path. A zero remainder would land
+        // on the server's own [TAG_PROMPT_LOGITS] special case, which exists precisely because a slot
+        // with nothing left to evaluate cannot produce logits.
+        const int rows = ((n_tokens - 1) / 128) * 128;
+        if (n_tokens < params_base.sp_min_prompt || rows < 2 * 128) {
+            return 0;
+        }
+
+        std::vector<int32_t> ids(rows);
+        for (int i = 0; i < rows; i++) {
+            ids[i] = slot.task->tokens[i];
+        }
+
+        // A node dying mid-prefill leaves every OTHER worker loaded and idle, so the cheapest thing to
+        // do with them is ask again -- the next dial simply finds a smaller fleet. Measured: a tear
+        // 30 s into a 16k prompt cost 763 s once it fell all the way back to one node, while eight
+        // ranks did the same prompt in 104 s.
+        //
+        // Bounded at one retry. A second tear inside a single request is a fleet problem rather than a
+        // node problem, and spending another 100 s to learn that only delays the solo path that is
+        // going to run anyway.
+        for (int attempt = 1; attempt <= 2; attempt++) {
+            switch (sp_prefill_once(slot, rows, ids)) {
+                case sp_attempt::done:
+                    return rows;
+                case sp_attempt::fallback:
+                    return 0;
+                case sp_attempt::torn:
+                    if (attempt == 1) {
+                        SLT_WRN(slot, "%s", "sp: the fleet tore mid-prefill; retrying on the survivors\n");
+                    } else {
+                        SLT_ERR(slot, "%s", "sp: the fleet tore twice -- single-node prefill\n");
+                    }
+                    break;
+            }
+        }
+        return 0;
     }
 
     void update_slots() {
