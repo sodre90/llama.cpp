@@ -74,6 +74,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -621,18 +622,32 @@ bool connect(const config & cfg, const split & s, std::string & err) {
     // Ranks connect low-to-high: rank i listens, every j > i dials in. Data only ever flows upward,
     // because attention is causal and a rank never needs rows after its own.
     int srv = -1;
+    // Every exit runs through this, because a caller that retries after a half-built session would
+    // otherwise fan the next request out over both the new sockets and the stale ones.
+    auto abandon = [&](std::string why) {
+        err = std::move(why);
+        if (srv >= 0) close(srv);
+        reset();
+        return false;
+    };
+
     if (g.rank < g.world - 1) {
         srv = listen_on(cfg.port + g.rank);
-        if (srv < 0) { err = "listen failed"; return false; }
+        if (srv < 0) return abandon("listen failed");
     }
     for (int j = 0; j < g.rank; j++) {
         const int c = connect_to(cfg.hosts[j], cfg.port + j, 120);
-        if (c < 0) { err = "could not reach " + cfg.hosts[j]; return false; }
+        if (c < 0) return abandon("could not reach " + cfg.hosts[j]);
         g.from_lower.push_back(c);
     }
+    // A bare accept() waits forever, so one rank that never arrives hangs every rank below it -- and
+    // the head, which is still inside a request. Ranks that are coming are already loaded and arrive
+    // within seconds of each other, so anything past a minute is a rank that is not coming.
     for (int j = g.rank + 1; j < g.world; j++) {
-        int c = accept(srv, nullptr, nullptr);
-        if (c < 0) { err = "accept failed"; return false; }
+        pollfd pfd{srv, POLLIN, 0};
+        if (poll(&pfd, 1, 60000) != 1) return abandon("timed out waiting for a higher rank to dial in");
+        const int c = accept(srv, nullptr, nullptr);
+        if (c < 0) return abandon("accept failed");
         set_nodelay(c);
         g.to_higher.push_back(c);
     }

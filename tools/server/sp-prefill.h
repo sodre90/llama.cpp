@@ -60,7 +60,9 @@ std::vector<int> partition(int rows, int world);
 bool plan(const config & cfg, split & out, std::string & err);
 
 // Ranks connect low-to-high: rank i listens, every j > i dials in. Call before loading the model --
-// the connect retries for two minutes, and overlapping it with an 8-11 minute load is free.
+// the connect retries for two minutes, and overlapping it with an 8-11 minute load is free. Bounded
+// at both ends, so a rank that never arrives fails the session instead of hanging every rank below
+// it. Cleans up after itself on failure: a caller may retry without calling reset() first.
 bool connect(const config & cfg, const split & sp_split, std::string & err);
 
 // Prefill exchanges KV per layer; decode must not. Disarm between the two, or a rank will block
