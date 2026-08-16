@@ -48,8 +48,11 @@ static common_speculative_output_limits server_output_limits(const common_params
         return { params.n_batch, 1 };
     }
 
-    auto result = common_speculative_get_output_limits(
-            params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
+    // a verify request wants one logit row per draft token plus one past the end -- the same shape a
+    // draft chain of that length needs, so the deeper of the two settles the budget
+    const int32_t n_rows = std::max(common_speculative_n_max(&params.speculative), params.n_verify_max);
+
+    auto result = common_speculative_get_output_limits(params.n_batch, params.n_parallel, n_rows);
 
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
@@ -4481,6 +4484,20 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     auto & rd = res->rd;
     auto & params = this->params;
 
+    // a verify request answers with logits the prompt already determined, so there is no token
+    // stream to follow and nothing for the OAI choice/delta shapes to carry
+    const bool is_verify = json_value(data, "verify_tail", 0) > 0;
+    if (is_verify) {
+        if (json_value(data, "stream", false)) {
+            res->error(format_error_response("verify_tail cannot be streamed", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (res_type != TASK_RESPONSE_TYPE_NONE) {
+            res->error(format_error_response("verify_tail is only available on the native completions endpoint", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+    }
+
     res->set_req(&req); // will also set spipe if needed
 
     int32_t sse_ping_interval = params.sse_ping_interval;
@@ -4571,7 +4588,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         } else {
             json arr = json::array();
             for (auto & res : all_results.results) {
-                GGML_ASSERT(dynamic_cast<server_task_result_cmpl_final*>(res.get()) != nullptr);
+                GGML_ASSERT(is_verify
+                        ? dynamic_cast<server_task_result_verify*>(res.get()) != nullptr
+                        : dynamic_cast<server_task_result_cmpl_final*>(res.get()) != nullptr);
                 arr.push_back(res->to_json());
             }
             GGML_ASSERT(!arr.empty() && "empty results");

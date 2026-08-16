@@ -608,6 +608,7 @@ struct common_params {
     int32_t sse_ping_interval   = 30;            // SSE ping interval in seconds
     int32_t n_threads_http      = -1;    // number of threads to process HTTP requests (TODO: support threadpool)
     int32_t n_cache_reuse       = 0;     // min chunk size to reuse from the cache via KV shifting
+    int32_t n_verify_max        = 0;     // longest draft chain a verify_tail request may check (0 = refuse)
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot

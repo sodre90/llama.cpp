@@ -499,8 +499,12 @@ struct server_task_result_rerank : server_task_result {
 };
 
 // One entry per verified position: the token the caller supplied, and what the target itself would
-// have produced there. The caller accepts the longest prefix where the two agree; the final entry
-// carries no supplied token and is the bonus token that follows a fully accepted chain.
+// have produced there. The caller accepts the longest prefix where the two agree, then appends the
+// target's own choice at the first unconfirmed position -- so target always carries one entry more
+// than draft, and accepting advances by n_accepted + 1 whether or not the chain survived intact.
+//
+// Only target[0..n_accepted] is meaningful. Entries beyond that were produced by attending to draft
+// tokens the target just rejected, so they answer a question about a prefix that will never exist.
 struct server_task_result_verify : server_task_result {
     std::vector<llama_token> draft;
     std::vector<llama_token> target;
