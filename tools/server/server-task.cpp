@@ -1544,6 +1544,7 @@ json server_task_result_verify::to_json() {
         {"n_accepted",       n_accepted},
         {"next_token",       next},
         {"tokens_evaluated", n_tokens},
+        {"prompt_n",         n_prompt_processed},
     };
 }
 

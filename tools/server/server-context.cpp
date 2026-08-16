@@ -2331,9 +2331,10 @@ private:
     // row whose prediction continues past the end of the chain.
     void send_verify(const server_slot & slot, const llama_batch & batch) {
         auto res = std::make_unique<server_task_result_verify>();
-        res->id       = slot.task->id;
-        res->index    = slot.task->index;
-        res->n_tokens = slot.task->n_tokens();
+        res->id                = slot.task->id;
+        res->index             = slot.task->index;
+        res->n_tokens          = slot.task->n_tokens();
+        res->n_prompt_processed = slot.n_prompt_tokens_processed;
 
         const int32_t n_vocab = llama_vocab_n_tokens(vocab);
 

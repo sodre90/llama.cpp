@@ -511,6 +511,10 @@ struct server_task_result_verify : server_task_result {
 
     int32_t n_tokens;
 
+    // how much of the prompt had to be decoded rather than reused. A caller that keeps extending a
+    // shared context needs this to tell a cheap round from one that silently replayed the context.
+    int32_t n_prompt_processed;
+
     virtual json to_json() override;
 };
 
