@@ -3891,7 +3891,14 @@ private:
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            // the request after a verify diverges somewhere inside the chain this one
+                            // is checking, so leave a checkpoint immediately before that chain. Without
+                            // it the next round falls back to the n_ubatch-spaced checkpoint and
+                            // replays that many tokens to reach a position a few tokens away.
+                            // Offset n_logits_tail rather than verify_tail, so the restored position
+                            // already satisfies the clamp at [TAG_PROMPT_LOGITS].
+                            const int n_verify = slot.task->params.verify_tail;
+                            const int checkpoint_offsets[] = {4 + n_ubatch, n_verify > 0 ? n_verify + 1 : 4, 4};
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
