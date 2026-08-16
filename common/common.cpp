@@ -1637,12 +1637,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
-    // A verify request rolls back the part of the draft chain the target rejected. On an arch that
-    // supports bounded partial rollback that is a cheap seq_rm, but only within n_rs_seq -- past
-    // the bound the server falls back to restoring a checkpoint, which sits before the accepted
-    // prefix and so re-decodes it in a second forward pass. Reserving the deepest chain the server
-    // will accept keeps the rollback inside the bound.
-    cparams.n_rs_seq          = std::max(params.speculative.need_n_rs_seq(), (uint32_t) std::max(params.n_verify_max, 0));
+    cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;
