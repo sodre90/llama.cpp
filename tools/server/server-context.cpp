@@ -3612,6 +3612,21 @@ private:
                                 n_past = 0;
                             }
 
+                            // A verify request wants decoded logits at the last verify_tail + 1
+                            // positions, so the cache has to stop short of all of them. This has to
+                            // happen before pos_next is derived: everything below -- which checkpoint
+                            // is usable, whether the state can be rolled back at all -- is decided
+                            // from pos_next, and a clamp applied afterwards can ask the memory to
+                            // roll back past the state those decisions just settled on, which a
+                            // recurrent model cannot do and aborts on.
+                            if (slot.task->params.verify_tail > 0) {
+                                const int n_logits_tail = 1 + slot.task->params.verify_tail;
+                                if (n_past > slot.task->n_tokens() - n_logits_tail) {
+                                    n_past = std::max(0, slot.task->n_tokens() - n_logits_tail);
+                                    SLT_DBG(slot, "verify wants %d logit rows, n_past clamped to %d\n", n_logits_tail, n_past);
+                                }
+                            }
+
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
@@ -3724,14 +3739,11 @@ private:
                         }
 
                         // [TAG_PROMPT_LOGITS]
-                        // logits exist only for tokens this batch actually decodes, so the cache has
-                        // to stop short of every position whose logits are wanted. Ordinarily that is
-                        // the single last token; a verify request also wants the draft positions, and
-                        // the one before them that predicts the first of them.
-                        const int n_logits_tail = 1 + slot.task->params.verify_tail;
-                        if (n_past > slot.task->n_tokens() - n_logits_tail && n_past > 0) {
-                            SLT_WRN(slot, "need to evaluate at least %d token(s) for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_logits_tail, n_past, slot.task->n_tokens());
-                            n_past = std::max(0, slot.task->n_tokens() - n_logits_tail);
+                        // a verify request was already clamped further back, before pos_next was
+                        // derived, so this only ever fires for the ordinary single-logit case
+                        if (n_past == slot.task->n_tokens() && n_past > 0) {
+                            SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
+                            n_past--;
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
