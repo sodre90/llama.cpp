@@ -1524,6 +1524,30 @@ json server_task_result_rerank::to_json() {
 }
 
 //
+// server_task_result_verify
+//
+json server_task_result_verify::to_json() {
+    size_t n_accepted = 0;
+    while (n_accepted < draft.size() && draft[n_accepted] == target[n_accepted]) {
+        n_accepted++;
+    }
+
+    // whether the chain diverged or matched to the end, the token to append is the same one: the
+    // target's own choice at the first position the caller has not had confirmed. Accepting a chain
+    // therefore always advances by n_accepted + 1 tokens.
+    const llama_token next = n_accepted < target.size() ? target[n_accepted] : LLAMA_TOKEN_NULL;
+
+    return json {
+        {"index",            index},
+        {"draft",            draft},
+        {"target",           target},
+        {"n_accepted",       n_accepted},
+        {"next_token",       next},
+        {"tokens_evaluated", n_tokens},
+    };
+}
+
+//
 // server_task_result_error
 //
 json server_task_result_error::to_json() {

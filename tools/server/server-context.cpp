@@ -2322,6 +2322,56 @@ private:
         queue_results.send(std::move(res));
     }
 
+    // Report the target's own greedy choice at each of the trailing prompt positions, so a caller
+    // that drafted those tokens on another machine can see where its chain diverged. Row i predicts
+    // the token at i+1, so the enabled rows are the draft tokens shifted back by one, plus one more
+    // row whose prediction continues past the end of the chain.
+    void send_verify(const server_slot & slot, const llama_batch & batch) {
+        auto res = std::make_unique<server_task_result_verify>();
+        res->id       = slot.task->id;
+        res->index    = slot.task->index;
+        res->n_tokens = slot.task->n_tokens();
+
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+
+        llama_tokens rows;
+
+        for (int i = 0; i < batch.n_tokens; ++i) {
+            if (!batch.logits[i] || batch.seq_id[i][0] != slot.id) {
+                continue;
+            }
+
+            const float * logits = llama_get_logits_ith(slot.ctx_tgt, i);
+            if (logits == nullptr) {
+                SLT_ERR(slot, "failed to get logits, token = %d, seq_id = %d\n", batch.token[i], batch.seq_id[i][0]);
+
+                rows.push_back(batch.token[i]);
+                res->target.push_back(LLAMA_TOKEN_NULL);
+                continue;
+            }
+
+            llama_token best = 0;
+            for (llama_token t = 1; t < n_vocab; ++t) {
+                if (logits[t] > logits[best]) {
+                    best = t;
+                }
+            }
+
+            rows.push_back(batch.token[i]);
+            res->target.push_back(best);
+        }
+
+        // the first enabled row holds the token BEFORE the chain -- it is what makes the last
+        // prediction land past the chain's end, and is not itself part of the draft
+        if (!rows.empty()) {
+            res->draft.assign(rows.begin() + 1, rows.end());
+        }
+
+        SLT_DBG(slot, "sending verify result, draft = %d, target = %d\n", (int) res->draft.size(), (int) res->target.size());
+
+        queue_results.send(std::move(res));
+    }
+
     //
     // Functions to process the task
     //
@@ -3670,9 +3720,14 @@ private:
                         }
 
                         // [TAG_PROMPT_LOGITS]
-                        if (n_past == slot.task->n_tokens() && n_past > 0) {
-                            SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
-                            n_past--;
+                        // logits exist only for tokens this batch actually decodes, so the cache has
+                        // to stop short of every position whose logits are wanted. Ordinarily that is
+                        // the single last token; a verify request also wants the draft positions, and
+                        // the one before them that predicts the first of them.
+                        const int n_logits_tail = 1 + slot.task->params.verify_tail;
+                        if (n_past > slot.task->n_tokens() - n_logits_tail && n_past > 0) {
+                            SLT_WRN(slot, "need to evaluate at least %d token(s) for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_logits_tail, n_past, slot.task->n_tokens());
+                            n_past = std::max(0, slot.task->n_tokens() - n_logits_tail);
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
@@ -3867,6 +3922,20 @@ private:
 
                         // extract the logits only for the last token
                         batch.set_output(batch.size() - 1, true);
+
+                        // a verify request needs the target's prediction at every draft position, not
+                        // just after the last one. The prediction FOR draft token i comes from the row
+                        // BEFORE it, so covering N draft tokens plus the bonus token means enabling the
+                        // final N+1 rows. Bounded by the batch to stay correct when the prompt spans
+                        // several batches -- a draft chain is a handful of tokens, so it always lands in
+                        // the last one.
+                        const int32_t n_verify = slot.task->params.verify_tail;
+                        if (n_verify > 0) {
+                            const int32_t first = std::max(0, batch.size() - (n_verify + 1));
+                            for (int32_t i = first; i < batch.size(); i++) {
+                                batch.set_output(i, true);
+                            }
+                        }
 
                         slot.n_decoded = 0;
                         slot.i_batch   = batch.size() - 1;
@@ -4074,6 +4143,15 @@ private:
 
                 if (slot.task->type == SERVER_TASK_TYPE_RERANK) {
                     send_rerank(slot, batch_view);
+                    slot.release();
+                    slot.i_batch = -1;
+                    return;
+                }
+
+                if (slot.task->params.verify_tail > 0) {
+                    // the whole point of the request was the prompt's own logits; there is nothing
+                    // left to generate once they have been read out
+                    send_verify(slot, batch_view);
                     slot.release();
                     slot.i_batch = -1;
                     return;

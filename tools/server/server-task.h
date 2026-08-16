@@ -64,6 +64,10 @@ struct task_params {
 
     int32_t n_cache_reuse = 0; // min chunk size to attempt reusing from the cache via KV shifting (0 = disabled)
 
+    // Distributed speculative decoding verifies a candidate chain that was drafted elsewhere, so it
+    // needs the target's own prediction at every draft position rather than only after the last one.
+    int32_t verify_tail = 0; // report argmax for the final N prompt positions (0 = disabled)
+
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
 
@@ -488,6 +492,18 @@ struct server_task_result_embd : server_task_result {
 
 struct server_task_result_rerank : server_task_result {
     float score = -1e6;
+
+    int32_t n_tokens;
+
+    virtual json to_json() override;
+};
+
+// One entry per verified position: the token the caller supplied, and what the target itself would
+// have produced there. The caller accepts the longest prefix where the two agree; the final entry
+// carries no supplied token and is the bonus token that follows a fully accepted chain.
+struct server_task_result_verify : server_task_result {
+    std::vector<llama_token> draft;
+    std::vector<llama_token> target;
 
     int32_t n_tokens;
 
