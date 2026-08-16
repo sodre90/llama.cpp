@@ -1518,7 +1518,12 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         uint64_t buffer_start = (uint64_t) ggml_backend_buffer_get_base(result->buffer);
         uint64_t buffer_size = (uint64_t) ggml_backend_buffer_get_size(result->buffer);
         GGML_ASSERT(tensor->data + tensor_size >= tensor->data); // check for overflow
-        GGML_ASSERT(tensor->data >= buffer_start && tensor->data + tensor_size <= buffer_start + buffer_size);
+        // An empty slice addresses no bytes, so its pointer is vacuously in bounds and may legitimately
+        // sit past the buffer end. Splitting a recurrent state cache across >= 3 backends hands at
+        // least one shard a zero-row slice (ne[1] == 0), and asserting on it aborted the whole split.
+        if (tensor_size > 0) {
+            GGML_ASSERT(tensor->data >= buffer_start && tensor->data + tensor_size <= buffer_start + buffer_size);
+        }
     }
 
     result->op = (ggml_op) tensor->op;
