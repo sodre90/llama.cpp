@@ -3898,8 +3898,13 @@ private:
                             // replays that many tokens to reach a position a few tokens away.
                             // Offset n_logits_tail rather than verify_tail, so the restored position
                             // already satisfies the clamp at [TAG_PROMPT_LOGITS].
+                            //
+                            // These offsets split the batch whether or not a checkpoint gets created,
+                            // and a split costs a whole forward pass. So a verify request drops the
+                            // offset-4 boundary: it would buy a checkpoint inside the chain, which is
+                            // exactly where the next round diverges and invalidates it.
                             const int n_verify = slot.task->params.verify_tail;
-                            const int checkpoint_offsets[] = {4 + n_ubatch, n_verify > 0 ? n_verify + 1 : 4, 4};
+                            const int checkpoint_offsets[] = {4 + n_ubatch, n_verify > 0 ? n_verify + 1 : 4};
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
