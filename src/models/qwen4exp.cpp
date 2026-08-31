@@ -741,6 +741,40 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     return top_k;
 }
 
+// LLAMA_QSA_GATHER=0 restores the masked path so both can be measured from one build
+static bool qsa_gather_enabled() {
+    static const bool enabled = []() {
+        const char * requested = getenv("LLAMA_QSA_GATHER");
+        return requested == nullptr || atoi(requested) != 0;
+    }();
+
+    return enabled;
+}
+
+// One gathered K/V can serve the whole batch only when every query named the same cells, which
+// means one token per stream; with more, each token has its own top_k. It also has to be a real
+// shrink, or the copy costs more than the masked read it replaces. A transposed V cache is laid
+// out by dimension rather than by cell, so its cells are not gatherable rows.
+static bool qsa_gather_pays_off(const ggml_tensor * top_k, const ggml_tensor * k_cache, const ggml_tensor * v_cache) {
+    const bool one_selection_per_stream = top_k->ne[1] == 1;
+    const bool shrinks_the_read         = 2*top_k->ne[0] <= k_cache->ne[2];
+    const bool v_transposed             = v_cache->nb[1] > v_cache->nb[2];
+
+    return qsa_gather_enabled() && one_selection_per_stream && shrinks_the_read && !v_transposed;
+}
+
+// Head and head-dim are contiguous within one cell, so they merge into a single row and get_rows
+// can index the cell dimension directly.
+static ggml_tensor * qsa_gather_cells(ggml_context * ctx0, ggml_tensor * cache, ggml_tensor * cell_idx) {
+    ggml_tensor * cells = ggml_view_3d(ctx0, cache,
+            cache->ne[0]*cache->ne[1], cache->ne[2], cache->ne[3],
+            cache->nb[2], cache->nb[3], 0);
+
+    ggml_tensor * selected = ggml_get_rows(ctx0, cells, cell_idx);
+
+    return ggml_reshape_4d(ctx0, selected, cache->ne[0], cache->ne[1], cell_idx->ne[0], cache->ne[3]);
+}
+
 // Dense GQA self-attention restricted to the cells that top_k names.
 // The mask build below copies the MLA sparse path in llm_graph_context::build_attn.
 ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
@@ -782,6 +816,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
+    ggml_tensor * k_cache = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v_cache = mctx_cur->get_v(ctx0, il);
+
+    ggml_tensor * cur = qsa_gather_pays_off(top_k, k_cache, v_cache)
+        ? build_attn_qsa_gathered(q_cur, k_cache, v_cache, kq_mask, top_k, kq_scale, il)
+        : build_attn_qsa_masked  (q_cur, k_cache, v_cache, kq_mask, top_k, kq_scale, il);
+    cb(cur, "kqv_out", il);
+
+    // the rotation is its own inverse, so undo it on the value side of the output
+    if (inp->self_v_rot) {
+        cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+    }
+
+    return cur;
+}
+
+ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa_masked(
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cache,
+        ggml_tensor * v_cache,
+        ggml_tensor * kq_mask,
+        ggml_tensor * top_k,
+        float         kq_scale,
+        int           il) {
     // prepare new kq mask - starts filled with -INFINITY
     ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
 
@@ -808,19 +866,39 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     // combine with the original kq mask
     kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
 
-    ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    return build_attn_mha(q_cur, k_cache, v_cache, nullptr, kq_mask_top_k, nullptr, nullptr, 0, kq_scale, il);
+}
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, 0, kq_scale, il);
-    cb(cur, "kqv_out", il);
+ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa_gathered(
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cache,
+        ggml_tensor * v_cache,
+        ggml_tensor * kq_mask,
+        ggml_tensor * top_k,
+        float         kq_scale,
+        int           il) {
+    const int64_t width     = top_k->ne[0];
+    const int64_t n_stream  = top_k->ne[3];
 
-    // the rotation is its own inverse, so undo it on the value side of the output
-    if (inp->self_v_rot) {
-        cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
-    }
+    // [n_top_k, 1, 1, n_stream] -> [n_top_k, n_stream, 1]: get_rows takes one index row per stream
+    ggml_tensor * cell_idx = ggml_reshape_3d(ctx0, top_k, width, n_stream, 1);
 
-    return cur;
+    ggml_tensor * k_sel = qsa_gather_cells(ctx0, k_cache, cell_idx);
+    ggml_tensor * v_sel = qsa_gather_cells(ctx0, v_cache, cell_idx);
+
+    // top_k still names masked cells when the cache holds fewer live cells than its budget, so the
+    // mask travels through the same gather. [n_kv, 1, 1, n_stream] -> [1, n_kv, 1, n_stream] puts
+    // the cells on the axis get_rows indexes.
+    ggml_tensor * mask_cells = ggml_view_4d(ctx0, kq_mask,
+            1, kq_mask->ne[0], 1, kq_mask->ne[3],
+            kq_mask->nb[0], kq_mask->nb[0]*kq_mask->ne[0], kq_mask->nb[3], 0);
+
+    ggml_tensor * mask_sel = ggml_get_rows(ctx0, mask_cells,
+            ggml_reshape_4d(ctx0, top_k, width, 1, n_stream, 1));
+
+    mask_sel = ggml_cast(ctx0, ggml_reshape_4d(ctx0, mask_sel, width, 1, 1, n_stream), GGML_TYPE_F16);
+
+    return build_attn_mha(q_cur, k_sel, v_sel, nullptr, mask_sel, nullptr, nullptr, 0, kq_scale, il);
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
