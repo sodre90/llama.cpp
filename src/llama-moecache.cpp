@@ -169,18 +169,34 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
         for (size_t il = 0; il < model.layers.size(); ++il) {
             const auto & l = model.layers[il];
             if (!l.ffn_up_exps || !l.ffn_gate_exps || !l.ffn_down_exps || !l.ffn_gate_inp) {
+                if (il < 2) LLAMA_LOG_WARN("moe-cache diag: layer %d missing tensor ptrs (up=%p gate=%p down=%p gate_inp=%p)\n",
+                        (int) il, (void*)l.ffn_up_exps, (void*)l.ffn_gate_exps, (void*)l.ffn_down_exps, (void*)l.ffn_gate_inp);
                 continue;
             }
             if (!l.ffn_up_exps->data || !l.ffn_gate_exps->data || !l.ffn_down_exps->data) {
+                if (il < 2) LLAMA_LOG_WARN("moe-cache diag: layer %d weights not loaded (dry-run?)\n", (int) il);
                 continue; // dry-run / memory-estimation model: weights not loaded, don't bind to it
             }
             if (!l.ffn_up_exps->buffer || !ggml_backend_buffer_is_host(l.ffn_up_exps->buffer)) {
+                if (il < 2) LLAMA_LOG_WARN("moe-cache diag: layer %d ffn_up_exps buffer=%p buft='%s' is_host=%d\n",
+                        (int) il, (void*)l.ffn_up_exps->buffer,
+                        l.ffn_up_exps->buffer ? ggml_backend_buft_name(ggml_backend_buffer_get_type(l.ffn_up_exps->buffer)) : "null",
+                        l.ffn_up_exps->buffer ? (int) ggml_backend_buffer_is_host(l.ffn_up_exps->buffer) : -1);
                 continue; // experts already on a device: nothing to cache
             }
             if (!l.ffn_gate_inp->buffer || ggml_backend_buffer_is_host(l.ffn_gate_inp->buffer)) {
+                if (il < 2) LLAMA_LOG_WARN("moe-cache diag: layer %d ffn_gate_inp buffer=%p buft='%s' is_host=%d\n",
+                        (int) il, (void*)l.ffn_gate_inp->buffer,
+                        l.ffn_gate_inp->buffer ? ggml_backend_buft_name(ggml_backend_buffer_get_type(l.ffn_gate_inp->buffer)) : "null",
+                        l.ffn_gate_inp->buffer ? (int) ggml_backend_buffer_is_host(l.ffn_gate_inp->buffer) : -1);
                 continue; // no device home for the cache
             }
             groups[ggml_backend_buffer_get_type(l.ffn_gate_inp->buffer)].push_back({(int) il, &l});
+        }
+        {
+            size_t n_cand = 0;
+            for (auto & g : groups) n_cand += g.second.size();
+            LLAMA_LOG_WARN("moe-cache diag: %zu candidate layers found host-resident, %zu groups\n", n_cand, groups.size());
         }
 
         if (groups.empty()) {
