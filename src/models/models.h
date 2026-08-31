@@ -2332,6 +2332,26 @@ struct llama_model_qwen4exp : public llama_model_base {
                           float   kq_scale,
                             int   il);
 
+        // the whole cache is read and 98% of it masked away
+        ggml_tensor * build_attn_qsa_masked(
+                    ggml_tensor * q_cur,
+                    ggml_tensor * k_cache,
+                    ggml_tensor * v_cache,
+                    ggml_tensor * kq_mask,
+                    ggml_tensor * top_k,
+                          float   kq_scale,
+                            int   il);
+
+        // only the named cells are read, so the cost stops following the context length
+        ggml_tensor * build_attn_qsa_gathered(
+                    ggml_tensor * q_cur,
+                    ggml_tensor * k_cache,
+                    ggml_tensor * v_cache,
+                    ggml_tensor * kq_mask,
+                    ggml_tensor * top_k,
+                          float   kq_scale,
+                            int   il);
+
         // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
         // so the layers sharing a ratio share one input set
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
