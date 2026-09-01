@@ -1756,7 +1756,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
             }
-            if (use_mlock && !ctx_key.lazy && ggml_backend_buffer_is_host(buf)) {
+            // the CPU extra buffer types (repack, kleidiai) are host memory, but they do not
+            // report is_host, so ask the device instead
+            const bool is_pinnable = ggml_backend_buffer_is_host(buf)
+                || props.type == GGML_BACKEND_DEVICE_TYPE_CPU;
+
+            if (use_mlock && !ctx_key.lazy && is_pinnable) {
                 pimpl->mlock_bufs.emplace_back(new llama_mlock);
                 auto & mlock_buf = pimpl->mlock_bufs.back();
                 mlock_buf->init   (ggml_backend_buffer_get_base(buf), ggml_backend_buffer_get_size(buf));
