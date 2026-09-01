@@ -1513,8 +1513,14 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cur = build_hc_mix(res_hc,
             layer.hc_ffn_norm, layer.hc_ffn_down, layer.hc_ffn_up, layer.hc_ffn_inject,
             &inject, il);
+
+    // the ids-matmul mmvq launch is only exercised with 2D activations; [n_embd, 1, n_tokens]
+    // and [n_embd, n_tokens] are memory-identical, but the 3D form puts n_tokens in dst ne2
+    // which drives the launch block.y out of the range the kernel handles
+    cur = ggml_reshape_2d(ctx0, cur, n_embd, n_tokens);
     cur = build_layer_ffn(cur, il);
     cb(cur, "mtp_ffn_out", il);
+    cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
     res_hc = build_hc_combine(res_hc, cur, inject, il);
 
     // chained-draft export: the drafter's own hc state, gathered to the output rows
