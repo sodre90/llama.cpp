@@ -214,6 +214,8 @@ extern "C" {
     LLAMA_API const char * llama_load_mode_name(enum llama_load_mode load_mode);
     LLAMA_API enum llama_load_mode llama_load_mode_from_str(const char * str);
 
+    // LLAMA_LOAD_MODE_MLOCK and LLAMA_LOAD_MODE_MMAP_MLOCK do not pin the tensors read on
+    // demand, so a big table can stream from disk while the rest of the model stays in RAM
     enum llama_lazy_mode {
         LLAMA_LAZY_MODE_OFF  = 0, // always read the whole tensor up front
         LLAMA_LAZY_MODE_AUTO = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)

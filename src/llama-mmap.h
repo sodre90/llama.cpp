@@ -66,8 +66,18 @@ struct llama_mlock {
     llama_mlock();
     ~llama_mlock();
 
-    void init(void * ptr);
+    // capacity is the size of the region that may be locked, 0 when unknown
+    void init(void * ptr, size_t capacity = 0);
+
+    // locks everything below target_size, including the ranges that were never used
     void grow_to(size_t target_size);
+
+    // locks [first, last) relative to the base address
+    // unlike grow_to, the range does not have to touch what is already locked, so the
+    // caller can leave holes (for example the tensors read lazily from disk)
+    void lock_range(size_t first, size_t last);
+
+    size_t locked_bytes() const;
 
     static const bool SUPPORTED;
 
