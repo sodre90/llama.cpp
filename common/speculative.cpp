@@ -1397,6 +1397,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int32_t> verify_h_rows;
 
     std::vector<int>                i_last;
+
+    // set when a vision chunk is skipped: the skipped positions have no token to
+    // catch up with, so the draft KV can never be made contiguous again and all
+    // later drafting would run over a diverged state. sticky until context reset.
+    bool desynced = false;
     std::vector<std::vector<float>> chain_h;
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
@@ -1518,12 +1523,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     bool process(const llama_batch & batch_in) override {
-        if (batch_in.n_tokens <= 0) {
+        if (batch_in.n_tokens <= 0 || desynced) {
             return true;
         }
 
         // TODO: how to make it work with vision tokens?
         if (batch_in.token == nullptr || batch_in.embd != nullptr) {
+            // the skipped positions have no token to catch up with, so the draft KV
+            // stays gapped and drafting over the gap builds malformed graphs
+            SPC_WRN("vision chunk at pos %d - draft-mtp does not support vision tokens, "
+                    "drafting disabled for this context\n",
+                    batch_in.pos ? (int) batch_in.pos[0] : -1);
+            desynced = true;
+            std::fill(i_last.begin(), i_last.end(), -1);
             return true;
         }
 
@@ -1636,6 +1648,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        if (desynced) {
+            return;
+        }
+
         auto & ctx_dft = params.ctx_dft;
 
         common_batch_clear(batch);
