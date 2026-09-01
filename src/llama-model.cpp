@@ -1765,10 +1765,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
             }
-            if (use_mlock && ggml_backend_buffer_is_host(buf)) {
+            if (use_mlock && !ctx_key.lazy && ggml_backend_buffer_is_host(buf)) {
                 pimpl->mlock_bufs.emplace_back(new llama_mlock);
                 auto & mlock_buf = pimpl->mlock_bufs.back();
-                mlock_buf->init   (ggml_backend_buffer_get_base(buf));
+                mlock_buf->init   (ggml_backend_buffer_get_base(buf), ggml_backend_buffer_get_size(buf));
                 mlock_buf->grow_to(ggml_backend_buffer_get_size(buf));
             }
             bufs.emplace_back(buf);
@@ -1834,6 +1834,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
+        }
+    }
+
+    if (use_mlock) {
+        size_t n_pinned = 0;
+
+        for (auto & mlock : pimpl->mlock_bufs) {
+            n_pinned += mlock->locked_bytes();
+        }
+        for (auto & mlock : pimpl->mlock_mmaps) {
+            n_pinned += mlock->locked_bytes();
+        }
+
+        LLAMA_LOG_INFO("%s: pinned %.2f MiB in memory\n", __func__, n_pinned / 1024.0 / 1024.0);
+
+        if (ml.lazy.any()) {
+            LLAMA_LOG_INFO("%s: %zu lazy tensors (%.2f MiB) are left out of the pinned ranges\n",
+                    __func__, ml.lazy.n_tensors(), ml.lazy.size_bytes() / 1024.0 / 1024.0);
         }
     }
 

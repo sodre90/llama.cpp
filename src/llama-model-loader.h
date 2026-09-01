@@ -98,6 +98,23 @@ struct llama_model_loader {
             return !ranges.empty();
         }
 
+        size_t n_tensors() const {
+            return tensors.size();
+        }
+
+        // total size of the lazy tensors, over all files
+        size_t size_bytes() const {
+            size_t res = 0;
+
+            for (const auto & per_file : ranges) {
+                for (const auto & r : per_file.second) {
+                    res += r.second - r.first;
+                }
+            }
+
+            return res;
+        }
+
         bool has(const ggml_tensor * t) const {
             return tensors.count(ggml_get_name(t)) > 0;
         }
