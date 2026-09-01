@@ -12,6 +12,7 @@ extern "C" void ggml_expert_cache_invalidate(const void * base, size_t size);
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <map>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -720,7 +721,7 @@ struct llama_mlock::impl {
 #endif
 
         LLAMA_LOG_WARN("warning: failed to mlock %zu-byte buffer (after previously locking %zu bytes): %s\n%s",
-                size, this->size, errmsg, suggest ? MLOCK_SUGGESTION : "");
+                size, this->n_locked, errmsg, suggest ? MLOCK_SUGGESTION : "");
         return false;
     }
 
@@ -743,7 +744,7 @@ struct llama_mlock::impl {
             }
             if (tries == 2) {
                 LLAMA_LOG_WARN("warning: failed to VirtualLock %zu-byte buffer (after previously locking %zu bytes): %s\n",
-                    len, size, llama_format_win_err(GetLastError()).c_str());
+                    len, n_locked, llama_format_win_err(GetLastError()).c_str());
                 return false;
             }
 
@@ -783,31 +784,90 @@ struct llama_mlock::impl {
     static void raw_unlock(const void * addr, size_t len) {}
 #endif
 
-    impl() : addr(NULL), size(0), failed_already(false) {}
+    impl() : addr(NULL), capacity(0), n_locked(0), failed_already(false) {}
 
-    void init(void * ptr) {
-        GGML_ASSERT(addr == NULL && size == 0);
-        addr = ptr;
+    void init(void * ptr, size_t size) {
+        GGML_ASSERT(addr == NULL && n_locked == 0);
+        addr     = ptr;
+        capacity = size;
     }
 
     void grow_to(size_t target_size) {
+        lock_range(0, target_size);
+    }
+
+    void lock_range(size_t first, size_t last) {
         GGML_ASSERT(addr);
+
         if (failed_already) {
             return;
         }
-        size_t granularity = lock_granularity();
-        target_size = (target_size + granularity - 1) & ~(granularity - 1);
-        if (target_size > size) {
-            if (raw_lock((uint8_t *) addr + size, target_size - size)) {
-                size = target_size;
-            } else {
-                failed_already = true;
+
+        const size_t granularity = lock_granularity();
+        first = first & ~(granularity - 1);
+        last  = (last + granularity - 1) & ~(granularity - 1);
+
+        if (capacity) {
+            last = std::min(last, capacity);
+        }
+
+        if (first >= last) {
+            return;
+        }
+
+        // the parts of the range that are still unlocked
+        std::vector<std::pair<size_t, size_t>> holes;
+
+        size_t pos = first;
+        for (const auto & frag : locked) {
+            if (frag.second <= pos || frag.first >= last) {
+                continue;
             }
+            if (frag.first > pos) {
+                holes.emplace_back(pos, frag.first);
+            }
+            pos = std::max(pos, frag.second);
+        }
+
+        if (pos < last) {
+            holes.emplace_back(pos, last);
+        }
+
+        for (const auto & hole : holes) {
+            if (!raw_lock((uint8_t *) addr + hole.first, hole.second - hole.first)) {
+                failed_already = true;
+                return;
+            }
+            n_locked += hole.second - hole.first;
+            record_locked(hole.first, hole.second);
         }
     }
 
+    size_t locked_bytes() const {
+        return n_locked;
+    }
+
+    // merge [first, last) into the locked fragments, so later calls can see the holes
+    void record_locked(size_t first, size_t last) {
+        for (auto it = locked.begin(); it != locked.end();) {
+            if (it->second < first || it->first > last) {
+                ++it;
+                continue;
+            }
+            first = std::min(first, it->first);
+            last  = std::max(last,  it->second);
+            it = locked.erase(it);
+        }
+
+        locked.emplace(first, last);
+    }
+
     void * addr;
-    size_t size;
+    size_t capacity;   // size of the region that may be locked, 0 = unknown
+    size_t n_locked;   // bytes locked so far
+
+    // the locked fragments, disjoint and sorted by offset
+    std::map<size_t, size_t> locked;
 
     bool failed_already;
 };
@@ -815,8 +875,11 @@ struct llama_mlock::impl {
 llama_mlock::llama_mlock() : pimpl(std::make_unique<impl>()) {}
 llama_mlock::~llama_mlock() = default;
 
-void llama_mlock::init(void * ptr) { pimpl->init(ptr); }
+void llama_mlock::init(void * ptr, size_t capacity) { pimpl->init(ptr, capacity); }
 void llama_mlock::grow_to(size_t target_size) { pimpl->grow_to(target_size); }
+void llama_mlock::lock_range(size_t first, size_t last) { pimpl->lock_range(first, last); }
+
+size_t llama_mlock::locked_bytes() const { return pimpl->locked_bytes(); }
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mlock::SUPPORTED = true;
