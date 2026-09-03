@@ -90,6 +90,29 @@ def test_anthropic_messages_with_system():
     assert len(res.body["content"]) > 0
 
 
+def test_anthropic_messages_system_role_inside_messages():
+    """A system-role message mid-array is folded into the leading system prompt.
+
+    The Anthropic spec only allows user/assistant in `messages`, but Claude Code sends a
+    system-role notice after the first user turn, and many chat templates raise on a system
+    message that is not the first one.
+    """
+    server.start()
+
+    res = server.make_request("POST", "/v1/messages", data={
+        "model": "test",
+        "max_tokens": 50,
+        "system": "You are a helpful assistant.",
+        "messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": [{"type": "text", "text": "New tools are available."}]}
+        ]
+    })
+
+    assert res.status_code == 200
+    assert res.body["type"] == "message"
+
+
 def test_anthropic_messages_multipart_content():
     """Test messages with multipart content blocks"""
     server.start()
