@@ -378,20 +378,33 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
     }
     const json & messages = body.at("messages");
     if (messages.is_array()) {
-        for (const auto & msg : messages) {
+        for (size_t msg_index = 0; msg_index < messages.size(); msg_index++) {
+            const json & msg = messages[msg_index];
             std::string role = json_value(msg, "role", std::string());
 
             // the Anthropic spec only allows user/assistant here, but some clients (Claude Code)
-            // put system-role notices mid-array, and chat templates commonly reject a system
-            // message that is not the first one - fold them into the leading system prompt
+            // put system-role notices mid-array (typically a per-turn reminder whose text changes
+            // turn to turn, e.g. as tools get loaded), and chat templates commonly reject a system
+            // message that is not the first one. A message that is genuinely first is folded into
+            // the leading system prompt as before; any later one is kept at its own position as a
+            // user message instead, so a change in its text only invalidates the prefix cache from
+            // that point on rather than turning every leading system message dynamic and defeating
+            // cache reuse for the whole conversation.
             if (role == "system") {
                 if (msg.contains("content")) {
                     const std::string text = anthropic_content_to_text(msg.at("content"));
                     if (!text.empty()) {
-                        if (!system_content.empty()) {
-                            system_content += "\n\n";
+                        if (msg_index == 0) {
+                            if (!system_content.empty()) {
+                                system_content += "\n\n";
+                            }
+                            system_content += text;
+                        } else {
+                            oai_messages.push_back({
+                                {"role",    "user"},
+                                {"content", text}
+                            });
                         }
-                        system_content += text;
                     }
                 }
                 continue;

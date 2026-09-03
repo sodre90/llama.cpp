@@ -91,11 +91,13 @@ def test_anthropic_messages_with_system():
 
 
 def test_anthropic_messages_system_role_inside_messages():
-    """A system-role message mid-array is folded into the leading system prompt.
+    """A system-role message that is not the first one is converted to a user message.
 
     The Anthropic spec only allows user/assistant in `messages`, but Claude Code sends a
     system-role notice after the first user turn, and many chat templates raise on a system
-    message that is not the first one.
+    message that is not the first one. Folding it into the leading system prompt instead
+    would make the leading prompt differ turn to turn and defeat prefix-cache reuse for the
+    whole conversation, so it is kept at its own position as a user message instead.
     """
     server.start()
 
