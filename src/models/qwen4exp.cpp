@@ -6,6 +6,11 @@
 #include <algorithm>
 #include <cinttypes>
 
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
     if (value == 0) {
@@ -1197,6 +1202,55 @@ public:
     std::vector<llama_token> prev;
 };
 
+// per_layer_token_embd is multi-GiB and loaded TENSOR_READ_LAZY, so llama_mmap marks its file range
+// POSIX_MADV_RANDOM and the kernel reads it back one page per fault, synchronously, on the thread
+// that touches it. The row set for the whole ubatch is known here, before the graph runs, so hand
+// the kernel every span up front and let the reads overlap the rest of set_input and graph build.
+static void ple_prefetch_rows(const ggml_tensor * embd, const std::vector<int32_t> & rows) {
+#if !defined(_WIN32)
+    if (embd->data == nullptr || embd->buffer == nullptr || !ggml_backend_buffer_is_host(embd->buffer)) {
+        return;
+    }
+
+    const size_t    page_size = (size_t) sysconf(_SC_PAGESIZE);
+    const size_t    row_size  = embd->nb[1];
+    const int64_t   n_rows    = embd->ne[1];
+    const uintptr_t base      = (uintptr_t) embd->data;
+
+    // posix_madvise needs a page-aligned address, and a tensor is only aligned to the gguf
+    // alignment, so round the absolute address rather than the offset within the tensor
+    std::vector<std::pair<uintptr_t, uintptr_t>> spans;
+    spans.reserve(rows.size());
+    for (const int32_t row : rows) {
+        if (row < 0 || row >= n_rows) {
+            continue;
+        }
+        const uintptr_t addr = base + (size_t) row * row_size;
+        spans.emplace_back(addr & ~(uintptr_t) (page_size - 1),
+                           (addr + row_size + page_size - 1) & ~(uintptr_t) (page_size - 1));
+    }
+    if (spans.empty()) {
+        return;
+    }
+
+    std::sort(spans.begin(), spans.end());
+
+    uintptr_t beg = spans[0].first;
+    uintptr_t end = spans[0].second;
+    for (size_t i = 1; i < spans.size(); ++i) {
+        if (spans[i].first > end) {
+            posix_madvise((void *) beg, end - beg, POSIX_MADV_WILLNEED);
+            beg = spans[i].first;
+        }
+        end = std::max(end, spans[i].second);
+    }
+    posix_madvise((void *) beg, end - beg, POSIX_MADV_WILLNEED);
+#else
+    GGML_UNUSED(embd);
+    GGML_UNUSED(rows);
+#endif
+}
+
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const auto & hp = pmodel.hparams;
 
@@ -1256,6 +1310,8 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
             }
         }
     }
+
+    ple_prefetch_rows(pmodel.per_layer_tok_embd, idx);
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
