@@ -942,6 +942,32 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         params.cors_origins = "localhost";
     }
 
+    if (params.cpu_moe_pinned) {
+        ggml_backend_load_all();
+
+        ggml_backend_dev_t         host_dev  = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        ggml_backend_buffer_type_t host_buft = host_dev ? ggml_backend_dev_host_buffer_type(host_dev) : nullptr;
+
+        if (host_buft == nullptr) {
+            LOG_WRN("%s: --cpu-moe-pinned ignored, no device offers a pinned host buffer type\n", __func__);
+        } else {
+            ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
+
+            size_t n_pinned = 0;
+            for (auto * overrides : { &params.tensor_buft_overrides, &params.speculative.draft.tensor_buft_overrides }) {
+                for (auto & tbo : *overrides) {
+                    if (tbo.pattern != nullptr && tbo.buft == cpu_buft) {
+                        tbo.buft = host_buft;
+                        n_pinned++;
+                    }
+                }
+            }
+
+            LOG_INF("%s: --cpu-moe-pinned: %zu CPU tensor override(s) moved to %s\n",
+                    __func__, n_pinned, ggml_backend_buft_name(host_buft));
+        }
+    }
+
     // pad tensor_buft_overrides for llama_params_fit:
     const size_t ntbo = llama_max_tensor_buft_overrides();
     while (params.tensor_buft_overrides.size() < ntbo) {
@@ -2826,6 +2852,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_DENSE_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_FFN"));
+    add_opt(common_arg(
+        {"--cpu-moe-pinned"},
+        "allocate the CPU-side tensor overrides (--cpu-moe, --n-cpu-moe, --n-cpu-ffn, -ot ...=CPU)\n"
+        "in pinned host memory, so the uploads that feed op-offload run at full PCIe rate\n"
+        "(no effect when mmap is enabled - use --load-mode none or mlock)",
+        [](common_params & params) {
+            params.cpu_moe_pinned = true;
+        }
+    ).set_env("LLAMA_ARG_CPU_MOE_PINNED"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
