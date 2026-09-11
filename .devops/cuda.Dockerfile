@@ -63,6 +63,20 @@ RUN mkdir -p /app/full \
 ## Base image
 FROM ${BASE_CUDA_RUN_CONTAINER} AS base
 
+# apt reaches archive.ubuntu.com over IPv6 here and the peer half-closes: the fetcher then
+# sits in poll() with the socket in CLOSE-WAIT and Acquire::http::Timeout never fires
+RUN printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "3";\nAcquire::http::Timeout "30";\n' \
+      > /etc/apt/apt.conf.d/99-build-net \
+    && apt-get update \
+    && apt-get install -y libgomp1 curl ffmpeg \
+    && apt autoremove -y \
+    && apt clean -y \
+    && rm -rf /tmp/* /var/tmp/* \
+    && find /var/cache/apt/archives /var/lib/apt/lists -not -name lock -type f -delete \
+    && find /var/cache -type f -delete
+
+# below the apt layer on purpose: every ARG in scope is part of a RUN layer's cache key, so
+# declaring these above it makes an APP_VERSION bump re-download the whole ffmpeg tree
 ARG BUILD_DATE=N/A
 ARG APP_VERSION=N/A
 ARG APP_REVISION=N/A
@@ -75,14 +89,6 @@ LABEL org.opencontainers.image.created=$BUILD_DATE \
       org.opencontainers.image.description="LLM inference in C/C++" \
       org.opencontainers.image.url=$IMAGE_URL \
       org.opencontainers.image.source=$IMAGE_SOURCE
-
-RUN apt-get update \
-    && apt-get install -y libgomp1 curl ffmpeg \
-    && apt autoremove -y \
-    && apt clean -y \
-    && rm -rf /tmp/* /var/tmp/* \
-    && find /var/cache/apt/archives /var/lib/apt/lists -not -name lock -type f -delete \
-    && find /var/cache -type f -delete
 
 COPY --from=build /app/lib/ /app
 
