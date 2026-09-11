@@ -933,7 +933,12 @@ uint32_t llama_memory_hybrid_idx_context::qsa_pooled_n_dirty_max(const llama_uba
         q_max = std::max(q_max, ubatch.pos[i]);
     }
 
-    const int64_t n_complete = (int64_t) (q_max + 1)/ratio;
+    // mrope repeats one position across an image, so set_input_qsa ranks the cells instead of
+    // using their positions: blocks then cut the live-cell line, which an image advances far
+    // faster than the position line. bound both, or the tables undersize on any image ubatch
+    const int64_t n_used = (int64_t) mem->get_mem_idx()->get_cells(seq).get_used();
+
+    const int64_t n_complete = std::max<int64_t>((int64_t) (q_max + 1)/ratio, n_used/ratio);
     const int64_t w          = std::min(mem->pooled_valid(seq), n_complete);
 
     return (uint32_t) std::max<int64_t>(1, n_complete - w);
