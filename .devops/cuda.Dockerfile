@@ -31,9 +31,14 @@ ARG GCC_VERSION
 # CUDA architecture to build for (defaults to all supported archs)
 ARG CUDA_DOCKER_ARCH=default
 
-# same IPv4 pin as the base stage: over IPv6 the archive peer half-closes and apt parks in
-# poll() with the socket in CLOSE-WAIT, where Acquire::http::Timeout never fires
-RUN printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "3";\nAcquire::http::Timeout "30";\n' \
+# archive.ubuntu.com is unusable from this host: it times out over IPv6 and delivers ~16 KB/s
+# over IPv4, where hu.archive.ubuntu.com serves the same files at ~40 MB/s from the same
+# container. The retry and timeout bounds keep a bad mirror failing the step instead of
+# parking the fetcher in poll() with a CLOSE-WAIT socket, which is how it hung before.
+RUN sed -i 's|//archive\.ubuntu\.com|//hu.archive.ubuntu.com|g' \
+        /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
+        /etc/apt/sources.list.d/*.list 2>/dev/null; \
+    printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "3";\nAcquire::http::Timeout "30";\n' \
       > /etc/apt/apt.conf.d/99-build-net \
     && apt-get update && \
     apt-get install -y gcc-${GCC_VERSION} g++-${GCC_VERSION} build-essential cmake python3 python3-pip git libssl-dev libgomp1 ccache
@@ -70,9 +75,14 @@ RUN mkdir -p /app/full \
 ## Base image
 FROM ${BASE_CUDA_RUN_CONTAINER} AS base
 
-# apt reaches archive.ubuntu.com over IPv6 here and the peer half-closes: the fetcher then
-# sits in poll() with the socket in CLOSE-WAIT and Acquire::http::Timeout never fires
-RUN printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "3";\nAcquire::http::Timeout "30";\n' \
+# archive.ubuntu.com is unusable from this host: it times out over IPv6 and delivers ~16 KB/s
+# over IPv4, where hu.archive.ubuntu.com serves the same files at ~40 MB/s from the same
+# container. The retry and timeout bounds keep a bad mirror failing the step instead of
+# parking the fetcher in poll() with a CLOSE-WAIT socket, which is how it hung before.
+RUN sed -i 's|//archive\.ubuntu\.com|//hu.archive.ubuntu.com|g' \
+        /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
+        /etc/apt/sources.list.d/*.list 2>/dev/null; \
+    printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "3";\nAcquire::http::Timeout "30";\n' \
       > /etc/apt/apt.conf.d/99-build-net \
     && apt-get update \
     && apt-get install -y libgomp1 curl ffmpeg \
