@@ -56,11 +56,11 @@ COPY --from=web /app/tools/ui/dist tools/ui/dist
 
 RUN HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
     cmake -S . -B build \
-        -DGGML_HIP=ON \
+        -DGGML_HIP=ON -DGGML_CUDA_FA_ALL_QUANTS=ON \
         -DAMDGPU_TARGETS="$ROCM_DOCKER_ARCH" \
         -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON \
         -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=OFF \
-    && cmake --build build --config Release -j$(nproc)
+    && cmake --build build --config Release -j16
 
 RUN mkdir -p /app/lib \
     && find build -name "*.so*" -exec cp -P {} /app/lib \;
@@ -76,6 +76,9 @@ RUN mkdir -p /app/full \
 
 ## Base image
 FROM ${BASE_ROCM_DEV_CONTAINER} AS base
+
+# the ROCm 10 images leave /opt/rocm/lib out of the loader cache
+ENV LD_LIBRARY_PATH=/opt/rocm/lib
 
 ARG BUILD_DATE=N/A
 ARG APP_VERSION=N/A

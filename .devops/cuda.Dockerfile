@@ -31,8 +31,17 @@ ARG GCC_VERSION
 # CUDA architecture to build for (defaults to all supported archs)
 ARG CUDA_DOCKER_ARCH=default
 
-RUN apt-get update && \
-    apt-get install -y gcc-${GCC_VERSION} g++-${GCC_VERSION} build-essential cmake python3 python3-pip git libssl-dev libgomp1
+# archive.ubuntu.com is unusable from this host: it times out over IPv6 and delivers ~16 KB/s
+# over IPv4, where hu.archive.ubuntu.com serves the same files at ~40 MB/s from the same
+# container. The retry and timeout bounds keep a bad mirror failing the step instead of
+# parking the fetcher in poll() with a CLOSE-WAIT socket, which is how it hung before.
+RUN sed -i 's|//archive\.ubuntu\.com|//hu.archive.ubuntu.com|g' \
+        /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
+        /etc/apt/sources.list.d/*.list 2>/dev/null; \
+    printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "3";\nAcquire::http::Timeout "30";\n' \
+      > /etc/apt/apt.conf.d/99-build-net \
+    && apt-get update && \
+    apt-get install -y gcc-${GCC_VERSION} g++-${GCC_VERSION} build-essential cmake python3 python3-pip git libssl-dev libgomp1 ccache
 
 ENV CC=gcc-${GCC_VERSION} CXX=g++-${GCC_VERSION} CUDAHOSTCXX=g++-${GCC_VERSION}
 
@@ -42,11 +51,14 @@ COPY . .
 
 COPY --from=web /app/tools/ui/dist tools/ui/dist
 
-RUN if [ "${CUDA_DOCKER_ARCH}" != "default" ]; then \
+RUN --mount=type=cache,target=/ccache \
+    export CCACHE_DIR=/ccache CCACHE_MAXSIZE=20G && \
+    if [ "${CUDA_DOCKER_ARCH}" != "default" ]; then \
     export CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=${CUDA_DOCKER_ARCH}"; \
     fi && \
-    cmake -B build -DGGML_NATIVE=OFF -DGGML_CUDA=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DLLAMA_BUILD_TESTS=OFF ${CMAKE_ARGS} -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined . && \
-    cmake --build build --config Release -j$(nproc)
+    cmake -B build -DGGML_NATIVE=OFF -DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DLLAMA_BUILD_TESTS=OFF ${CMAKE_ARGS} -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined -DCMAKE_CXX_FLAGS=-O1 -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache . && \
+    cmake --build build --config Release -j8 && \
+    ccache -s
 
 RUN mkdir -p /app/lib && \
     find build -name "*.so*" -exec cp -P {} /app/lib \;
@@ -63,6 +75,25 @@ RUN mkdir -p /app/full \
 ## Base image
 FROM ${BASE_CUDA_RUN_CONTAINER} AS base
 
+# archive.ubuntu.com is unusable from this host: it times out over IPv6 and delivers ~16 KB/s
+# over IPv4, where hu.archive.ubuntu.com serves the same files at ~40 MB/s from the same
+# container. The retry and timeout bounds keep a bad mirror failing the step instead of
+# parking the fetcher in poll() with a CLOSE-WAIT socket, which is how it hung before.
+RUN sed -i 's|//archive\.ubuntu\.com|//hu.archive.ubuntu.com|g' \
+        /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
+        /etc/apt/sources.list.d/*.list 2>/dev/null; \
+    printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "3";\nAcquire::http::Timeout "30";\n' \
+      > /etc/apt/apt.conf.d/99-build-net \
+    && apt-get update \
+    && apt-get install -y libgomp1 curl ffmpeg \
+    && apt autoremove -y \
+    && apt clean -y \
+    && rm -rf /tmp/* /var/tmp/* \
+    && find /var/cache/apt/archives /var/lib/apt/lists -not -name lock -type f -delete \
+    && find /var/cache -type f -delete
+
+# below the apt layer on purpose: every ARG in scope is part of a RUN layer's cache key, so
+# declaring these above it makes an APP_VERSION bump re-download the whole ffmpeg tree
 ARG BUILD_DATE=N/A
 ARG APP_VERSION=N/A
 ARG APP_REVISION=N/A
@@ -75,14 +106,6 @@ LABEL org.opencontainers.image.created=$BUILD_DATE \
       org.opencontainers.image.description="LLM inference in C/C++" \
       org.opencontainers.image.url=$IMAGE_URL \
       org.opencontainers.image.source=$IMAGE_SOURCE
-
-RUN apt-get update \
-    && apt-get install -y libgomp1 curl ffmpeg \
-    && apt autoremove -y \
-    && apt clean -y \
-    && rm -rf /tmp/* /var/tmp/* \
-    && find /var/cache/apt/archives /var/lib/apt/lists -not -name lock -type f -delete \
-    && find /var/cache -type f -delete
 
 COPY --from=build /app/lib/ /app
 
