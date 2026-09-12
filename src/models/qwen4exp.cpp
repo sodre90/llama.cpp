@@ -842,6 +842,18 @@ static bool qsa_gather_enabled() {
     return enabled;
 }
 
+// Off by default: n_kv_max has to bound the finite entries in every mask row, and the base
+// kq_mask can leave more live cells than top_k names. A violation reads too few cells and
+// returns a wrong answer silently - it does not fault.
+static bool qsa_sparse_fa_enabled() {
+    static const bool enabled = []() {
+        const char * requested = getenv("LLAMA_QSA_SPARSE_FA");
+        return requested != nullptr && atoi(requested) != 0;
+    }();
+
+    return enabled;
+}
+
 // One gathered K/V can serve the whole batch only when every query named the same cells, which
 // means one token per stream; with more, each token has its own top_k. It also has to be a real
 // shrink, or the copy costs more than the masked read it replaces. A transposed V cache is laid
@@ -957,7 +969,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa_masked(
     // combine with the original kq mask
     kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
 
-    return build_attn_mha(q_cur, k_cache, v_cache, nullptr, kq_mask_top_k, nullptr, nullptr, 0, kq_scale, il);
+    return build_attn_mha(q_cur, k_cache, v_cache, nullptr, kq_mask_top_k, nullptr, nullptr,
+            qsa_sparse_fa_enabled() ? top_k->ne[0] : 0, kq_scale, il);
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa_gathered(
