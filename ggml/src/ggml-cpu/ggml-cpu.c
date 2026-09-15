@@ -1783,6 +1783,8 @@ static void ggml_compute_forward_mul_mat_id(
     }
 }
 
+#define GGML_MOE_MAX_EXPERTS_USED 128
+
 static void ggml_compute_forward_fused_moe_silu(
         const struct ggml_compute_params * params,
         struct ggml_tensor * node0,
@@ -1903,6 +1905,129 @@ static void ggml_compute_forward_fused_moe_silu(
 
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
         }
+    }
+}
+
+static void ggml_compute_forward_fused_moe_down(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * mmid_node,
+        struct ggml_tensor * mul_node,
+        struct ggml_tensor * dst_node) {
+
+    const struct ggml_tensor * weights_down = mmid_node->src[0];
+    const struct ggml_tensor * src1         = mmid_node->src[1];
+    const struct ggml_tensor * ids          = mmid_node->src[2];
+
+    const struct ggml_tensor * weights = (mul_node->src[0] == mmid_node) ? mul_node->src[1] : mul_node->src[0];
+
+    const int64_t ne00 = weights_down->ne[0];
+    const int64_t ne01 = weights_down->ne[1];
+    const int64_t ne02 = weights_down->ne[2];
+
+    const size_t down_nb01 = weights_down->nb[1];
+    const size_t down_nb02 = weights_down->nb[2];
+
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+    const size_t  nb11 = src1->nb[1];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const enum ggml_type type = weights_down->type;
+
+    ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
+    enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+    ggml_from_float_t const from_float   = type_traits_cpu[vec_dot_type].from_float;
+
+    const int n_ids = ids->ne[0];
+    const int n_as  = ne02;
+
+    const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+
+    void * wdata_cur = params->wdata;
+
+    const char * src1_q = (const char *) src1->data;
+    if (src1->type != vec_dot_type) {
+        char * quant_base = (char *) incr_ptr_aligned(&wdata_cur,
+            (ggml_row_size(vec_dot_type, ggml_nelements(src1)) + CACHE_LINE_SIZE) * nth, sizeof(int64_t));
+
+        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+        char * wdata = quant_base + ith * (ne11 * row_size + CACHE_LINE_SIZE);
+        for (int64_t i11 = 0; i11 < ne11; ++i11) {
+            from_float((const float *)((const char *) src1->data + i11*nb11),
+                       (void *)(wdata + i11*row_size),
+                       ne10);
+        }
+        src1_q = wdata;
+    }
+
+    incr_ptr_aligned(&wdata_cur, n_as * sizeof(int64_t), sizeof(int64_t));
+    incr_ptr_aligned(&wdata_cur, n_as * ids->ne[0] * ids->ne[1] * sizeof(struct mmid_row_mapping), sizeof(int64_t));
+
+    atomic_int * atomic_current_chunk = (atomic_int *) incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE, CACHE_LINE_SIZE);
+
+    if (ith == 0) {
+        atomic_store_explicit(atomic_current_chunk, nth, memory_order_relaxed);
+    }
+
+    ggml_barrier(params->threadpool);
+
+    const int64_t nr0 = ne01;
+    const int chunk_size = 64;
+    const bool disable_chunking = ggml_is_numa();
+
+    int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
+    if (nchunk0 < (int64_t)(nth * 4) || disable_chunking) {
+        nchunk0 = nth;
+    }
+    const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
+
+    struct expert_info {
+        const char * down_base;
+        const char * src1_col;
+        float w;
+    };
+
+    struct expert_info active_experts[GGML_MOE_MAX_EXPERTS_USED];
+    int n_active = 0;
+    for (int id = 0; id < n_ids && id < GGML_MOE_MAX_EXPERTS_USED; ++id) {
+        const int32_t expert_idx = *(const int32_t *) ((const char *) ids->data + id*ids->nb[0]);
+        const float w = *(const float *) ((const char *) weights->data + id*weights->nb[1]);
+        if (w == 0.0f) {
+            continue;
+        }
+
+        active_experts[n_active].down_base = (const char *) weights_down->data + expert_idx * down_nb02;
+        active_experts[n_active].src1_col  = (src1->type != vec_dot_type)
+            ? (src1_q + id * row_size)
+            : ((const char *) src1->data + id * nb11);
+        active_experts[n_active].w         = w;
+        n_active++;
+    }
+
+    float * dst_data = (float *) dst_node->data;
+
+    int current_chunk = ith;
+    while (current_chunk < nchunk0) {
+        const int64_t ir0_start = dr0 * current_chunk;
+        const int64_t ir0_end   = MIN(ir0_start + dr0, nr0);
+
+        for (int64_t ir0 = ir0_start; ir0 < ir0_end; ++ir0) {
+            float acc = 0.0f;
+            for (int a = 0; a < n_active; ++a) {
+                float val;
+                vec_dot(ne00, &val, 0, active_experts[a].down_base + ir0*down_nb01, 0, active_experts[a].src1_col, 0, 1);
+                acc += active_experts[a].w * val;
+            }
+            dst_data[ir0] = acc;
+        }
+
+        if (nth >= nchunk0) {
+            break;
+        }
+
+        current_chunk = atomic_fetch_add_explicit(atomic_current_chunk, 1, memory_order_relaxed);
     }
 }
 
@@ -3291,6 +3416,33 @@ static int ggml_cpu_try_fuse_ops(
                     ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU) {
                 ggml_compute_forward_fused_moe_silu(params, node, node1, glu);
                 return 2;
+            }
+        }
+
+        // MUL_MAT_ID (down) + MUL (weights) + k*VIEW + (k-1)*ADD fusion; only for TG (single token)
+        const struct ggml_tensor * ids = node->src[2];
+        const int k = ids ? ids->ne[0] : 0;
+        if (k >= 2 && k <= GGML_MOE_MAX_EXPERTS_USED && node->src[1]->ne[2] == 1 && node->src[3] == NULL) {
+            const int n_nodes = 2 * k + 1;
+            if (node_n + n_nodes <= cgraph->n_nodes) {
+                enum ggml_op down_fuse_ops[2 * GGML_MOE_MAX_EXPERTS_USED + 1];
+                down_fuse_ops[0] = GGML_OP_MUL_MAT_ID;
+                down_fuse_ops[1] = GGML_OP_MUL;
+                for (int j = 0; j < k; ++j) {
+                    down_fuse_ops[2 + j] = GGML_OP_VIEW;
+                }
+                for (int j = 0; j < k - 1; ++j) {
+                    down_fuse_ops[2 + k + j] = GGML_OP_ADD;
+                }
+                const int down_outputs[1] = { node_n + 2 * k };
+                if (ggml_can_fuse_subgraph(cgraph, node_n, n_nodes, down_fuse_ops, down_outputs, 1)) {
+                    struct ggml_tensor * mul_node = cgraph->nodes[node_n + 1];
+                    struct ggml_tensor * dst_node = cgraph->nodes[node_n + 2 * k];
+                    if (dst_node->type == GGML_TYPE_F32 && ggml_nrows(node->src[1]) == k) {
+                        ggml_compute_forward_fused_moe_down(params, node, mul_node, dst_node);
+                        return 2 * k;
+                    }
+                }
             }
         }
     }
