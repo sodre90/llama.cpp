@@ -418,6 +418,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_post(
     GGML_ASSERT(x->ne[0] == n_embd);
     GGML_ASSERT(residual->ne[1] == hparams.dsv4_hc_mult);
 
+    if (x->ne[2] != 1 || x->ne[3] != 1) {
+        x = ggml_reshape_2d(ctx0, x, n_embd, ggml_nelements(x) / n_embd);
+    }
+
     if (cparams.fused_dsv4_hc_post) {
         ggml_tensor * result = ggml_dsv4_hc_post(ctx0, x, residual, post, comb);
         res->add_fused_node({LLM_FUSED_OP_DSV4_HC_POST, result, il});
