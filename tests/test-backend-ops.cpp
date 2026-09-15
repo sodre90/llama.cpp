@@ -5207,6 +5207,82 @@ struct test_mul_mat_id_fusion : public test_case {
     }
 };
 
+struct test_moe_down_fusion : public test_case {
+    const ggml_type type_a;
+    const ggml_type type_b;
+    const int n_mats;
+    const int n_used;
+    const int64_t m;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_a, type_b, n_mats, n_used, m, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * k * n_used;
+    }
+
+    test_moe_down_fusion(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
+            int n_mats = 8, int n_used = 4, int64_t m = 32, int64_t k = 32)
+        : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), m(m), k(k) {
+            GGML_ASSERT(n_used <= n_mats);
+        }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as, "as");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, 1);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, 1, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, n_used, 1);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, 1);
+        ggml_set_name(weights, "weights");
+
+        ggml_tensor * experts = ggml_mul_mat_id(ctx, as, b, ids);
+        ggml_set_name(experts, "experts");
+
+        experts = ggml_mul(ctx, experts, weights);
+        ggml_set_name(experts, "weighted_experts");
+
+        std::vector<ggml_tensor *> cur_experts(n_used);
+        for (int i = 0; i < n_used; ++i) {
+            cur_experts[i] = ggml_view_2d(ctx, experts, m, 1, experts->nb[2], i * experts->nb[1]);
+        }
+
+        ggml_tensor * moe_out = cur_experts[0];
+        for (int i = 1; i < n_used; ++i) {
+            moe_out = ggml_add(ctx, moe_out, cur_experts[i]);
+        }
+        ggml_set_name(moe_out, "moe_out");
+
+        return moe_out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_DOWN_FUSION";
+    }
+};
+
 // GGML_OP_OUT_PROD
 struct test_out_prod : public test_case {
     const ggml_type type_a;
@@ -10147,6 +10223,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 // test with mul after (ffn_moe_weighted)
                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1, true));
             }
+        }
+    }
+
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S}) {
+        for (int n_used : {2, 4, 10}) {
+            test_cases.emplace_back(new test_moe_down_fusion(type_a, GGML_TYPE_F32, 16, n_used, 512, 256));
         }
     }
 
