@@ -383,6 +383,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
 
     ggml_tensor * cur = nullptr;
     if (cparams.fused_dsv4_hc_post && il >= 0) {
+        if (block_out->ne[2] != 1 || block_out->ne[3] != 1) {
+            block_out = ggml_reshape_2d(ctx0, block_out, n_embd, ggml_nelements(block_out) / n_embd);
+        }
         // identity comb: every stream adds the same block output, scaled by its own weight
         cur = ggml_dsv4_hc_post(ctx0, block_out, residual, w, nullptr);
         res->add_fused_node({LLM_FUSED_OP_DSV4_HC_POST, cur, il});
