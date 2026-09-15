@@ -2024,27 +2024,35 @@ static void ggml_compute_forward_fused_moe_down(
     while (current_chunk < nchunk0) {
         const int64_t ir0_start = dr0 * current_chunk;
         const int64_t ir0_end   = MIN(ir0_start + dr0, nr0);
+        const int64_t chunk_len = ir0_end - ir0_start;
 
-        for (int64_t ir0 = ir0_start; ir0 < ir0_end; ++ir0) {
-            float acc = 0.0f;
+        for (int64_t blk_start = 0; blk_start < chunk_len; blk_start += 64) {
+            const int64_t blk_len = MIN((int64_t)64, chunk_len - blk_start);
+            float acc_buf[64];
+            memset(acc_buf, 0, blk_len * sizeof(float));
+
             for (int a = 0; a < n_active; ++a) {
-                if (a + 1 < n_active) {
-                    const char * pf_down = active_experts[a + 1].down_base + ir0*down_nb01;
-                    for (size_t off = 0; off < down_nb01; off += CACHE_LINE_SIZE) {
-                        __builtin_prefetch(pf_down + off, 0, 3);
-                    }
-                } else if (ir0 + 1 < ir0_end) {
-                    const char * pf_down = active_experts[0].down_base + (ir0 + 1)*down_nb01;
-                    for (size_t off = 0; off < down_nb01; off += CACHE_LINE_SIZE) {
-                        __builtin_prefetch(pf_down + off, 0, 3);
-                    }
-                }
+                const char * expert_down = active_experts[a].down_base;
+                const char * src1_col    = active_experts[a].src1_col;
+                const float  w           = active_experts[a].w;
 
-                float val;
-                vec_dot(ne00, &val, 0, active_experts[a].down_base + ir0*down_nb01, 0, active_experts[a].src1_col, 0, 1);
-                acc += active_experts[a].w * val;
+                for (int64_t i = 0; i < blk_len; ++i) {
+                    const int64_t ir0 = ir0_start + blk_start + i;
+                    if (i + 2 < blk_len) {
+                        const char * pf_down = expert_down + (ir0 + 2)*down_nb01;
+                        for (size_t off = 0; off < down_nb01; off += CACHE_LINE_SIZE) {
+                            __builtin_prefetch(pf_down + off, 0, 3);
+                        }
+                    }
+                    float val;
+                    vec_dot(ne00, &val, 0, expert_down + ir0*down_nb01, 0, src1_col, 0, 1);
+                    acc_buf[i] += w * val;
+                }
             }
-            dst_data[ir0] = acc;
+
+            for (int64_t i = 0; i < blk_len; ++i) {
+                dst_data[ir0_start + blk_start + i] = acc_buf[i];
+            }
         }
 
         if (nth >= nchunk0) {
@@ -2228,27 +2236,35 @@ static void ggml_compute_forward_fused_moe_ffn_full(
     while (current_chunk < nchunk0) {
         const int64_t ir0_start = dr0 * current_chunk;
         const int64_t ir0_end   = MIN(ir0_start + dr0, nr0_down);
+        const int64_t chunk_len = ir0_end - ir0_start;
 
-        for (int64_t ir0 = ir0_start; ir0 < ir0_end; ++ir0) {
-            float acc = 0.0f;
+        for (int64_t blk_start = 0; blk_start < chunk_len; blk_start += 64) {
+            const int64_t blk_len = MIN((int64_t)64, chunk_len - blk_start);
+            float acc_buf[64];
+            memset(acc_buf, 0, blk_len * sizeof(float));
+
             for (int a = 0; a < n_active; ++a) {
-                if (a + 1 < n_active) {
-                    const char * pf_down = active_experts[a + 1].down_base + ir0*down_nb01;
-                    for (size_t off = 0; off < down_nb01; off += CACHE_LINE_SIZE) {
-                        __builtin_prefetch(pf_down + off, 0, 3);
-                    }
-                } else if (ir0 + 1 < ir0_end) {
-                    const char * pf_down = active_experts[0].down_base + (ir0 + 1)*down_nb01;
-                    for (size_t off = 0; off < down_nb01; off += CACHE_LINE_SIZE) {
-                        __builtin_prefetch(pf_down + off, 0, 3);
-                    }
-                }
+                const char * expert_down = active_experts[a].down_base;
+                const char * src1_col    = active_experts[a].src1_col;
+                const float  w           = active_experts[a].w;
 
-                float val;
-                vec_dot_down(ne00_down, &val, 0, active_experts[a].down_base + ir0*down_nb01, 0, active_experts[a].src1_col, 0, 1);
-                acc += active_experts[a].w * val;
+                for (int64_t i = 0; i < blk_len; ++i) {
+                    const int64_t ir0 = ir0_start + blk_start + i;
+                    if (i + 2 < blk_len) {
+                        const char * pf_down = expert_down + (ir0 + 2)*down_nb01;
+                        for (size_t off = 0; off < down_nb01; off += CACHE_LINE_SIZE) {
+                            __builtin_prefetch(pf_down + off, 0, 3);
+                        }
+                    }
+                    float val;
+                    vec_dot_down(ne00_down, &val, 0, expert_down + ir0*down_nb01, 0, src1_col, 0, 1);
+                    acc_buf[i] += w * val;
+                }
             }
-            dst_data[ir0] = acc;
+
+            for (int64_t i = 0; i < blk_len; ++i) {
+                dst_data[ir0_start + blk_start + i] = acc_buf[i];
+            }
         }
 
         if (nth >= nchunk0) {
