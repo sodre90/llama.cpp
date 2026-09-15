@@ -2486,6 +2486,20 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
 
+    // host -> device copy
+    if (ggml_backend_is_cuda(backend_dst) && ggml_backend_buffer_is_cuda(buf_dst) && ggml_backend_buffer_is_host(buf_src)) {
+        ggml_backend_cuda_context * cuda_ctx_dst = (ggml_backend_cuda_context *) backend_dst->context;
+        ggml_backend_cuda_buffer_context * buf_ctx_dst = (ggml_backend_cuda_buffer_context *) buf_dst->context;
+
+        if (cuda_ctx_dst->device != buf_ctx_dst->device) {
+            return false;
+        }
+
+        ggml_cuda_set_device(cuda_ctx_dst->device);
+        CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyHostToDevice, cuda_ctx_dst->stream()));
+        return true;
+    }
+
     if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
         return false;
     }

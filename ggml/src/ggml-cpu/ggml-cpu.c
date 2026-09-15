@@ -1893,6 +1893,18 @@ static void ggml_compute_forward_fused_moe_silu(
             const int64_t ir0_end   = MIN(ir0_start + dr0, nr0);
 
             for (int64_t ir0 = ir0_start; ir0 < ir0_end; ++ir0) {
+                const int64_t prefetch_dist = 2;
+                if (ir0 + prefetch_dist < ir0_end) {
+                    const char * pf_gate = gate_cur + (ir0 + prefetch_dist)*gate_nb01;
+                    const char * pf_up   = up_cur   + (ir0 + prefetch_dist)*up_nb01;
+                    for (size_t off = 0; off < gate_nb01; off += CACHE_LINE_SIZE) {
+                        __builtin_prefetch(pf_gate + off, 0, 3);
+                    }
+                    for (size_t off = 0; off < up_nb01; off += CACHE_LINE_SIZE) {
+                        __builtin_prefetch(pf_up + off, 0, 3);
+                    }
+                }
+
                 float gate_val, up_val;
                 vec_dot(ne00, &gate_val, 0, gate_cur + ir0*gate_nb01, 0, src1_col, 0, 1);
                 vec_dot(ne00, &up_val,   0, up_cur   + ir0*up_nb01,   0, src1_col, 0, 1);
@@ -2016,6 +2028,18 @@ static void ggml_compute_forward_fused_moe_down(
         for (int64_t ir0 = ir0_start; ir0 < ir0_end; ++ir0) {
             float acc = 0.0f;
             for (int a = 0; a < n_active; ++a) {
+                if (a + 1 < n_active) {
+                    const char * pf_down = active_experts[a + 1].down_base + ir0*down_nb01;
+                    for (size_t off = 0; off < down_nb01; off += CACHE_LINE_SIZE) {
+                        __builtin_prefetch(pf_down + off, 0, 3);
+                    }
+                } else if (ir0 + 1 < ir0_end) {
+                    const char * pf_down = active_experts[0].down_base + (ir0 + 1)*down_nb01;
+                    for (size_t off = 0; off < down_nb01; off += CACHE_LINE_SIZE) {
+                        __builtin_prefetch(pf_down + off, 0, 3);
+                    }
+                }
+
                 float val;
                 vec_dot(ne00, &val, 0, active_experts[a].down_base + ir0*down_nb01, 0, active_experts[a].src1_col, 0, 1);
                 acc += active_experts[a].w * val;
