@@ -690,25 +690,32 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     } else {
         auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias);
 
-        qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
-        if (!blk_bias) {
-            qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
-            ggml_set_input(qsa->cell_blk);
-        }
-        qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
-        qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
-
-        ggml_set_input(qsa->blk_cells);
-        ggml_set_input(qsa->bias);
-
         // [TAG_QSA_POOLED_CACHE] complete blocks' summaries are cached; per ubatch only the
         // freshly completed blocks (plus any pending refill after a full state load) are
         // pooled/normed/roped, and the score reads the cache. The full-recompute tables are
         // then dead graph inputs, so they are not created at all (an unreferenced input is
         // never allocated, and filling it would write through a null pointer).
         // Kill switch for A/B testing.
-        if (mctx_hyb->get_pooled_k(il) != nullptr && n_stream == 1 &&
-            getenv("LLAMA_QSA_NO_POOLED_CACHE") == nullptr) {
+        const bool use_pooled = mctx_hyb->get_pooled_k(il) != nullptr && n_stream == 1 &&
+            getenv("LLAMA_QSA_NO_POOLED_CACHE") == nullptr;
+
+        qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
+        if (!blk_bias) {
+            qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
+            ggml_set_input(qsa->cell_blk);
+        }
+
+        // blk_cells feeds the full-recompute pooling gather and the block-level top-k gather;
+        // with the pooled cache on and block top-k off, neither runs and it is dead
+        if (!use_pooled || blk_bias) {
+            qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
+            ggml_set_input(qsa->blk_cells);
+        }
+
+        qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+        ggml_set_input(qsa->bias);
+
+        if (use_pooled) {
             const int64_t n_dirty_max = mctx_hyb->qsa_pooled_n_dirty_max(ubatch, (uint32_t) r);
 
             qsa->dirty_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_dirty_max, 1);
