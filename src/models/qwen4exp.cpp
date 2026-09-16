@@ -598,8 +598,10 @@ public:
         res &= params.ubatch.n_tokens % n_stream == 0;
 
         res &= k_idxs->ne[0]    == params.ubatch.n_tokens;
-        res &= cell_blk->ne[0]  == n_kv;
-        res &= cell_blk->ne[1]  == n_stream;
+        if (cell_blk != nullptr) {
+            res &= cell_blk->ne[0]  == n_kv;
+            res &= cell_blk->ne[1]  == n_stream;
+        }
         if (blk_cells != nullptr) {
             res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks;
         }
@@ -678,11 +680,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias);
 
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
-        qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
+        if (!blk_bias) {
+            qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
+            ggml_set_input(qsa->cell_blk);
+        }
         qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
         qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
 
-        ggml_set_input(qsa->cell_blk);
         ggml_set_input(qsa->blk_cells);
         ggml_set_input(qsa->bias);
 
