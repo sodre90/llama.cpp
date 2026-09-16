@@ -663,13 +663,11 @@ void llama_memory_hybrid_idx::set_input_qsa(
             }
         }
 
-        // unpooled cells all point at one spare block. a spare block exists only when some
-        // cell is unpooled: n_bid == n_blocks means every cell sits in a full block.
-        const bool     have_dead = n_bid < n_blocks;
-        const int32_t  dead_bid  = have_dead ? n_bid : n_blocks - 1;
-
-        // lowest index the spare block names, so a query before all of them can mask it whole
-        int64_t dead_min_idx = INT64_MAX;
+        // unpooled cells sit in spare blocks: each complete block pools r cells, so the
+        // unpooled tail takes ceil(n_up / r) spare rows out of the (n_blocks - n_bid) left over.
+        const int32_t dead_bid = n_bid < n_blocks ? n_bid : n_blocks - 1;
+        std::vector<int32_t> unpooled_cells;
+        int32_t pad = -1;
 
         for (int64_t j = 0; j < n_kv; ++j) {
             const int32_t g = cell_grp[j];
@@ -685,46 +683,34 @@ void llama_memory_hybrid_idx::set_input_qsa(
             if (cur_cell_blk != nullptr) {
                 cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
             }
+
+            if (cells.is_empty(j)) {
+                if (pad < 0) {
+                    pad = (int32_t) j;
+                }
+            } else if (blk_of[j] < 0) {
+                unpooled_cells.push_back((int32_t) j);
+            }
         }
 
+        const int64_t n_up   = (int64_t) unpooled_cells.size();
+        const int64_t n_dead = (n_up + r - 1)/r;
+
         // [TAG_QSA_BLOCK_TOPK] block-level top-k gathers whole rows of blk_cells, so the spare
-        // block needs the real unpooled cells in its row. Leaving the fill-zero row would make
+        // blocks need the real unpooled cells in their rows. Leaving fill-zero rows would make
         // the always-visible tail - the incomplete block that holds the query's own token -
         // read cell 0 r times over, which the per-cell cell_blk expansion never did.
-        if (blk_bias && have_dead) {
-            int32_t * dead_row = &loc_blk_cells[(int64_t) dead_bid*r];
+        if (blk_bias && n_dead > 0) {
+            GGML_ASSERT(n_bid + n_dead <= n_blocks && "qsa: not enough block slots for unpooled cells");
+            GGML_ASSERT((n_up == n_dead*r || pad >= 0) && "qsa: no empty cell to pad the spare block with");
 
-            // an empty cell carries -inf in the attention mask the caller adds, so padding with
-            // one costs no weight; a live cell repeated would be counted r times instead
-            int32_t pad  = -1;
-            int64_t n_up = 0;
+            for (int64_t d = 0; d < n_dead; ++d) {
+                int32_t * dead_row = &loc_blk_cells[(int64_t) (n_bid + d)*r];
 
-            for (int64_t j = 0; j < n_kv; ++j) {
-                if (cells.is_empty(j)) {
-                    if (pad < 0) {
-                        pad = (int32_t) j;
-                    }
-                    continue;
+                for (int64_t i = 0; i < r; ++i) {
+                    const int64_t idx = d*r + i;
+                    dead_row[i] = idx < n_up ? unpooled_cells[idx] : pad;
                 }
-
-                if (blk_of[j] < 0) {
-                    if (n_up < r) {
-                        dead_row[n_up] = (int32_t) j;
-                    }
-
-                    dead_min_idx = std::min(dead_min_idx, ranked ? (int64_t) rank[j] : (int64_t) cells.pos_get(j));
-                    n_up++;
-                }
-            }
-
-            // both hold for a single gapless sequence, which is what a spare block is sized for;
-            // several sequences sharing the unified cache can split one bucket into partial
-            // groups and break them. LLAMA_QSA_BLOCK_TOPK=0 is the way out
-            GGML_ASSERT(n_up <= r && "qsa: more unpooled cells than one spare block can name");
-            GGML_ASSERT((n_up == r || pad >= 0) && "qsa: no empty cell to pad the spare block with");
-
-            for (int64_t i = n_up; i < r; ++i) {
-                dead_row[i] = pad;
             }
         }
 
@@ -847,12 +833,29 @@ void llama_memory_hybrid_idx::set_input_qsa(
                                     : 0.0f;
                 }
 
-                // the spare block holds the unpooled cells, which are the incomplete tail, so
-                // it gets the tail value. it must stay finite when the query can see any of
-                // them: a sequence with fewer than `ratio` cells owns no full block, and a row
-                // of -inf only gives a nan.
-                if (have_dead) {
-                    cur_blk_bias[dead_bid] = dead_min_idx > q ? -INFINITY : 1e9f;
+                // spare blocks hold unpooled cells (incomplete tails). A spare block is visible
+                // and gets the tail value (1e9f) if it contains at least one causally visible cell
+                // for this sequence; otherwise -inf so foreign sequence tails are not selected.
+                for (int64_t d = 0; d < n_dead; ++d) {
+                    const int32_t   bid      = n_bid + (int32_t) d;
+                    const int32_t * dead_row = &loc_blk_cells[(int64_t) bid*r];
+
+                    bool visible = false;
+
+                    for (int64_t k = 0; k < r; ++k) {
+                        const int32_t c = dead_row[k];
+
+                        if (c >= 0 && !cells.is_empty(c) && cells.seq_has(c, seq_id)) {
+                            const int64_t idx = ranked ? rank[c] : cells.pos_get(c);
+
+                            if (idx <= q) {
+                                visible = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    cur_blk_bias[bid] = visible ? 1e9f : -INFINITY;
                 }
 
                 continue;
