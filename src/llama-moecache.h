@@ -30,6 +30,11 @@
 struct llama_model;
 struct ggml_tensor;
 
+// the cache chain is built (and routing observed) only for ubatches this small:
+// decode of up to this many concurrent sequences. Larger ubatches are prefill,
+// where streaming the experts once already amortises over the whole batch.
+constexpr int64_t LLAMA_MOE_CACHE_MAX_TOKENS = 4;
+
 struct llama_moe_cache_layer {
     int il = -1;
 
