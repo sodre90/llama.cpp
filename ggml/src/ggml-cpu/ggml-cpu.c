@@ -1898,10 +1898,10 @@ static void ggml_compute_forward_fused_moe_silu(
                     const char * pf_gate = gate_cur + (ir0 + prefetch_dist)*gate_nb01;
                     const char * pf_up   = up_cur   + (ir0 + prefetch_dist)*up_nb01;
                     for (size_t off = 0; off < gate_nb01; off += CACHE_LINE_SIZE) {
-                        __builtin_prefetch(pf_gate + off, 0, 3);
+                        __builtin_prefetch(pf_gate + off, 0, 0);
                     }
                     for (size_t off = 0; off < up_nb01; off += CACHE_LINE_SIZE) {
-                        __builtin_prefetch(pf_up + off, 0, 3);
+                        __builtin_prefetch(pf_up + off, 0, 0);
                     }
                 }
 
@@ -2041,7 +2041,7 @@ static void ggml_compute_forward_fused_moe_down(
                     if (i + 2 < blk_len) {
                         const char * pf_down = expert_down + (ir0 + 2)*down_nb01;
                         for (size_t off = 0; off < down_nb01; off += CACHE_LINE_SIZE) {
-                            __builtin_prefetch(pf_down + off, 0, 3);
+                            __builtin_prefetch(pf_down + off, 0, 0);
                         }
                     }
                     float val;
@@ -2160,15 +2160,26 @@ static void ggml_compute_forward_fused_moe_ffn_full(
     }
 
     const int64_t total_glu_rows = total_glu_vectors * ne01_gate;
-    const int64_t glu_rows_per_th = (total_glu_rows + nth - 1) / nth;
-    const int64_t glu_row_start = ith * glu_rows_per_th;
-    const int64_t glu_row_end   = MIN(glu_row_start + glu_rows_per_th, total_glu_rows);
+    const int64_t bs_down = (vec_dot_type_down != GGML_TYPE_F32) ? (int64_t)ggml_blck_size(vec_dot_type_down) : 1;
+    const size_t  ts_down = (vec_dot_type_down != GGML_TYPE_F32) ? ggml_type_size(vec_dot_type_down) : sizeof(float);
+    const bool can_fuse_quant = (vec_dot_type_down != GGML_TYPE_F32) && (ne01_gate % bs_down == 0);
 
-    for (int64_t g_idx = glu_row_start; g_idx < glu_row_end; ++g_idx) {
+    const int64_t glu_chunk_align = (can_fuse_quant && bs_down > 1) ? bs_down : 1;
+    const int64_t total_glu_chunks = (total_glu_rows + glu_chunk_align - 1) / glu_chunk_align;
+    const int64_t glu_chunks_per_th = (total_glu_chunks + nth - 1) / nth;
+    const int64_t glu_row_start = MIN(ith * glu_chunks_per_th * glu_chunk_align, total_glu_rows);
+    const int64_t glu_row_end   = MIN((ith + 1) * glu_chunks_per_th * glu_chunk_align, total_glu_rows);
+
+    const int64_t blk_size = (can_fuse_quant && bs_down > 64) ? bs_down : 64;
+    GGML_ASSERT(blk_size <= 256);
+
+    int64_t g_idx = glu_row_start;
+    while (g_idx < glu_row_end) {
         const int v_idx = (int)(g_idx / ne01_gate);
         const int t     = v_idx / n_ids;
         const int id    = v_idx % n_ids;
-        const int64_t ir0 = g_idx % ne01_gate;
+        const int64_t ir0_base = g_idx % ne01_gate;
+        const int64_t v_len = MIN(glu_row_end - g_idx, ne01_gate - ir0_base);
 
         const int32_t expert_idx = *(const int32_t *) ((const char *) ids->data + t*ids_nb1 + id*ids_nb0);
         const char * gate_cur = (const char *) weights_gate->data + expert_idx * gate_nb02;
@@ -2178,31 +2189,52 @@ static void ggml_compute_forward_fused_moe_ffn_full(
             ? ((const char *) src1->data + t*nb12)
             : (wdata + t*row_size_src1);
 
-        if (g_idx + 2 < glu_row_end) {
-            const int next_v   = (int)((g_idx + 2) / ne01_gate);
-            const int next_t   = next_v / n_ids;
-            const int next_id  = next_v % n_ids;
-            const int64_t next_ir0 = (g_idx + 2) % ne01_gate;
-            const int32_t next_expert_idx = *(const int32_t *) ((const char *) ids->data + next_t*ids_nb1 + next_id*ids_nb0);
-            const char * pf_gate = (const char *) weights_gate->data + next_expert_idx * gate_nb02 + next_ir0*gate_nb01;
-            const char * pf_up   = (const char *) weights_up->data   + next_expert_idx * up_nb02   + next_ir0*up_nb01;
-            for (size_t off = 0; off < gate_nb01; off += CACHE_LINE_SIZE) {
-                __builtin_prefetch(pf_gate + off, 0, 3);
+        for (int64_t blk_start = 0; blk_start < v_len; blk_start += blk_size) {
+            const int64_t blk_len = MIN(blk_size, v_len - blk_start);
+            const int64_t ir0 = ir0_base + blk_start;
+
+            float gate_vals[256];
+
+            // 1. Contiguous Gate streaming
+            for (int64_t i = 0; i < blk_len; ++i) {
+                const int64_t r = ir0 + i;
+                if (i + 2 < blk_len) {
+                    const char * pf_gate = gate_cur + (r + 2)*gate_nb01;
+                    for (size_t off = 0; off < gate_nb01; off += CACHE_LINE_SIZE) {
+                        __builtin_prefetch(pf_gate + off, 0, 0);
+                    }
+                }
+                vec_dot_gate(ne00_gate, &gate_vals[i], 0, gate_cur + r*gate_nb01, 0, src1_q_t, 0, 1);
             }
-            for (size_t off = 0; off < up_nb01; off += CACHE_LINE_SIZE) {
-                __builtin_prefetch(pf_up + off, 0, 3);
+
+            // 2. Contiguous Up streaming + SwiGLU computation
+            float * glu_dst = glu_buf + v_idx * ne01_gate + ir0;
+            for (int64_t i = 0; i < blk_len; ++i) {
+                const int64_t r = ir0 + i;
+                if (i + 2 < blk_len) {
+                    const char * pf_up = up_cur + (r + 2)*up_nb01;
+                    for (size_t off = 0; off < up_nb01; off += CACHE_LINE_SIZE) {
+                        __builtin_prefetch(pf_up + off, 0, 0);
+                    }
+                }
+                float up_val;
+                vec_dot_gate(ne00_gate, &up_val, 0, up_cur + r*up_nb01, 0, src1_q_t, 0, 1);
+                glu_dst[i] = ggml_silu_f32(gate_vals[i]) * up_val;
+            }
+
+            // 3. In-place quantization while hot in L1 cache
+            if (can_fuse_quant && (blk_len % bs_down == 0)) {
+                char * q_dst = glu_q + v_idx * row_size_glu + (ir0 / bs_down) * ts_down;
+                from_float_down(glu_dst, q_dst, blk_len);
             }
         }
 
-        float gate_val, up_val;
-        vec_dot_gate(ne00_gate, &gate_val, 0, gate_cur + ir0*gate_nb01, 0, src1_q_t, 0, 1);
-        vec_dot_gate(ne00_gate, &up_val,   0, up_cur   + ir0*up_nb01,   0, src1_q_t, 0, 1);
-        glu_buf[v_idx * ne01_gate + ir0] = ggml_silu_f32(gate_val) * up_val;
+        g_idx += v_len;
     }
 
     ggml_barrier(params->threadpool);
 
-    if (vec_dot_type_down != GGML_TYPE_F32) {
+    if (vec_dot_type_down != GGML_TYPE_F32 && !can_fuse_quant) {
         for (int v = ith; v < total_glu_vectors; v += nth) {
             from_float_down(glu_buf + v * ne01_gate,
                             (void *)(glu_q + v * row_size_glu),
@@ -2278,7 +2310,7 @@ static void ggml_compute_forward_fused_moe_ffn_full(
                     if (i + 2 < blk_len) {
                         const char * pf_down = expert_down + (ir0 + 2)*down_nb01;
                         for (size_t off = 0; off < down_nb01; off += CACHE_LINE_SIZE) {
-                            __builtin_prefetch(pf_down + off, 0, 3);
+                            __builtin_prefetch(pf_down + off, 0, 0);
                         }
                     }
                     float val;
