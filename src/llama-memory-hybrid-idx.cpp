@@ -424,6 +424,8 @@ void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * blk_pos,
         ggml_tensor * bias,
         const llama_ubatch * ubatch,
+        uint32_t n_kv_graph,
+        uint32_t n_stream,
         uint32_t ratio,
         bool blk_bias,
         ggml_tensor * dirty_cells,
@@ -439,12 +441,19 @@ void llama_memory_hybrid_idx::set_input_qsa(
         GGML_ASSERT(ggml_backend_buffer_is_host(blk_cells->buffer));
     }
 
-    const int64_t n_kv     = cell_blk != nullptr ? cell_blk->ne[0] : (int64_t) get_mem_idx()->get_cells(ubatch->seq_id[0][0]).size();
-    const int64_t n_ns     = cell_blk != nullptr ? cell_blk->ne[1] : (blk_cells != nullptr ? blk_cells->ne[1] : bias->ne[2]);
+    const int64_t n_kv     = n_kv_graph;
+    const int64_t n_ns     = n_stream;
     const int64_t n_tokens = ubatch->n_tokens;
     const int64_t r        = ratio;
     // same formula as the graph; blk_pos may be null on the pooled path
     const int64_t n_blocks = (n_kv + r - 1)/r;
+
+    // every tensor below was sized from the graph's n_kv, so a mismatch here silently writes
+    // past the host input buffer and only surfaces as a fault on the GPU
+    GGML_ASSERT(cell_blk  == nullptr || (cell_blk->ne[0]  == n_kv        && cell_blk->ne[1] == n_ns));
+    GGML_ASSERT(blk_cells == nullptr || (blk_cells->ne[0] == r*n_blocks  && blk_cells->ne[1] == n_ns));
+    GGML_ASSERT(blk_pos   == nullptr ||  blk_pos->ne[0]   == 4*n_blocks*n_ns);
+    GGML_ASSERT(bias->ne[0] == (blk_bias ? n_blocks : n_kv));
 
     GGML_ASSERT(n_tokens % n_ns == 0);
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
@@ -672,6 +681,44 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
             if (cur_cell_blk != nullptr) {
                 cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
+            }
+        }
+
+        // [TAG_QSA_BLOCK_TOPK] block-level top-k gathers whole rows of blk_cells, so the spare
+        // block needs the real unpooled cells in its row. Leaving the fill-zero row would make
+        // the always-visible tail - the incomplete block that holds the query's own token -
+        // read cell 0 r times over, which the per-cell cell_blk expansion never did.
+        if (blk_bias && have_dead) {
+            int32_t * dead_row = &loc_blk_cells[(int64_t) dead_bid*r];
+
+            // an empty cell carries -inf in the attention mask the caller adds, so padding with
+            // one costs no weight; a live cell repeated would be counted r times instead
+            int32_t pad  = -1;
+            int64_t n_up = 0;
+
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (cells.is_empty(j)) {
+                    if (pad < 0) {
+                        pad = (int32_t) j;
+                    }
+                    continue;
+                }
+
+                if (blk_of[j] < 0 && n_up < r) {
+                    dead_row[n_up] = (int32_t) j;
+                }
+
+                n_up += blk_of[j] < 0 ? 1 : 0;
+            }
+
+            // both hold for a single gapless sequence, which is what a spare block is sized for;
+            // several sequences sharing the unified cache can split one bucket into partial
+            // groups and break them. LLAMA_QSA_BLOCK_TOPK=0 is the way out
+            GGML_ASSERT(n_up <= r && "qsa: more unpooled cells than one spare block can name");
+            GGML_ASSERT((n_up == r || pad >= 0) && "qsa: no empty cell to pad the spare block with");
+
+            for (int64_t i = n_up; i < r; ++i) {
+                dead_row[i] = pad;
             }
         }
 
@@ -908,8 +955,10 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * dirty_pos,
         ggml_tensor * dirty_rows) const {
     GGML_ASSERT(mem != nullptr);
+    GGML_ASSERT(get_idx() != nullptr);
 
-    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias,
+    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch,
+            get_idx()->get_n_kv(), get_n_stream(), ratio, blk_bias,
             dirty_cells, dirty_pos, dirty_rows);
 }
 

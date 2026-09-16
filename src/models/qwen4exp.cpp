@@ -639,6 +639,17 @@ public:
     const bool blk_bias;
 };
 
+// [TAG_QSA_BLOCK_TOPK] LLAMA_QSA_BLOCK_TOPK=0 restores the per-cell score expansion, so the
+// block-level selection and the path it replaced can be compared from one build
+static bool qsa_block_top_k_enabled() {
+    static const bool enabled = []() {
+        const char * requested = getenv("LLAMA_QSA_BLOCK_TOPK");
+        return requested == nullptr || atoi(requested) != 0;
+    }();
+
+    return enabled;
+}
+
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         const llama_memory_hybrid_idx_context * mctx_hyb,
         ggml_tensor *                           cur,
@@ -666,7 +677,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // the rest is the visible/not test the attention mask already carries, so upload the per-block half only: 1/ratio of the cells
     // alibi writes distances instead of a mask and non-causal keeps future cells, so both opt out
     // the mask also holds an mrope rule for the query's own position, but only 2d image positions can differ there
-    const bool blk_bias = kq_mask != nullptr &&
+    const bool blk_bias = qsa_block_top_k_enabled() && kq_mask != nullptr &&
         kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
         cparams.causal_attn && !hparams.use_alibi;
 
