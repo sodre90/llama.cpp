@@ -838,15 +838,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         // top-k directly on block scores: [n_blocks, n_tps, n_stream] -> [n_top_blocks, n_tps, n_stream, 1]
         ggml_tensor * top_blocks = ggml_cont(ctx0, ggml_top_k(ctx0, score, n_top_blocks));
 
-        // blk_cells is [r*n_blocks, n_stream] -> view as 2D table [r, n_blocks*n_stream]
-        ggml_tensor * blk_cells_2d = ggml_view_2d(ctx0, inp->blk_cells,
-                r, n_blocks*n_stream,
-                r*sizeof(int32_t), 0);
+        // view blk_cells as 3D tensor: [r, n_blocks, n_stream]
+        ggml_tensor * blk_cells_3d = ggml_view_3d(ctx0, inp->blk_cells,
+                r, n_blocks, n_stream,
+                r*sizeof(int32_t), r*n_blocks*sizeof(int32_t), 0);
 
-        ggml_tensor * flat_top_blocks = ggml_reshape_1d(ctx0, top_blocks, n_top_blocks*n_tps*n_stream);
+        // reshape top_blocks to [n_top_blocks*n_tps, n_stream, 1, 1] to match ggml_get_rows batching
+        ggml_tensor * top_blocks_reshaped = ggml_reshape_2d(ctx0, top_blocks, n_top_blocks*n_tps, n_stream);
 
-        // ggml_get_rows gathers cell indices for all selected blocks: [r, n_top_blocks*n_tps*n_stream]
-        ggml_tensor * top_cells = ggml_get_rows(ctx0, blk_cells_2d, flat_top_blocks);
+        // ggml_get_rows gathers cell indices: [r, n_top_blocks*n_tps, n_stream, 1]
+        ggml_tensor * top_cells = ggml_get_rows(ctx0, blk_cells_3d, top_blocks_reshaped);
 
         // reshape to [r*n_top_blocks, n_tps, 1, n_stream]
         const int64_t total_top_cells = r*n_top_blocks;
