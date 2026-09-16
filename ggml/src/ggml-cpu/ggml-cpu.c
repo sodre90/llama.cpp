@@ -1785,6 +1785,27 @@ static void ggml_compute_forward_mul_mat_id(
 
 #define GGML_MOE_MAX_EXPERTS_USED 128
 
+// llama MoE expert cache: src[3] is an I32 table mapping expert id -> device
+// cache slot, with op_params[0] the "not cached" dummy. Ids the device chain
+// serves must be skipped here exactly as ggml_compute_forward_mul_mat_id does.
+struct ggml_moe_cache_filter {
+    const int32_t * tbl;
+    int32_t         dummy;
+};
+
+static struct ggml_moe_cache_filter ggml_moe_cache_filter_from(const struct ggml_tensor * node) {
+    struct ggml_moe_cache_filter f = { NULL, 0 };
+    if (node->src[3]) {
+        f.tbl   = (const int32_t *) node->src[3]->data;
+        f.dummy = ggml_get_op_params_i32(node, 0);
+    }
+    return f;
+}
+
+static inline bool ggml_moe_expert_is_cached(struct ggml_moe_cache_filter f, int32_t expert_idx) {
+    return f.tbl && f.tbl[expert_idx] != f.dummy;
+}
+
 static void ggml_compute_forward_fused_moe_silu(
         const struct ggml_compute_params * params,
         struct ggml_tensor * node0,
@@ -1830,6 +1851,8 @@ static void ggml_compute_forward_fused_moe_silu(
 
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = weights_gate->ne[2]; // n_experts
+
+    const struct ggml_moe_cache_filter mcf = ggml_moe_cache_filter_from(node0);
 
     const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -1878,6 +1901,10 @@ static void ggml_compute_forward_fused_moe_silu(
 
     for (int id = 0; id < n_ids; ++id) {
         const int32_t expert_idx = *(const int32_t *) ((const char *) ids->data + id*ids->nb[0]);
+
+        if (ggml_moe_expert_is_cached(mcf, expert_idx)) {
+            continue; // served by the device cache chain; the down op skips it too
+        }
 
         const char * gate_cur = (const char *) weights_gate->data + expert_idx * gate_nb02;
         const char * up_cur   = (const char *) weights_up->data   + expert_idx * up_nb02;
@@ -1955,6 +1982,8 @@ static void ggml_compute_forward_fused_moe_down(
     const int n_ids = ids->ne[0];
     const int n_as  = ne02;
 
+    const struct ggml_moe_cache_filter mcf = ggml_moe_cache_filter_from(mmid_node);
+
     const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
     void * wdata_cur = params->wdata;
@@ -2006,7 +2035,7 @@ static void ggml_compute_forward_fused_moe_down(
     for (int id = 0; id < n_ids && id < GGML_MOE_MAX_EXPERTS_USED; ++id) {
         const int32_t expert_idx = *(const int32_t *) ((const char *) ids->data + id*ids->nb[0]);
         const float w = *(const float *) ((const char *) weights->data + id*weights->nb[1]);
-        if (w == 0.0f) {
+        if (w == 0.0f || ggml_moe_expert_is_cached(mcf, expert_idx)) {
             continue;
         }
 
@@ -2056,6 +2085,18 @@ static void ggml_compute_forward_fused_moe_down(
 }
 
 #define GGML_MOE_FUSED_MAX_TOKENS 4
+
+// runtime cap on the multi-token fused MoE path, so GGML_MOE_FUSED_MAX_TOKENS=1
+// restores single-token-only fusion without a rebuild
+static int ggml_moe_fused_max_tokens(void) {
+    static int cap = -1;
+    if (cap < 0) {
+        const char * env = getenv("GGML_MOE_FUSED_MAX_TOKENS");
+        int v = env ? atoi(env) : GGML_MOE_FUSED_MAX_TOKENS;
+        cap = MIN(MAX(v, 1), GGML_MOE_FUSED_MAX_TOKENS);
+    }
+    return cap;
+}
 
 static void ggml_compute_forward_fused_moe_ffn_full(
         const struct ggml_compute_params * params,
@@ -2119,6 +2160,8 @@ static void ggml_compute_forward_fused_moe_ffn_full(
 
     const int n_ids = ids->ne[0];
 
+    const struct ggml_moe_cache_filter mcf = ggml_moe_cache_filter_from(node_down);
+
     const size_t row_size_src1 = ggml_row_size(vec_dot_type_gate, ne10);
     const size_t row_size_glu  = ggml_row_size(vec_dot_type_down, ne01_gate);
 
@@ -2160,6 +2203,10 @@ static void ggml_compute_forward_fused_moe_ffn_full(
         const int64_t ir0 = g_idx % ne01_gate;
 
         const int32_t expert_idx = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + id*ids->nb[0]);
+        if (ggml_moe_expert_is_cached(mcf, expert_idx)) {
+            continue;
+        }
+
         const char * gate_cur = (const char *) weights_gate->data + expert_idx * gate_nb02;
         const char * up_cur   = (const char *) weights_up->data   + expert_idx * up_nb02;
         const char * token_src1 = (src1->type != vec_dot_type_gate) ? (src1_q + t * row_size_src1) : ((const char *) src1->data + t * nb_token);
@@ -2190,6 +2237,15 @@ static void ggml_compute_forward_fused_moe_ffn_full(
 
     if (vec_dot_type_down != GGML_TYPE_F32) {
         for (int inst = ith; inst < total_instances; inst += nth) {
+            if (mcf.tbl) {
+                const int t  = inst / n_ids;
+                const int id = inst % n_ids;
+                const int32_t expert_idx = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + id*ids->nb[0]);
+                if (ggml_moe_expert_is_cached(mcf, expert_idx)) {
+                    continue; // glu_buf was never written for a cached expert
+                }
+            }
+
             from_float_down(glu_buf + inst * ne01_gate,
                             (void *)(glu_q + inst * row_size_glu),
                             ne01_gate);
@@ -2210,7 +2266,7 @@ static void ggml_compute_forward_fused_moe_ffn_full(
         for (int id = 0; id < n_ids && id < GGML_MOE_MAX_EXPERTS_USED; ++id) {
             const int32_t expert_idx = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + id*ids->nb[0]);
             const float w = *(const float *) ((const char *) weights->data + t*weights->nb[2] + id*weights->nb[1]);
-            if (w == 0.0f) {
+            if (w == 0.0f || ggml_moe_expert_is_cached(mcf, expert_idx)) {
                 continue;
             }
 
@@ -3445,8 +3501,10 @@ struct ggml_cplan ggml_graph_plan(
                         // src1
                         if (src1->type != vec_dot_type) {
                             size_t quant_buf = ggml_row_size(vec_dot_type, ggml_nelements(src1));
-                            // fused MoE path: each thread needs its own quantization buffer + cache line padding
-                            if (src1->ne[2] == 1) {
+                            // fused MoE path: each thread needs its own quantization buffer + cache line padding.
+                            // must stay in step with the fusion gate in ggml_cpu_try_fuse_ops, or the
+                            // multi-token kernel overruns the work buffer
+                            if (src1->ne[2] <= ggml_moe_fused_max_tokens()) {
                                 quant_buf = (quant_buf + CACHE_LINE_SIZE) * n_tasks;
                             }
                             cur += quant_buf + sizeof(int64_t);
@@ -3651,7 +3709,7 @@ static int ggml_cpu_try_fuse_ops(
         const int k = ids ? ids->ne[0] : 0;
 
         // 1. FULL FFN Fusion: MUL_MAT_ID(gate) + MUL_MAT_ID(up) + GLU + MUL_MAT_ID(down) + MUL(weights) + k*VIEW + (k-1)*ADD
-        if (k >= 2 && k <= GGML_MOE_MAX_EXPERTS_USED && node->src[1]->ne[2] == 1 && node->src[3] == NULL) {
+        if (k >= 2 && k <= GGML_MOE_MAX_EXPERTS_USED && node->src[1]->ne[2] <= ggml_moe_fused_max_tokens()) {
             const int n_nodes_full = 2 * k + 4;
             if (node_n + n_nodes_full <= cgraph->n_nodes) {
                 enum ggml_op full_fuse_ops[2 * GGML_MOE_MAX_EXPERTS_USED + 4];
@@ -3677,8 +3735,8 @@ static int ggml_cpu_try_fuse_ops(
                     if (node->src[1] == node1->src[1] && node->src[2] == node1->src[2] &&
                         node->src[0]->type == node1->src[0]->type &&
                         node_down->src[1] == glu && node_down->src[2] == node->src[2] &&
-                        node_down->src[3] == NULL &&
-                        ggml_nrows(node->src[1]) <= GGML_MOE_FUSED_MAX_TOKENS &&
+                        node_down->src[3] == node->src[3] && node1->src[3] == node->src[3] &&
+                        ggml_nrows(node->src[1]) <= ggml_moe_fused_max_tokens() &&
                         ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
                         dst_node->type == GGML_TYPE_F32) {
 
@@ -3707,7 +3765,7 @@ static int ggml_cpu_try_fuse_ops(
         }
 
         // MUL_MAT_ID (down) + MUL (weights) + k*VIEW + (k-1)*ADD fusion; only for TG (single token)
-        if (k >= 2 && k <= GGML_MOE_MAX_EXPERTS_USED && node->src[1]->ne[2] == 1 && node->src[3] == NULL) {
+        if (k >= 2 && k <= GGML_MOE_MAX_EXPERTS_USED && node->src[1]->ne[2] == 1) {
             const int n_nodes = 2 * k + 1;
             if (node_n + n_nodes <= cgraph->n_nodes) {
                 enum ggml_op down_fuse_ops[2 * GGML_MOE_MAX_EXPERTS_USED + 1];
