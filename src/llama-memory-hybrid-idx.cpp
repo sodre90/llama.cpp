@@ -668,6 +668,9 @@ void llama_memory_hybrid_idx::set_input_qsa(
         const bool     have_dead = n_bid < n_blocks;
         const int32_t  dead_bid  = have_dead ? n_bid : n_blocks - 1;
 
+        // lowest index the spare block names, so a query before all of them can mask it whole
+        int64_t dead_min_idx = INT64_MAX;
+
         for (int64_t j = 0; j < n_kv; ++j) {
             const int32_t g = cell_grp[j];
 
@@ -704,11 +707,14 @@ void llama_memory_hybrid_idx::set_input_qsa(
                     continue;
                 }
 
-                if (blk_of[j] < 0 && n_up < r) {
-                    dead_row[n_up] = (int32_t) j;
-                }
+                if (blk_of[j] < 0) {
+                    if (n_up < r) {
+                        dead_row[n_up] = (int32_t) j;
+                    }
 
-                n_up += blk_of[j] < 0 ? 1 : 0;
+                    dead_min_idx = std::min(dead_min_idx, ranked ? (int64_t) rank[j] : (int64_t) cells.pos_get(j));
+                    n_up++;
+                }
             }
 
             // both hold for a single gapless sequence, which is what a spare block is sized for;
@@ -828,15 +834,25 @@ void llama_memory_hybrid_idx::set_input_qsa(
                         continue;
                     }
 
+                    // [TAG_QSA_BLOCK_TOPK] the causal cut has to happen before the selection, not
+                    // after it. The per-cell expansion this replaced added the attention mask to
+                    // the cells and only then ran top-k, so future cells could never be picked;
+                    // block-level top-k sees these scores raw, and a block that starts past the
+                    // query would take a budget slot on its 1e9 and be masked away afterwards.
+                    // A whole prefill ubatch sits past its own first query, so that alone cost
+                    // those queries nearly all of their history.
                     // finite, so it can never meet a -inf and produce a nan
-                    cur_blk_bias[b] = bid_idx[b] >= tail_start ? 1e9f : 0.0f;
+                    cur_blk_bias[b] = bid_idx[b] >  q          ? -INFINITY
+                                    : bid_idx[b] >= tail_start ? 1e9f
+                                    : 0.0f;
                 }
 
                 // the spare block holds the unpooled cells, which are the incomplete tail, so
-                // it gets the tail value. it must stay finite: a sequence with fewer than
-                // `ratio` cells owns no full block, and a row of -inf only gives a nan.
+                // it gets the tail value. it must stay finite when the query can see any of
+                // them: a sequence with fewer than `ratio` cells owns no full block, and a row
+                // of -inf only gives a nan.
                 if (have_dead) {
-                    cur_blk_bias[dead_bid] = 1e9f;
+                    cur_blk_bias[dead_bid] = dead_min_idx > q ? -INFINITY : 1e9f;
                 }
 
                 continue;
