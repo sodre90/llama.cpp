@@ -679,9 +679,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
         qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
+        qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
         qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
 
         ggml_set_input(qsa->cell_blk);
+        ggml_set_input(qsa->blk_cells);
         ggml_set_input(qsa->bias);
 
         // [TAG_QSA_POOLED_CACHE] complete blocks' summaries are cached; per ubatch only the
@@ -702,10 +704,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ggml_set_input(qsa->dirty_pos);
             ggml_set_input(qsa->dirty_rows);
         } else {
-            qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
             qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
 
-            ggml_set_input(qsa->blk_cells);
             ggml_set_input(qsa->blk_pos);
         }
 
@@ -821,34 +821,56 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     score = summed;
     cb(score, "indexer_score", il);
 
-    // one value per block, so it is cheaper to bias here than after the cells are expanded
-    if (blk_bias) {
-        score = ggml_add(ctx0, score, inp->bias);
-    }
-
-    // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
-    ggml_tensor * expanded = ggml_get_rows(ctx0,
-            ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3)), inp->cell_blk);
-    expanded = ggml_cont(ctx0, ggml_permute(ctx0, expanded, 1, 0, 2, 3));
-
-    if (blk_bias) {
-        // flash attention keeps the mask in f16; the scores are f32
-        ggml_tensor * mask = kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
-        expanded = ggml_add(ctx0, expanded, ggml_reshape_3d(ctx0, mask, n_kv, n_tps, n_stream));
-    } else {
-        expanded = ggml_add(ctx0, expanded, inp->bias);
-    }
-    cb(expanded, "indexer_score_tokens", il);
-
     // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
     const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
 
-    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
+    if (blk_bias) {
+        // one value per block, so it is cheaper to bias here than after the cells are expanded
+        score = ggml_add(ctx0, score, inp->bias);
 
-    // build_attn_qsa reads [n_top_k, n_batch, 1, n_stream], matching the KQ mask.
+        // the budget is whole blocks: select top-k at block level
+        const int64_t n_top_blocks = std::min<int64_t>(n_blocks, (width + r - 1)/r);
+
+        // top-k directly on block scores: [n_blocks, n_tps, n_stream] -> [n_top_blocks, n_tps, n_stream, 1]
+        ggml_tensor * top_blocks = ggml_cont(ctx0, ggml_top_k(ctx0, score, n_top_blocks));
+
+        // blk_cells is [r*n_blocks, n_stream] -> view as 4D [r, n_blocks, n_tps, n_stream]
+        // with nb2=0 so it broadcasts over n_tps
+        ggml_tensor * blk_cells_4d = ggml_view_4d(ctx0, inp->blk_cells,
+                r, n_blocks, n_tps, n_stream,
+                r*sizeof(int32_t), 0, r*n_blocks*sizeof(int32_t), 0);
+
+        // top_blocks is [n_top_blocks, n_tps, n_stream, 1] -> reshape to [n_top_blocks, n_tps, n_stream, 1]
+        ggml_tensor * top_blocks_idx = ggml_reshape_4d(ctx0, top_blocks,
+                n_top_blocks, n_tps, n_stream, 1);
+
+        // ggml_get_rows gathers cell indices: [r, n_top_blocks, n_tps, n_stream]
+        ggml_tensor * top_cells = ggml_get_rows(ctx0, blk_cells_4d, top_blocks_idx);
+
+        // reshape to [r*n_top_blocks, n_tps, 1, n_stream]
+        const int64_t total_top_cells = r*n_top_blocks;
+        ggml_tensor * top_k = ggml_reshape_4d(ctx0, top_cells, total_top_cells, n_tps, 1, n_stream);
+
+        // truncate to width if total_top_cells exceeds width
+        if (total_top_cells > width) {
+            top_k = ggml_cont(ctx0, ggml_view_4d(ctx0, top_k, width, n_tps, 1, n_stream,
+                    top_k->nb[1], top_k->nb[2], top_k->nb[3], 0));
+        }
+
+        cb(top_k, "indexer_top_k", il);
+        return top_k;
+    }
+
+    // Fallback for non-causal attention when blk_bias is false
+    ggml_tensor * expanded = ggml_get_rows(ctx0,
+            ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3)), inp->cell_blk);
+    expanded = ggml_cont(ctx0, ggml_permute(ctx0, expanded, 1, 0, 2, 3));
+    expanded = ggml_add(ctx0, expanded, inp->bias);
+    cb(expanded, "indexer_score_tokens", il);
+
+    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
     top_k = ggml_reshape_4d(ctx0, top_k, width, n_tps, 1, n_stream);
     cb(top_k, "indexer_top_k", il);
-
     return top_k;
 }
 
