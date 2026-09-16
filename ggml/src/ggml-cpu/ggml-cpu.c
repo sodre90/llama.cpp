@@ -2055,6 +2055,8 @@ static void ggml_compute_forward_fused_moe_down(
     }
 }
 
+#define GGML_MOE_FUSED_MAX_TOKENS 4
+
 static void ggml_compute_forward_fused_moe_ffn_full(
         const struct ggml_compute_params * params,
         struct ggml_tensor * node0,
@@ -2089,13 +2091,14 @@ static void ggml_compute_forward_fused_moe_ffn_full(
 
     const int64_t ne00_down = weights_down->ne[0];
     const int64_t ne01_down = weights_down->ne[1];
-    const int64_t ne02_down = weights_down->ne[2];
     const size_t down_nb01  = weights_down->nb[1];
     const size_t down_nb02  = weights_down->nb[2];
 
     const int64_t ne10 = src1->ne[0];
     const int64_t ne11 = src1->ne[1];
     const size_t  nb11 = src1->nb[1];
+
+    GGML_ASSERT(ne11 <= GGML_MOE_FUSED_MAX_TOKENS);
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -2112,7 +2115,6 @@ static void ggml_compute_forward_fused_moe_ffn_full(
     ggml_from_float_t const from_float_down   = type_traits_cpu[vec_dot_type_down].from_float;
 
     const int n_ids = ids->ne[0];
-    const int n_as  = ne02_down;
 
     const size_t row_size_src1 = ggml_row_size(vec_dot_type_gate, ne10);
     const size_t row_size_glu  = ggml_row_size(vec_dot_type_down, ne01_gate);
@@ -2134,34 +2136,37 @@ static void ggml_compute_forward_fused_moe_ffn_full(
         src1_q = wdata;
     }
 
-    float * glu_buf = (float *) incr_ptr_aligned(&wdata_cur, (n_ids * ne01_gate * sizeof(float) + CACHE_LINE_SIZE), CACHE_LINE_SIZE);
-    char  * glu_q   = (char *)  incr_ptr_aligned(&wdata_cur, (n_ids * row_size_glu + CACHE_LINE_SIZE), CACHE_LINE_SIZE);
-
-    incr_ptr_aligned(&wdata_cur, n_as * sizeof(int64_t), sizeof(int64_t));
-    incr_ptr_aligned(&wdata_cur, n_as * ids->ne[0] * ids->ne[1] * sizeof(struct mmid_row_mapping), sizeof(int64_t));
+    const int64_t total_instances = (int64_t)ne11 * n_ids;
+    float * glu_buf = (float *) incr_ptr_aligned(&wdata_cur, (total_instances * ne01_gate * sizeof(float) + CACHE_LINE_SIZE), CACHE_LINE_SIZE);
+    char  * glu_q   = (char *)  incr_ptr_aligned(&wdata_cur, (total_instances * row_size_glu + CACHE_LINE_SIZE), CACHE_LINE_SIZE);
 
     atomic_int * atomic_chunk_down = (atomic_int *) incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE, CACHE_LINE_SIZE);
     if (ith == 0) {
         atomic_store_explicit(atomic_chunk_down, nth, memory_order_relaxed);
     }
 
-    const int64_t total_glu_rows = (int64_t)n_ids * ne01_gate;
+    const int64_t total_glu_rows = total_instances * ne01_gate;
     const int64_t glu_rows_per_th = (total_glu_rows + nth - 1) / nth;
     const int64_t glu_row_start = ith * glu_rows_per_th;
     const int64_t glu_row_end   = MIN(glu_row_start + glu_rows_per_th, total_glu_rows);
 
     for (int64_t g_idx = glu_row_start; g_idx < glu_row_end; ++g_idx) {
-        const int id  = (int)(g_idx / ne01_gate);
+        const int inst = (int)(g_idx / ne01_gate);
+        const int t    = inst / n_ids;
+        const int id   = inst % n_ids;
         const int64_t ir0 = g_idx % ne01_gate;
 
-        const int32_t expert_idx = *(const int32_t *) ((const char *) ids->data + id*ids->nb[0]);
+        const int32_t expert_idx = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + id*ids->nb[0]);
         const char * gate_cur = (const char *) weights_gate->data + expert_idx * gate_nb02;
         const char * up_cur   = (const char *) weights_up->data   + expert_idx * up_nb02;
+        const char * token_src1 = (src1->type != vec_dot_type_gate) ? (src1_q + t * row_size_src1) : ((const char *) src1->data + t * nb11);
 
         if (g_idx + 2 < glu_row_end) {
-            const int next_id = (int)((g_idx + 2) / ne01_gate);
+            const int next_inst = (int)((g_idx + 2) / ne01_gate);
+            const int next_t    = next_inst / n_ids;
+            const int next_id   = next_inst % n_ids;
             const int64_t next_ir0 = (g_idx + 2) % ne01_gate;
-            const int32_t next_expert_idx = *(const int32_t *) ((const char *) ids->data + next_id*ids->nb[0]);
+            const int32_t next_expert_idx = *(const int32_t *) ((const char *) ids->data + next_t*ids->nb[1] + next_id*ids->nb[0]);
             const char * pf_gate = (const char *) weights_gate->data + next_expert_idx * gate_nb02 + next_ir0*gate_nb01;
             const char * pf_up   = (const char *) weights_up->data   + next_expert_idx * up_nb02   + next_ir0*up_nb01;
             for (size_t off = 0; off < gate_nb01; off += CACHE_LINE_SIZE) {
@@ -2173,17 +2178,17 @@ static void ggml_compute_forward_fused_moe_ffn_full(
         }
 
         float gate_val, up_val;
-        vec_dot_gate(ne00_gate, &gate_val, 0, gate_cur + ir0*gate_nb01, 0, src1_q, 0, 1);
-        vec_dot_gate(ne00_gate, &up_val,   0, up_cur   + ir0*up_nb01,   0, src1_q, 0, 1);
-        glu_buf[id * ne01_gate + ir0] = ggml_silu_f32(gate_val) * up_val;
+        vec_dot_gate(ne00_gate, &gate_val, 0, gate_cur + ir0*gate_nb01, 0, token_src1, 0, 1);
+        vec_dot_gate(ne00_gate, &up_val,   0, up_cur   + ir0*up_nb01,   0, token_src1, 0, 1);
+        glu_buf[inst * ne01_gate + ir0] = ggml_silu_f32(gate_val) * up_val;
     }
 
     ggml_barrier(params->threadpool);
 
     if (vec_dot_type_down != GGML_TYPE_F32) {
-        for (int id = ith; id < n_ids; id += nth) {
-            from_float_down(glu_buf + id * ne01_gate,
-                            (void *)(glu_q + id * row_size_glu),
+        for (int inst = ith; inst < total_instances; inst += nth) {
+            from_float_down(glu_buf + inst * ne01_gate,
+                            (void *)(glu_q + inst * row_size_glu),
                             ne01_gate);
         }
         ggml_barrier(params->threadpool);
@@ -2195,21 +2200,26 @@ static void ggml_compute_forward_fused_moe_ffn_full(
         float w;
     };
 
-    struct expert_info active_experts[GGML_MOE_MAX_EXPERTS_USED];
-    int n_active = 0;
-    for (int id = 0; id < n_ids && id < GGML_MOE_MAX_EXPERTS_USED; ++id) {
-        const int32_t expert_idx = *(const int32_t *) ((const char *) ids->data + id*ids->nb[0]);
-        const float w = *(const float *) ((const char *) weights->data + id*weights->nb[1]);
-        if (w == 0.0f) {
-            continue;
-        }
+    struct expert_info active_experts[GGML_MOE_FUSED_MAX_TOKENS][GGML_MOE_MAX_EXPERTS_USED];
+    int n_active[GGML_MOE_FUSED_MAX_TOKENS] = {0};
 
-        active_experts[n_active].down_base = (const char *) weights_down->data + expert_idx * down_nb02;
-        active_experts[n_active].src1_col  = (vec_dot_type_down != GGML_TYPE_F32)
-            ? (glu_q + id * row_size_glu)
-            : (const char *)(glu_buf + id * ne01_gate);
-        active_experts[n_active].w         = w;
-        n_active++;
+    for (int t = 0; t < ne11; ++t) {
+        for (int id = 0; id < n_ids && id < GGML_MOE_MAX_EXPERTS_USED; ++id) {
+            const int32_t expert_idx = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + id*ids->nb[0]);
+            const float w = *(const float *) ((const char *) weights->data + t*weights->nb[2] + id*weights->nb[1]);
+            if (w == 0.0f) {
+                continue;
+            }
+
+            const int inst = t * n_ids + id;
+            const int act_idx = n_active[t];
+            active_experts[t][act_idx].down_base = (const char *) weights_down->data + expert_idx * down_nb02;
+            active_experts[t][act_idx].src1_col  = (vec_dot_type_down != GGML_TYPE_F32)
+                ? (glu_q + inst * row_size_glu)
+                : (const char *)(glu_buf + inst * ne01_gate);
+            active_experts[t][act_idx].w         = w;
+            n_active[t]++;
+        }
     }
 
     const int64_t nr0_down = ne01_down;
@@ -2222,33 +2232,37 @@ static void ggml_compute_forward_fused_moe_ffn_full(
     }
     const int64_t dr0 = (nr0_down + nchunk0 - 1) / nchunk0;
 
-    float * dst_data = (float *) dst_node->data;
-
     int current_chunk = ith;
     while (current_chunk < nchunk0) {
         const int64_t ir0_start = dr0 * current_chunk;
         const int64_t ir0_end   = MIN(ir0_start + dr0, nr0_down);
 
-        for (int64_t ir0 = ir0_start; ir0 < ir0_end; ++ir0) {
-            float acc = 0.0f;
-            for (int a = 0; a < n_active; ++a) {
-                if (a + 1 < n_active) {
-                    const char * pf_down = active_experts[a + 1].down_base + ir0*down_nb01;
-                    for (size_t off = 0; off < down_nb01; off += CACHE_LINE_SIZE) {
-                        __builtin_prefetch(pf_down + off, 0, 3);
-                    }
-                } else if (ir0 + 1 < ir0_end) {
-                    const char * pf_down = active_experts[0].down_base + (ir0 + 1)*down_nb01;
-                    for (size_t off = 0; off < down_nb01; off += CACHE_LINE_SIZE) {
-                        __builtin_prefetch(pf_down + off, 0, 3);
-                    }
-                }
+        for (int t = 0; t < ne11; ++t) {
+            float * dst_token = (float *)((char *)dst_node->data + t * dst_node->nb[1]);
+            const int n_act = n_active[t];
+            const struct expert_info * exp_list = active_experts[t];
 
-                float val;
-                vec_dot_down(ne00_down, &val, 0, active_experts[a].down_base + ir0*down_nb01, 0, active_experts[a].src1_col, 0, 1);
-                acc += active_experts[a].w * val;
+            for (int64_t ir0 = ir0_start; ir0 < ir0_end; ++ir0) {
+                float acc = 0.0f;
+                for (int a = 0; a < n_act; ++a) {
+                    if (a + 1 < n_act) {
+                        const char * pf_down = exp_list[a + 1].down_base + ir0*down_nb01;
+                        for (size_t off = 0; off < down_nb01; off += CACHE_LINE_SIZE) {
+                            __builtin_prefetch(pf_down + off, 0, 3);
+                        }
+                    } else if (ir0 + 1 < ir0_end) {
+                        const char * pf_down = exp_list[0].down_base + (ir0 + 1)*down_nb01;
+                        for (size_t off = 0; off < down_nb01; off += CACHE_LINE_SIZE) {
+                            __builtin_prefetch(pf_down + off, 0, 3);
+                        }
+                    }
+
+                    float val;
+                    vec_dot_down(ne00_down, &val, 0, exp_list[a].down_base + ir0*down_nb01, 0, exp_list[a].src1_col, 0, 1);
+                    acc += exp_list[a].w * val;
+                }
+                dst_token[ir0] = acc;
             }
-            dst_data[ir0] = acc;
         }
 
         if (nth >= nchunk0) {
@@ -3430,7 +3444,7 @@ struct ggml_cplan ggml_graph_plan(
                             size_t quant_buf = ggml_row_size(vec_dot_type, ggml_nelements(src1));
                             // fused MoE path: each thread needs its own quantization buffer + cache line padding
                             if (src1->ne[2] == 1) {
-                                quant_buf = (quant_buf) * n_tasks;
+                                quant_buf = (quant_buf + CACHE_LINE_SIZE) * n_tasks;
                             }
                             cur += quant_buf + sizeof(int64_t);
                         }
@@ -3661,7 +3675,7 @@ static int ggml_cpu_try_fuse_ops(
                         node->src[0]->type == node1->src[0]->type &&
                         node_down->src[1] == glu && node_down->src[2] == node->src[2] &&
                         node_down->src[3] == NULL &&
-                        ggml_nrows(node->src[1]) == 1 &&
+                        ggml_nrows(node->src[1]) <= GGML_MOE_FUSED_MAX_TOKENS &&
                         ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
                         dst_node->type == GGML_TYPE_F32) {
 
