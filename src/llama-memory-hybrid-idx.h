@@ -93,8 +93,11 @@ public:
     // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
     // the caller then adds the attention mask, the only part of the bias that varies within a block
     // causal_attn selects the rule: causal forces the query's own block on, non-causal lets every visible block compete on score
+    // n_kv/n_stream are the graph's, not the cache's: get_n_kv() is a padded live window well
+    // below cells.size(), and every tensor here was sized from it
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
+                       ggml_tensor * bias, const llama_ubatch * ubatch,
+                       uint32_t n_kv, uint32_t n_stream, uint32_t ratio,
                        bool blk_bias, bool causal_attn,
                        ggml_tensor * dirty_cells = nullptr,
                        ggml_tensor * dirty_pos   = nullptr,

@@ -485,6 +485,8 @@ void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * blk_pos,
         ggml_tensor * bias,
         const llama_ubatch * ubatch,
+        uint32_t n_kv_graph,
+        uint32_t n_stream,
         uint32_t ratio,
         bool blk_bias,
         bool causal_attn,
@@ -494,19 +496,31 @@ void llama_memory_hybrid_idx::set_input_qsa(
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(get_mem_idx() != nullptr);
 
-    GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
+    if (cell_blk != nullptr) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
+    }
+    if (blk_cells != nullptr) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(blk_cells->buffer));
+    }
 
-    const int64_t n_kv     = cell_blk->ne[0];
-    const int64_t n_ns     = cell_blk->ne[1];        // streams in this ubatch
+    const int64_t n_kv     = n_kv_graph;
+    const int64_t n_ns     = n_stream;
     const int64_t n_tokens = ubatch->n_tokens;
     const int64_t r        = ratio;
     // same formula as the graph; blk_pos may be null on the pooled path
     const int64_t n_blocks = (n_kv + r - 1)/r;
 
+    // every tensor below was sized from the graph's n_kv, so a mismatch here silently writes
+    // past the host input buffer and only surfaces as a fault on the GPU
+    GGML_ASSERT(cell_blk  == nullptr || (cell_blk->ne[0]  == n_kv        && cell_blk->ne[1] == n_ns));
+    GGML_ASSERT(blk_cells == nullptr || (blk_cells->ne[0] == r*n_blocks  && blk_cells->ne[1] == n_ns));
+    GGML_ASSERT(blk_pos   == nullptr ||  blk_pos->ne[0]   == 4*n_blocks*n_ns);
+    GGML_ASSERT(bias->ne[0] == (blk_bias ? n_blocks : n_kv));
+
     GGML_ASSERT(n_tokens % n_ns == 0);
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
 
-    int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
+    int32_t * dst_cell_blk  = cell_blk != nullptr ? (int32_t *) cell_blk->data : nullptr;
     float   * dst_bias      = (float   *) bias->data;
 
     // [TAG_QSA_POOLED_CACHE] the pooled path drops blk_cells/blk_pos from the graph (the dirty
@@ -545,7 +559,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
         const auto & cells = get_mem_idx()->get_cells(seq_of_stream);
 
-        int32_t * cur_cell_blk  = dst_cell_blk + s*n_kv;
+        int32_t * cur_cell_blk  = dst_cell_blk != nullptr ? dst_cell_blk + s*n_kv : nullptr;
 
         std::fill(loc_blk_cells.begin(), loc_blk_cells.end(), 0);
         std::fill(loc_blk_pos.begin(),   loc_blk_pos.end(),   0);
@@ -564,8 +578,13 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
         const bool one_seq = n_seq_present <= 1;
 
-        // a cell no block covers needs its own -inf, which a per-block bias cannot carry
-        // every cache path keeps the position below the cell window, so this stays false
+        // a cell no block covers needs its own -inf, which a per-block bias cannot carry.
+        // This stays false only while n_kv bounds every cell INDEX in the stream: the scan below
+        // walks [0, n_kv) without filtering by sequence, buckets each cell by its POSITION, and a
+        // sequence of T tokens holds T cells, so pos <= T-1 < used_max_p1 <= n_kv for all of them.
+        // Bounding n_kv by the ubatch's own sequences breaks that - an idle neighbour whose cells
+        // wrapped to low indices keeps its high positions and runs past n_blocks. Measured: that is
+        // what aborted production on 2026-09-18.
         bool oor = false;
 
         bool dup = false;
@@ -711,10 +730,11 @@ void llama_memory_hybrid_idx::set_input_qsa(
             }
         }
 
-        // unpooled cells all point at one spare block. a spare block exists only when some
-        // cell is unpooled: n_bid == n_blocks means every cell sits in a full block.
-        const bool     have_dead = n_bid < n_blocks;
-        const int32_t  dead_bid  = have_dead ? n_bid : n_blocks - 1;
+        // unpooled cells sit in spare blocks: each complete block pools r cells, so the
+        // unpooled tail takes ceil(n_up / r) spare rows out of the (n_blocks - n_bid) left over.
+        const int32_t dead_bid = n_bid < n_blocks ? n_bid : n_blocks - 1;
+        std::vector<int32_t> unpooled_cells;
+        int32_t pad = -1;
 
         for (int64_t j = 0; j < n_kv; ++j) {
             const int32_t g = cell_grp[j];
@@ -727,7 +747,38 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 loc_blk_cells[blk_of[j]*r + (idx%r)] = (int32_t) j;
             }
 
-            cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
+            if (cur_cell_blk != nullptr) {
+                cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
+            }
+
+            if (cells.is_empty(j)) {
+                if (pad < 0) {
+                    pad = (int32_t) j;
+                }
+            } else if (blk_of[j] < 0) {
+                unpooled_cells.push_back((int32_t) j);
+            }
+        }
+
+        const int64_t n_up   = (int64_t) unpooled_cells.size();
+        const int64_t n_dead = (n_up + r - 1)/r;
+
+        // [TAG_QSA_BLOCK_TOPK] block-level top-k gathers whole rows of blk_cells, so the spare
+        // blocks need the real unpooled cells in their rows. Leaving fill-zero rows would make
+        // the always-visible tail - the incomplete block that holds the query's own token -
+        // read cell 0 r times over, which the per-cell cell_blk expansion never did.
+        if (blk_bias && n_dead > 0) {
+            GGML_ASSERT(n_bid + n_dead <= n_blocks && "qsa: not enough block slots for unpooled cells");
+            GGML_ASSERT((n_up == n_dead*r || pad >= 0) && "qsa: no empty cell to pad the spare block with");
+
+            for (int64_t d = 0; d < n_dead; ++d) {
+                int32_t * dead_row = &loc_blk_cells[(int64_t) (n_bid + d)*r];
+
+                for (int64_t i = 0; i < r; ++i) {
+                    const int64_t idx = d*r + i;
+                    dead_row[i] = idx < n_up ? unpooled_cells[idx] : pad;
+                }
+            }
         }
 
         if (dst_blk_cells != nullptr) {
@@ -836,15 +887,43 @@ void llama_memory_hybrid_idx::set_input_qsa(
                         continue;
                     }
 
+                    // [TAG_QSA_BLOCK_TOPK] the causal cut has to happen before the selection, not
+                    // after it. The per-cell expansion this replaced added the attention mask to
+                    // the cells and only then ran top-k, so future cells could never be picked;
+                    // block-level top-k sees these scores raw, and a block that starts past the
+                    // query would take a budget slot on its 1e9 and be masked away afterwards.
+                    // A whole prefill ubatch sits past its own first query, so that alone cost
+                    // those queries nearly all of their history.
                     // finite, so it can never meet a -inf and produce a nan
-                    cur_blk_bias[b] = (causal_attn && bid_idx[b] >= tail_start) ? 1e9f : 0.0f;
+                    cur_blk_bias[b] = !causal_attn             ? 0.0f
+                                    : bid_idx[b] >  q          ? -INFINITY
+                                    : bid_idx[b] >= tail_start ? 1e9f
+                                    : 0.0f;
                 }
 
-                // the spare block holds the unpooled cells, which are the incomplete tail, so
-                // it gets the tail value. it must stay finite: a sequence with fewer than
-                // `ratio` cells owns no full block, and a row of -inf only gives a nan.
-                if (have_dead) {
-                    cur_blk_bias[dead_bid] = 1e9f;
+                // spare blocks hold unpooled cells (incomplete tails). A spare block is visible
+                // and gets the tail value (1e9f) if it contains at least one causally visible cell
+                // for this sequence; otherwise -inf so foreign sequence tails are not selected.
+                for (int64_t d = 0; d < n_dead; ++d) {
+                    const int32_t   bid      = n_bid + (int32_t) d;
+                    const int32_t * dead_row = &loc_blk_cells[(int64_t) bid*r];
+
+                    bool visible = false;
+
+                    for (int64_t k = 0; k < r; ++k) {
+                        const int32_t c = dead_row[k];
+
+                        if (c >= 0 && !cells.is_empty(c) && cells.seq_has(c, seq_id)) {
+                            const int64_t idx = ranked ? rank[c] : cells.pos_get(c);
+
+                            if (!causal_attn || idx <= q) {
+                                visible = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    cur_blk_bias[bid] = visible ? 1e9f : -INFINITY;
                 }
 
                 continue;
@@ -1153,8 +1232,10 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * dirty_pos,
         ggml_tensor * dirty_rows) const {
     GGML_ASSERT(mem != nullptr);
+    GGML_ASSERT(get_idx() != nullptr);
 
-    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, causal_attn,
+    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch,
+            get_idx()->get_n_kv(), get_n_stream(), ratio, blk_bias, causal_attn,
             dirty_cells, dirty_pos, dirty_rows);
 }
 
