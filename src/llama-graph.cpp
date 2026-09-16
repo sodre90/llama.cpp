@@ -2211,22 +2211,36 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
-    // MoE expert cache (see llama-moecache.h): during single-token decode on a
-    // layer whose experts live in host memory, run a parallel mul_mat_id chain
-    // over a device-resident cache of hot experts. Cached ids are skipped by
-    // the CPU chain (src[3] table) and served by the cache chain; uncached ids
-    // map to the cache's zero slot. The two outputs sum to the exact result.
+    // MoE expert cache (see llama-moecache.h): during decode on a layer whose
+    // experts live in host memory, run a parallel mul_mat_id chain over a
+    // device-resident cache of hot experts. Cached ids are skipped by the CPU
+    // chain (src[3] table) and served by the cache chain; uncached ids map to
+    // the cache's zero slot. The two outputs sum to the exact result.
     const llama_moe_cache_layer * mcache = nullptr;
     ggml_tensor * mc_slot_ids = nullptr;
-    if (n_tokens == 1 && !gate_up_exps && gate_exps && down_exps &&
+    if (n_tokens <= LLAMA_MOE_CACHE_MAX_TOKENS && !gate_up_exps && gate_exps && down_exps &&
         !up_exps_b && !gate_exps_b && !down_exps_b &&
         !up_exps_s && !gate_exps_s && !down_exps_s &&
         type_op == LLM_FFN_SILU && !weight_before_ffn && loras->empty()) {
         mcache = llama_moe_cache_lookup(up_exps);
     }
     if (mcache) {
-        mc_slot_ids = ggml_get_rows(ctx0, mcache->dev_table, selected_experts); // [1, n_expert_used, 1]
-        mc_slot_ids = ggml_reshape_2d(ctx0, mc_slot_ids, n_expert_used, 1);
+        if (n_tokens > 1) {
+            static bool multi_token_cache_logged = false;
+            if (!multi_token_cache_logged) {
+                multi_token_cache_logged = true;
+                LLAMA_LOG_INFO("%s: MoE expert cache engaged on a %d-token ubatch\n", __func__, (int) n_tokens);
+            }
+        }
+
+        // dev_table has no token axis, so ggml_get_rows needs the ids flat
+        ggml_tensor * flat_experts = ggml_is_contiguous(selected_experts)
+            ? selected_experts
+            : ggml_cont(ctx0, selected_experts);
+        flat_experts = ggml_reshape_1d(ctx0, flat_experts, n_expert_used*n_tokens);
+
+        mc_slot_ids = ggml_get_rows(ctx0, mcache->dev_table, flat_experts); // [1, n_expert_used*n_tokens]
+        mc_slot_ids = ggml_reshape_2d(ctx0, mc_slot_ids, n_expert_used, n_tokens);
         cb(mc_slot_ids, "ffn_moe_cache_slots", il);
     }
 
@@ -2395,6 +2409,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
     cb(experts, "ffn_moe_down", il);
 
+    ggml_tensor * cache_down = nullptr;
+
     if (mcache) {
         experts->src[3] = mcache->host_table;
         experts->op_params[0] = mcache->n_slots;
@@ -2425,11 +2441,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
         }
 
-        ggml_tensor * down_g = ggml_mul_mat_id(ctx0, mcache->down_c, act_g, mc_slot_ids);
-        cb(down_g, "ffn_moe_cache_down", il);
+        cache_down = ggml_mul_mat_id(ctx0, mcache->down_c, act_g, mc_slot_ids);
+        cb(cache_down, "ffn_moe_cache_down", il);
 
-        experts = ggml_add(ctx0, experts, down_g);
-        cb(experts, "ffn_moe_cache_merged", il);
+        // NOTE: the two chains are merged only after each has been reduced to
+        // [n_embd, n_tokens] below. Merging here would interpose an ADD between
+        // the down mul_mat_id and the weights MUL, which breaks the CPU
+        // MUL_MAT_ID+MUL_MAT_ID+GLU+MUL_MAT_ID+MUL+VIEW*k+ADD*(k-1) fusion
+        // pattern and costs far more than the cache saves.
     }
 
     if (down_exps_s) {
@@ -2446,33 +2465,51 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_weighted", il);
     }
 
-    ggml_build_forward_expand(gf, experts);
-
-    ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
-
     assert(n_expert_used > 0);
 
-    // order the views before the adds
     // Use per-layer n_expert_used to bound the graph even during warmup (avoids
     // the large-add-nodes issue for uniform arches; for Puzzle the per-layer
     // value is correct). ref: https://github.com/ggml-org/llama.cpp/pull/14753
     const uint32_t n_expert_used_il = hparams.n_expert_used(il);
-    for (uint32_t i = 0; i < n_expert_used_il; ++i) {
-        cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
 
-        ggml_build_forward_expand(gf, cur_experts[i]);
-    }
+    // [n_embd, n_expert_used, n_tokens] -> [n_embd, n_tokens]; the views must be
+    // ordered before the adds, and the whole run must stay contiguous in the
+    // graph so the CPU full-FFN MoE fusion can match it
+    auto sum_expert_columns = [&](ggml_tensor * e) {
+        ggml_build_forward_expand(gf, e);
 
-    // aggregate experts
-    ggml_tensor * moe_out = cur_experts[0];
+        ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
 
-    for (uint32_t i = 1; i < n_expert_used_il; ++i) {
-        moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
+        for (uint32_t i = 0; i < n_expert_used_il; ++i) {
+            cur_experts[i] = ggml_view_2d(ctx0, e, n_embd, n_tokens, e->nb[2], i*e->nb[1]);
+
+            ggml_build_forward_expand(gf, cur_experts[i]);
+        }
+
+        ggml_tensor * sum = cur_experts[0];
+
+        for (uint32_t i = 1; i < n_expert_used_il; ++i) {
+            sum = ggml_add(ctx0, sum, cur_experts[i]);
+
+            ggml_build_forward_expand(gf, sum);
+        }
+
+        return sum;
+    };
+
+    ggml_tensor * moe_out = sum_expert_columns(experts);
+
+    if (cache_down) {
+        ggml_tensor * cache_weighted = ggml_mul(ctx0, cache_down, weights);
+        cb(cache_weighted, "ffn_moe_cache_weighted", il);
+
+        moe_out = ggml_add(ctx0, moe_out, sum_expert_columns(cache_weighted));
+        cb(moe_out, "ffn_moe_cache_merged", il);
 
         ggml_build_forward_expand(gf, moe_out);
     }
 
-    if (n_expert_used_il == 1) {
+    if (n_expert_used_il == 1 && !cache_down) {
         // avoid returning a non-contiguous tensor
         moe_out = ggml_cont(ctx0, moe_out);
     }
