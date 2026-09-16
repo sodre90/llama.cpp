@@ -2095,10 +2095,13 @@ static void ggml_compute_forward_fused_moe_ffn_full(
     const size_t down_nb02  = weights_down->nb[2];
 
     const int64_t ne10 = src1->ne[0];
-    const int64_t ne11 = src1->ne[1];
-    const size_t  nb11 = src1->nb[1];
 
-    GGML_ASSERT(ne11 <= GGML_MOE_FUSED_MAX_TOKENS);
+    // the MoE graph feeds src1 as [n_embd, 1, n_tokens], so the token axis is ne[2], not ne[1]
+    const int64_t n_tokens_src1 = src1->ne[2];
+    const size_t  nb_token      = src1->nb[2];
+
+    GGML_ASSERT(src1->ne[1] == 1);
+    GGML_ASSERT(n_tokens_src1 <= GGML_MOE_FUSED_MAX_TOKENS);
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -2127,16 +2130,16 @@ static void ggml_compute_forward_fused_moe_ffn_full(
             (ggml_row_size(vec_dot_type_gate, ggml_nelements(src1)) + CACHE_LINE_SIZE) * nth, sizeof(int64_t));
 
         GGML_ASSERT(src1->type == GGML_TYPE_F32);
-        char * wdata = quant_base + ith * (ne11 * row_size_src1 + CACHE_LINE_SIZE);
-        for (int64_t i11 = 0; i11 < ne11; ++i11) {
-            from_float_gate((const float *)((const char *) src1->data + i11*nb11),
+        char * wdata = quant_base + ith * (n_tokens_src1 * row_size_src1 + CACHE_LINE_SIZE);
+        for (int64_t i11 = 0; i11 < n_tokens_src1; ++i11) {
+            from_float_gate((const float *)((const char *) src1->data + i11*nb_token),
                             (void *)(wdata + i11*row_size_src1),
                             ne10);
         }
         src1_q = wdata;
     }
 
-    const int64_t total_instances = (int64_t)ne11 * n_ids;
+    const int64_t total_instances = n_tokens_src1 * n_ids;
     float * glu_buf = (float *) incr_ptr_aligned(&wdata_cur, (total_instances * ne01_gate * sizeof(float) + CACHE_LINE_SIZE), CACHE_LINE_SIZE);
     char  * glu_q   = (char *)  incr_ptr_aligned(&wdata_cur, (total_instances * row_size_glu + CACHE_LINE_SIZE), CACHE_LINE_SIZE);
 
@@ -2159,7 +2162,7 @@ static void ggml_compute_forward_fused_moe_ffn_full(
         const int32_t expert_idx = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + id*ids->nb[0]);
         const char * gate_cur = (const char *) weights_gate->data + expert_idx * gate_nb02;
         const char * up_cur   = (const char *) weights_up->data   + expert_idx * up_nb02;
-        const char * token_src1 = (src1->type != vec_dot_type_gate) ? (src1_q + t * row_size_src1) : ((const char *) src1->data + t * nb11);
+        const char * token_src1 = (src1->type != vec_dot_type_gate) ? (src1_q + t * row_size_src1) : ((const char *) src1->data + t * nb_token);
 
         if (g_idx + 2 < glu_row_end) {
             const int next_inst = (int)((g_idx + 2) / ne01_gate);
@@ -2203,7 +2206,7 @@ static void ggml_compute_forward_fused_moe_ffn_full(
     struct expert_info active_experts[GGML_MOE_FUSED_MAX_TOKENS][GGML_MOE_MAX_EXPERTS_USED];
     int n_active[GGML_MOE_FUSED_MAX_TOKENS] = {0};
 
-    for (int t = 0; t < ne11; ++t) {
+    for (int t = 0; t < n_tokens_src1; ++t) {
         for (int id = 0; id < n_ids && id < GGML_MOE_MAX_EXPERTS_USED; ++id) {
             const int32_t expert_idx = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + id*ids->nb[0]);
             const float w = *(const float *) ((const char *) weights->data + t*weights->nb[2] + id*weights->nb[1]);
@@ -2237,7 +2240,7 @@ static void ggml_compute_forward_fused_moe_ffn_full(
         const int64_t ir0_start = dr0 * current_chunk;
         const int64_t ir0_end   = MIN(ir0_start + dr0, nr0_down);
 
-        for (int t = 0; t < ne11; ++t) {
+        for (int t = 0; t < n_tokens_src1; ++t) {
             float * dst_token = (float *)((char *)dst_node->data + t * dst_node->nb[1]);
             const int n_act = n_active[t];
             const struct expert_info * exp_list = active_experts[t];

@@ -912,6 +912,8 @@ private:
     int decode_priority_burst = 0;       // env: LLAMA_SERVER_DECODE_PRIORITY
     int n_decode_steps_since_prompt = 0; // counter for decode steps while a prompt is pending
 
+    size_t i_slot_start = 0; // rotates so a low slot id cannot monopolize the n_batch prompt budget
+
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
@@ -2756,6 +2758,25 @@ private:
         }
     }
 
+    // the prompt batching loop fills up to n_batch and stops, so a fixed order lets the first slot
+    // take the whole budget every step while later slots starve; advance the start slot each step
+    std::vector<server_slot *> slots_in_round_robin_order() {
+        std::vector<server_slot *> res;
+
+        if (slots.empty()) {
+            return res;
+        }
+
+        res.reserve(slots.size());
+        for (size_t i = 0; i < slots.size(); ++i) {
+            res.push_back(&slots[(i_slot_start + i) % slots.size()]);
+        }
+
+        i_slot_start = (i_slot_start + 1) % slots.size();
+
+        return res;
+    }
+
     void iterate(std::vector<server_slot *> & slots, std::function<void(server_slot &)> callback) {
         for (auto & slot : slots) {
             try {
@@ -3154,7 +3175,9 @@ private:
         if (allow_prompt_batch) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
-            iterate(slots, [&](server_slot & slot) {
+            auto slots_ordered = slots_in_round_robin_order();
+
+            iterate(slots_ordered, [&](server_slot & slot) {
                 if (!add_ok || batch.size() >= n_batch) {
                     return; // batch is full, skip remaining slots
                 }
