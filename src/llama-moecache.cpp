@@ -6,6 +6,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstdlib>
@@ -16,19 +17,24 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace {
 
 struct layer_state {
     llama_moe_cache_layer pub;
 
-    // LRU bookkeeping (host side; the tables mirror expert_slot)
-    std::vector<int32_t>  slot_expert;   // slot -> expert id, -1 when empty
-    std::vector<int32_t>  expert_slot;   // expert id -> slot, -1 when uncached
-    std::vector<uint64_t> slot_last_use; // slot -> lamport clock of last hit
-    std::vector<int32_t>  pending;       // uncached ids observed since last step (dedup, obs order)
+    // LRU and SLRU bookkeeping (host side; tables mirror expert_slot)
+    std::vector<int32_t>  slot_expert;    // slot -> expert id, -1 when empty
+    std::vector<int32_t>  expert_slot;    // expert id -> slot, -1 when uncached
+    std::vector<uint64_t> slot_last_use;  // slot -> lamport clock of last hit
+    std::vector<bool>     slot_protected; // SLRU: true if in protected segment
+    std::vector<int32_t>  pending;        // uncached ids observed since last step (dedup, obs order)
 
     std::vector<bool>     slot_in_flight; // slot has an upload pending
+
+    std::vector<uint64_t> expert_hits;    // expert id -> total hits observed
 
     uint64_t n_hit    = 0;
     uint64_t n_miss   = 0;
@@ -81,6 +87,9 @@ int parse_layer_from_name(const char * name) {
     return atoi(name + 4);
 }
 
+void promote_to_protected(layer_state & ls, int32_t slot, int32_t n_slots, uint64_t clock);
+int32_t find_eviction_victim(const layer_state & ls, int32_t n_slots);
+
 void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
     moe_cache * mc = (moe_cache *) ud;
 
@@ -110,10 +119,12 @@ void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
             if (id < 0 || id >= (int32_t) ls->expert_slot.size()) {
                 continue;
             }
+            ls->expert_hits[id]++;
+
             const int32_t slot = ls->expert_slot[id];
             if (slot >= 0) {
                 ls->n_hit++;
-                ls->slot_last_use[slot] = ++mc->clock;
+                promote_to_protected(*ls, slot, mc->n_slots, ++mc->clock);
             } else {
                 ls->n_miss++;
                 bool dup = false;
@@ -142,6 +153,196 @@ void set_table_entry(llama_moe_cache_layer & pub, int32_t expert, int32_t slot_o
     const int32_t v = slot_or_dummy;
     ggml_backend_tensor_set(pub.dev_table,  &v, (size_t) expert*sizeof(int32_t), sizeof(int32_t));
     ggml_backend_tensor_set(pub.host_table, &v, (size_t) expert*sizeof(int32_t), sizeof(int32_t));
+}
+
+void promote_to_protected(layer_state & ls, int32_t slot, int32_t n_slots, uint64_t clock) {
+    ls.slot_last_use[slot] = clock;
+    if (ls.slot_protected[slot]) {
+        return;
+    }
+
+    ls.slot_protected[slot] = true;
+
+    int n_protected = 0;
+    for (int32_t s = 0; s < n_slots; ++s) {
+        if (ls.slot_protected[s]) {
+            n_protected++;
+        }
+    }
+
+    const int max_protected = (n_slots * 3) / 4;
+    if (n_protected <= max_protected) {
+        return;
+    }
+
+    int32_t lru_slot = -1;
+    uint64_t oldest_clock = UINT64_MAX;
+    for (int32_t s = 0; s < n_slots; ++s) {
+        if (ls.slot_protected[s] && s != slot && ls.slot_last_use[s] < oldest_clock) {
+            oldest_clock = ls.slot_last_use[s];
+            lru_slot = s;
+        }
+    }
+
+    if (lru_slot >= 0) {
+        ls.slot_protected[lru_slot] = false;
+    }
+}
+
+int32_t find_eviction_victim(const layer_state & ls, int32_t n_slots) {
+    for (int32_t s = 0; s < n_slots; ++s) {
+        if (!ls.slot_in_flight[s] && ls.slot_expert[s] < 0) {
+            return s;
+        }
+    }
+
+    int32_t victim = -1;
+    uint64_t oldest_probation = UINT64_MAX;
+    for (int32_t s = 0; s < n_slots; ++s) {
+        if (!ls.slot_in_flight[s] && !ls.slot_protected[s] && ls.slot_last_use[s] < oldest_probation) {
+            oldest_probation = ls.slot_last_use[s];
+            victim = s;
+        }
+    }
+
+    if (victim >= 0) {
+        return victim;
+    }
+
+    uint64_t oldest_protected = UINT64_MAX;
+    for (int32_t s = 0; s < n_slots; ++s) {
+        if (!ls.slot_in_flight[s] && ls.slot_last_use[s] < oldest_protected) {
+            oldest_protected = ls.slot_last_use[s];
+            victim = s;
+        }
+    }
+
+    return victim;
+}
+
+const char * get_moe_cache_map_path() {
+    const char * env = getenv("LLAMA_MOE_CACHE_MAP");
+    if (env) {
+        if (strcmp(env, "none") == 0 || strcmp(env, "0") == 0) {
+            return nullptr;
+        }
+        if (env[0]) {
+            return env;
+        }
+    }
+    struct stat st;
+    if (stat("/models", &st) == 0 && S_ISDIR(st.st_mode)) {
+        return "/models/moe-cache-map.csv";
+    }
+    return nullptr;
+}
+
+void save_cache_map(const moe_cache & mc, const char * path) {
+    if (!path || !path[0]) {
+        return;
+    }
+
+    char tmp_path[512];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", path, (int) getpid());
+
+    FILE * f = fopen(tmp_path, "w");
+    if (!f) {
+        return;
+    }
+
+    fprintf(f, "# layer,expert,hits\n");
+    for (size_t li = 0; li < mc.layers.size(); ++li) {
+        const auto & ls = mc.layers[li];
+        std::vector<std::pair<uint64_t, int32_t>> ranked;
+        ranked.reserve(ls.expert_hits.size());
+        for (int32_t e = 0; e < (int32_t) ls.expert_hits.size(); ++e) {
+            if (ls.expert_hits[e] > 0) {
+                ranked.push_back({ls.expert_hits[e], e});
+            }
+        }
+        std::sort(ranked.rbegin(), ranked.rend());
+        for (const auto & p : ranked) {
+            fprintf(f, "%d,%d,%" PRIu64 "\n", ls.pub.il, p.second, p.first);
+        }
+    }
+
+    fclose(f);
+    rename(tmp_path, path);
+    LLAMA_LOG_INFO("moe-cache: saved expert cache map to %s\n", path);
+}
+
+void load_cache_map(moe_cache & mc, const char * path) {
+    if (!path || !path[0]) {
+        return;
+    }
+
+    FILE * f = fopen(path, "r");
+    if (!f) {
+        return;
+    }
+
+    std::map<int, std::vector<std::pair<uint64_t, int32_t>>> layer_experts;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') {
+            continue;
+        }
+        int il = -1;
+        int expert = -1;
+        uint64_t hits = 0;
+        if (sscanf(line, "%d,%d,%" SCNu64, &il, &expert, &hits) >= 2) {
+            layer_experts[il].push_back({hits, expert});
+        }
+    }
+    fclose(f);
+
+    int loaded_count = 0;
+    for (auto & ls : mc.layers) {
+        const auto it = layer_experts.find(ls.pub.il);
+        if (it == layer_experts.end()) {
+            continue;
+        }
+        int32_t slot = 0;
+        for (const auto & h_exp : it->second) {
+            const int32_t exp = h_exp.second;
+            const uint64_t hits = h_exp.first;
+            if (exp >= 0 && exp < (int32_t) ls.expert_hits.size()) {
+                ls.expert_hits[exp] = hits;
+            }
+            if (slot >= mc.n_slots) {
+                continue;
+            }
+            if (exp < 0 || exp >= (int32_t) ls.expert_slot.size() || ls.expert_slot[exp] >= 0) {
+                continue;
+            }
+
+            ls.slot_expert[slot]    = exp;
+            ls.expert_slot[exp]     = slot;
+            ls.slot_protected[slot] = true;
+            ls.slot_last_use[slot]  = ++mc.clock;
+            ls.slot_in_flight[slot] = false;
+
+            upload_slice(ls.pub.up_c,   ls.pub.up_src,   exp, slot);
+            upload_slice(ls.pub.gate_c, ls.pub.gate_src, exp, slot);
+            upload_slice(ls.pub.down_c, ls.pub.down_src, exp, slot);
+            set_table_entry(ls.pub, exp, slot);
+
+            slot++;
+            loaded_count++;
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: pre-warmed %d expert slots from %s\n", __func__, loaded_count, path);
+}
+
+void moe_cache_atexit() {
+    if (g_cache) {
+        const char * map_path = get_moe_cache_map_path();
+        if (map_path) {
+            std::lock_guard<std::mutex> lock(g_cache->mtx);
+            save_cache_map(*g_cache, map_path);
+        }
+    }
 }
 
 } // namespace
@@ -276,7 +477,9 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
             ls.slot_expert.assign(n_slots, -1);
             ls.expert_slot.assign(n_expert, -1);
             ls.slot_last_use.assign(n_slots, 0);
+            ls.slot_protected.assign(n_slots, false);
             ls.slot_in_flight.assign(n_slots, false);
+            ls.expert_hits.assign(n_expert, 0);
 
             std::vector<int32_t> dummy(n_expert, n_slots);
             ggml_backend_tensor_set(ls.pub.dev_table,  dummy.data(), 0, n_expert*sizeof(int32_t));
@@ -287,6 +490,12 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
             LLAMA_LOG_DEBUG("moe-cache: init layer %d '%s' %zu bytes/expert\n",
                     ls.pub.il, ls.pub.up_src->name, ls.pub.up_src->nb[2]);
         }
+
+        const char * map_path = get_moe_cache_map_path();
+        if (map_path) {
+            load_cache_map(*mc, map_path);
+        }
+        std::atexit(moe_cache_atexit);
 
         mc->worker = std::thread([mc]() {
             for (;;) {
@@ -385,23 +594,20 @@ void llama_moe_cache_step() {
             continue;
         }
 
-        int budget = mc->max_inserts;
+        int n_empty = 0;
+        for (int32_t s = 0; s < mc->n_slots; ++s) {
+            if (ls.slot_expert[s] < 0 && !ls.slot_in_flight[s]) {
+                n_empty++;
+            }
+        }
+        int budget = n_empty > 0 ? std::max(mc->max_inserts, std::min(4, n_empty)) : mc->max_inserts;
         for (auto it = ls.pending.rbegin(); it != ls.pending.rend() && budget > 0; ++it, --budget) {
             const int32_t id = *it;
             if (ls.expert_slot[id] >= 0) {
                 continue;
             }
 
-            // victim: an empty non-in-flight slot if any, else the LRU non-in-flight slot
-            int32_t slot = -1;
-            uint64_t best = UINT64_MAX;
-            for (int32_t s = 0; s < mc->n_slots; ++s) {
-                if (ls.slot_in_flight[s]) {
-                    continue;
-                }
-                if (ls.slot_expert[s] < 0) { slot = s; break; }
-                if (ls.slot_last_use[s] < best) { best = ls.slot_last_use[s]; slot = s; }
-            }
+            const int32_t slot = find_eviction_victim(ls, mc->n_slots);
             if (slot < 0) {
                 break; // every slot is in flight; try again next step
             }
@@ -413,6 +619,7 @@ void llama_moe_cache_step() {
                 set_table_entry(ls.pub, victim, mc->n_slots);
                 ls.n_evict++;
             }
+            ls.slot_protected[slot] = false;
             ls.slot_in_flight[slot] = true;
             ls.n_insert++;
 
@@ -426,7 +633,12 @@ void llama_moe_cache_step() {
     if (mc->n_steps % 512 == 0) {
         uint64_t h = 0, m = 0;
         for (auto & ls : mc->layers) { h += ls.n_hit; m += ls.n_miss; }
-        LLAMA_LOG_DEBUG("moe-cache: steps=%" PRIu64 " hits=%" PRIu64 " misses=%" PRIu64 " hit-rate=%.1f%%\n",
+        LLAMA_LOG_INFO("moe-cache: steps=%" PRIu64 " hits=%" PRIu64 " misses=%" PRIu64 " hit-rate=%.1f%%\n",
                 mc->n_steps, h, m, h + m ? 100.0*h/(h + m) : 0.0);
+
+        const char * map_path = get_moe_cache_map_path();
+        if (map_path) {
+            save_cache_map(*mc, map_path);
+        }
     }
 }
