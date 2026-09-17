@@ -657,6 +657,10 @@ struct server_prompt_cache {
 
     std::list<server_prompt_cache_state> states;
 
+    // the entry set aside by reserve() for the prompt about to be loaded: it is not in states,
+    // so the saves that precede its load neither count it against the limit nor evict it
+    std::list<server_prompt_cache_state> reserved;
+
     // in bytes, 0 = no limit
     size_t limit_size = 0;
 
@@ -668,6 +672,12 @@ struct server_prompt_cache {
     size_t n_tokens() const;
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+
+    // set aside the entry load(tokens_next) would restore from, until load() or release()
+    void reserve(const server_tokens & tokens_next);
+
+    // return a reserved entry to the cache as its newest entry
+    void release();
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 

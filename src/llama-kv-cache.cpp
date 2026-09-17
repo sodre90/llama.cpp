@@ -1226,6 +1226,16 @@ uint32_t llama_kv_cache::get_n_seq_max() const {
     return n_seq_max;
 }
 
+uint32_t llama_kv_cache::get_used() const {
+    uint32_t used = 0;
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        used += v_cells[s].get_used();
+    }
+
+    return used;
+}
+
 uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }
@@ -1287,7 +1297,16 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
 
-        result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
+        // padding used_max_p1() + 1 rather than used_max_p1() keeps at least one empty cell inside
+        // the window whenever the cache is not completely full. A consumer that has to name a cell
+        // it does not want attended has nothing else to name: an empty cell is the only index that
+        // is -inf in every mask row. QSA's spare-block padding needs exactly that, and used_max_p1()
+        // landing on a multiple of the padding - roughly one batch in n_pad, once the cells below it
+        // are packed with no holes - left it with none. Measured: that is what aborted production on
+        // 2026-09-19, on two builds, under ordinary three-slot traffic.
+        const uint32_t used = cells.used_max_p1();
+
+        result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(used + 1, n_pad_cur))), result);
     }
 
     return result;

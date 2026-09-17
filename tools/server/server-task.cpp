@@ -1735,6 +1735,31 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
+void server_prompt_cache::reserve(const server_tokens & tokens_next) {
+    release();
+
+    auto it_best = states.end();
+    int lcp_best = 0;
+
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_next);
+
+        // same rule as load(): an entry that would lose most of its context is not a candidate
+        if (lcp_cur > lcp_best && float(lcp_cur) / it->prompt.tokens.size() >= 0.25f) {
+            lcp_best = lcp_cur;
+            it_best  = it;
+        }
+    }
+
+    if (it_best != states.end()) {
+        reserved.splice(reserved.end(), states, it_best);
+    }
+}
+
+void server_prompt_cache::release() {
+    states.splice(states.end(), reserved);
+}
+
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
@@ -1777,8 +1802,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     if (limit_size > 0) {
         // make room before allocating the new vectors to avoid breaching the limit
         while (!states.empty() && size() + state_size_new > limit_size) {
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
+            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (%zu tokens, %.3f MiB)\n",
+                    states.front().prompt.tokens.size(), states.front().size() / (1024.0 * 1024.0));
 
             states.pop_front();
         }
@@ -1818,6 +1843,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    // a reserved entry rejoins as the newest, so the update() after this load spares it too
+    release();
+
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1827,6 +1855,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     auto it_best = states.end();
 
+    // the longest prefix any entry shares with the prompt, whether or not it qualifies
+    int lcp_any = 0;
+
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
@@ -1835,6 +1866,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
 
         SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
+
+        lcp_any = std::max(lcp_any, lcp_cur);
 
         // don't trash large prompts
         if (f_keep_cur < 0.25f) {
@@ -1847,6 +1880,13 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
             it_best = it;
         }
+    }
+
+    // a miss is silent otherwise, and under several agents "it keeps prefilling" is
+    // indistinguishable from an eviction, an admission failure or a bad match without this
+    if (it_best == states.end()) {
+        SRV_INF("prompt cache: slot %d keeps its own %zu tokens (lcp %d of %zu); no better entry among %zu, best lcp %d\n",
+                id_slot, prompt.tokens.size(), lcp_best, tokens_new.size(), states.size(), lcp_any);
     }
 
     if (it_best != states.end()) {
@@ -1885,6 +1925,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 data.shrink_to_fit();
             }
         }
+
+        SRV_INF("prompt cache: slot %d restored %zu-token entry (f_keep = %.3f, f_sim = %.3f) for a %zu-token prompt\n",
+                id_slot, it_best->prompt.tokens.size(), f_keep_best, f_sim_best, tokens_new.size());
 
         prompt = std::move(it_best->prompt);
 
