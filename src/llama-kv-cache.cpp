@@ -710,7 +710,20 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
+            // [TAG_KV_UNIFIED_CLUSTER] n_kv is bounded by the sequences a ubatch carries, so packing
+            // several of them into one ubatch makes every sequence pay the deepest one's extent -
+            // and under continuous batching a decode ubatch carries every active sequence, which is
+            // why no cell layout alone can shrink the window. One sequence set per ubatch keeps each
+            // window at its own extent. With a single sequence there is nothing to separate, so keep
+            // the cheaper packed split.
+            llama_ubatch ubatch;
+            if (n_stream != 1) {
+                ubatch = balloc.split_equal(n_ubatch, true, 0);
+            } else if (n_seq_max > 1) {
+                ubatch = balloc.split_seq(n_ubatch);
+            } else {
+                ubatch = balloc.split_simple(n_ubatch);
+            }
 
             if (ubatch.n_tokens == 0) {
                 break;
@@ -1247,12 +1260,29 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     return v_cells[seq_to_stream[seq_id]];
 }
 
-uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, const llama_ubatch & ubatch) const {
     uint32_t result = 0;
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
     const uint32_t n_pad_cur = std::max(n_pad, 256u);
+
+    // a unified cache puts every sequence in one stream, so used_max_p1() is the high-water cell of
+    // whichever sequence is deepest: a shallow agent would attend over a deep neighbour's cells,
+    // every one of them masked out. Bound the window by the sequences this ubatch actually carries.
+    // Other sequences' cells below that bound stay in the window and stay masked, exactly as before;
+    // only the tail beyond every present sequence is dropped, and no present sequence has a cell
+    // there by construction.
+    if (n_stream == 1 && n_seq_max > 1) {
+        const auto & cells = v_cells[sinfo.strm[0]];
+
+        uint32_t used_max_p1 = 0;
+        for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+            used_max_p1 = std::max(used_max_p1, cells.seq_used_max_p1(ubatch.seq_id_unq[s]));
+        }
+
+        return std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(used_max_p1, n_pad_cur)));
+    }
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
@@ -2723,7 +2753,7 @@ bool llama_kv_cache_context::apply() {
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
-    n_kv = kv->get_n_kv(sinfos[i_cur]);
+    n_kv = kv->get_n_kv(sinfos[i_cur], ubatches[i_cur]);
 
     return true;
 }
