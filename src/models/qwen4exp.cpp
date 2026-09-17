@@ -578,7 +578,7 @@ public:
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
         mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias,
-                dirty_cells, dirty_pos, dirty_rows);
+                dirty_cells, dirty_pos, dirty_rows, blk_rows);
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -617,6 +617,10 @@ public:
             res &= dirty_rows->ne[0] == (int64_t) mctx->qsa_pooled_n_dirty_max(params.ubatch, ratio);
             res &= dirty_rows->ne[1] == n_stream;
         }
+        if (blk_rows != nullptr) {
+            res &= blk_rows->ne[0] == n_blocks;
+            res &= blk_rows->ne[1] == n_stream;
+        }
 
         return res;
     }
@@ -632,6 +636,10 @@ public:
     ggml_tensor * dirty_cells = nullptr; // I32 [ratio*n_dirty_max, n_stream]
     ggml_tensor * dirty_pos   = nullptr; // I32 [4*n_dirty_max*n_stream]
     ggml_tensor * dirty_rows  = nullptr; // I64 [n_dirty_max, n_stream]
+
+    // only when the store is keyed on (seq, block): the reader gathers one row per block instead
+    // of viewing a contiguous range, because a unified pool interleaves sequences' rows
+    ggml_tensor * blk_rows    = nullptr; // I32 [n_blocks, n_stream]
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t ratio;
@@ -726,6 +734,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ggml_set_input(qsa->dirty_cells);
             ggml_set_input(qsa->dirty_pos);
             ggml_set_input(qsa->dirty_rows);
+
+            // keyed on (seq, block) the rows a stream reads are interleaved with other
+            // sequences', so the reader gathers them instead of viewing a contiguous range
+            if (mctx_hyb->pooled_is_keyed_by_seq()) {
+                qsa->blk_rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_blocks, n_stream);
+                ggml_set_input(qsa->blk_rows);
+            }
         } else {
             qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
 
@@ -789,8 +804,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
                 store->nb[1], store->nb[2], store->nb[2] * s0);
         ggml_build_forward_expand(gf, ggml_set_rows(ctx0, store_cur, fresh, inp->dirty_rows));
 
-        pooled = ggml_view_3d(ctx0, store, idx_dim, n_blocks, n_stream,
-                store->nb[1], store->nb[2], store->nb[2] * s0);
+        if (inp->blk_rows != nullptr) {
+            // keyed on (seq, block): this stream's rows are interleaved with the other
+            // sequences', so gather the one row each block owns. blk_rows names the shared
+            // dustbin for spare and dead blocks, which the bias masks anyway.
+            pooled = ggml_get_rows(ctx0, store_cur, inp->blk_rows);
+            pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
+        } else {
+            pooled = ggml_view_3d(ctx0, store, idx_dim, n_blocks, n_stream,
+                    store->nb[1], store->nb[2], store->nb[2] * s0);
+        }
         cb(pooled, "indexer_k", il);
     } else {
         // gathers per stream: blk_cells row s indexes stream s's own cells
