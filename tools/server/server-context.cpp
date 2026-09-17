@@ -680,6 +680,14 @@ struct server_slot {
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
         }
 
+        llama_moe_cache_stats moe_stats;
+        if (llama_moe_cache_get_stats(&moe_stats) && (moe_stats.n_hit + moe_stats.n_miss > 0)) {
+            const double hr = 100.0 * moe_stats.n_hit / (moe_stats.n_hit + moe_stats.n_miss);
+            SLT_INF(*this,
+                    "       moe cache = %5.1f%% hit rate (%" PRIu64 " hits, %" PRIu64 " misses, %" PRIu64 " inserts, %" PRIu64 " evicts)\n",
+                    hr, moe_stats.n_hit, moe_stats.n_miss, moe_stats.n_insert, moe_stats.n_evict);
+        }
+
         common_speculative_print_stats(spec);
     }
 

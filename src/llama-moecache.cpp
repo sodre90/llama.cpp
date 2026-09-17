@@ -56,6 +56,9 @@ struct moe_cache {
     uint64_t clock   = 0;
     uint64_t n_steps = 0;
 
+    uint64_t last_log_hits   = 0;
+    uint64_t last_log_misses = 0;
+
     std::mutex mtx; // guards pending lists + clock (observe runs during graph exec)
 
     std::vector<layer_state> layers;
@@ -127,6 +130,9 @@ void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
                 promote_to_protected(*ls, slot, mc->n_slots, ++mc->clock);
             } else {
                 ls->n_miss++;
+                if (slot == -2) {
+                    continue;
+                }
                 bool dup = false;
                 for (int32_t p : ls->pending) {
                     if (p == id) { dup = true; break; }
@@ -319,7 +325,7 @@ void load_cache_map(moe_cache & mc, const char * path) {
             ls.slot_expert[slot]    = exp;
             ls.expert_slot[exp]     = slot;
             ls.slot_protected[slot] = slot < (mc.n_slots * 3) / 4;
-            ls.slot_last_use[slot]  = ++mc.clock;
+            ls.slot_last_use[slot]  = mc.clock + (mc.n_slots - slot);
             ls.slot_in_flight[slot] = false;
 
             upload_slice(ls.pub.up_c,   ls.pub.up_src,   exp, slot);
@@ -330,6 +336,7 @@ void load_cache_map(moe_cache & mc, const char * path) {
             slot++;
             loaded_count++;
         }
+        mc.clock += mc.n_slots;
     }
 
     LLAMA_LOG_INFO("%s: pre-warmed %d expert slots from %s\n", __func__, loaded_count, path);
@@ -603,7 +610,7 @@ void llama_moe_cache_step() {
         int budget = n_empty > 0 ? std::max(mc->max_inserts, std::min(4, n_empty)) : mc->max_inserts;
         for (auto it = ls.pending.rbegin(); it != ls.pending.rend() && budget > 0; ++it, --budget) {
             const int32_t id = *it;
-            if (ls.expert_slot[id] >= 0) {
+            if (ls.expert_slot[id] >= 0 || ls.expert_slot[id] == -2) {
                 continue;
             }
 
@@ -621,6 +628,7 @@ void llama_moe_cache_step() {
             }
             ls.slot_protected[slot] = false;
             ls.slot_in_flight[slot] = true;
+            ls.expert_slot[id]      = -2;
             ls.n_insert++;
 
             std::lock_guard<std::mutex> wlk(mc->wmtx);
@@ -630,15 +638,33 @@ void llama_moe_cache_step() {
     }
     mc->wcv.notify_one();
 
-    if (mc->n_steps % 512 == 0) {
-        uint64_t h = 0, m = 0;
-        for (auto & ls : mc->layers) { h += ls.n_hit; m += ls.n_miss; }
-        LLAMA_LOG_INFO("moe-cache: steps=%" PRIu64 " hits=%" PRIu64 " misses=%" PRIu64 " hit-rate=%.1f%%\n",
-                mc->n_steps, h, m, h + m ? 100.0*h/(h + m) : 0.0);
+    if (mc->n_steps % 128 == 0) {
+        uint64_t h = 0;
+        uint64_t m = 0;
+        uint64_t ins = 0;
+        uint64_t ev = 0;
+        for (const auto & ls : mc->layers) {
+            h   += ls.n_hit;
+            m   += ls.n_miss;
+            ins += ls.n_insert;
+            ev  += ls.n_evict;
+        }
+        const uint64_t dh = h - mc->last_log_hits;
+        const uint64_t dm = m - mc->last_log_misses;
+        mc->last_log_hits   = h;
+        mc->last_log_misses = m;
 
-        const char * map_path = get_moe_cache_map_path();
-        if (map_path) {
-            save_cache_map(*mc, map_path);
+        const double total_rate = (h + m > 0) ? (100.0 * h / (h + m)) : 0.0;
+        const double win_rate   = (dh + dm > 0) ? (100.0 * dh / (dh + dm)) : 0.0;
+
+        LLAMA_LOG_WARN("moe-cache: steps=%" PRIu64 " win_hit=%.1f%% (%" PRIu64 "/%" PRIu64 ") total_hit=%.1f%% (%" PRIu64 "/%" PRIu64 ") ins=%" PRIu64 " evict=%" PRIu64 "\n",
+                mc->n_steps, win_rate, dh, dh + dm, total_rate, h, h + m, ins, ev);
+
+        if (mc->n_steps % 512 == 0) {
+            const char * map_path = get_moe_cache_map_path();
+            if (map_path) {
+                save_cache_map(*mc, map_path);
+            }
         }
     }
 }
