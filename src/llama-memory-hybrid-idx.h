@@ -178,6 +178,7 @@ public:
 
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
+    uint32_t get_s0() const;
 
     // [TAG_QSA_POOLED_CACHE] the dirty_* tensors are optional: when given, the fill also
     // resolves which blocks must be (re)pooled this ubatch — the range from the sequence's

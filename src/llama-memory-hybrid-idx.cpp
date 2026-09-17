@@ -67,9 +67,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {
-    // [TAG_QSA_POOLED_CACHE] one f32 row per position block per layer; single-stream memories
-    // only (a unified cache shares one stream; block rows are position-indexed)
-    if (mem_idx && mem_idx->get_n_stream() == 1) {
+    // [TAG_QSA_POOLED_CACHE] one f32 row per position block per layer; multi-stream aware
+    if (mem_idx) {
         uint32_t ratio = 0;
         for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
             if (model.hparams.dsv4_compress_ratios[il] > 0) {
@@ -78,9 +77,10 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             }
         }
 
-        const uint32_t idx_dim = model.hparams.indexer_head_size;
+        const uint32_t idx_dim        = model.hparams.indexer_head_size;
+        const uint32_t n_stream_total = mem_idx->get_n_stream();
 
-        if (ratio > 0 && idx_dim > 0) {
+        if (ratio > 0 && idx_dim > 0 && n_stream_total > 0) {
             // + 1 so a partial trailing block has a slot, + 1 dustbin row for padded writes
             pooled_rows  = kv_size/ratio + 2;
             pooled_ratio = ratio;
@@ -124,7 +124,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
                     pooled_ctxs.emplace_back(ggml_init(ip));
                 }
 
-                ggml_tensor * t = ggml_new_tensor_2d(pooled_ctxs[ci].get(), GGML_TYPE_F32, idx_dim, pooled_rows);
+                ggml_tensor * t = ggml_new_tensor_3d(pooled_ctxs[ci].get(), GGML_TYPE_F32, idx_dim, pooled_rows, n_stream_total);
                 ggml_format_name(t, "idx_pooled_l%u", il);
                 pooled_k[(int32_t) il] = t;
                 per_buf_tensors[ci].push_back(t);
@@ -140,8 +140,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             }
 
             if (!pooled_k.empty()) {
-                LLAMA_LOG_INFO("%s: pooled indexer key cache, %zu layers x %u rows on %zu buffers, %.2f MiB\n",
-                        __func__, pooled_k.size(), pooled_rows, pooled_bufs.size(),
+                LLAMA_LOG_INFO("%s: pooled indexer key cache, %zu layers x %u rows x %u streams on %zu buffers, %.2f MiB\n",
+                        __func__, pooled_k.size(), pooled_rows, n_stream_total, pooled_bufs.size(),
                         total_bytes/1024.0/1024.0);
             }
         }
@@ -454,6 +454,9 @@ void llama_memory_hybrid_idx::set_input_qsa(
     GGML_ASSERT(blk_cells == nullptr || (blk_cells->ne[0] == r*n_blocks  && blk_cells->ne[1] == n_ns));
     GGML_ASSERT(blk_pos   == nullptr ||  blk_pos->ne[0]   == 4*n_blocks*n_ns);
     GGML_ASSERT(bias->ne[0] == (blk_bias ? n_blocks : n_kv));
+    GGML_ASSERT(dirty_cells == nullptr || (dirty_cells->ne[0] == r*dirty_rows->ne[0] && dirty_cells->ne[1] == n_ns));
+    GGML_ASSERT(dirty_pos   == nullptr ||  dirty_pos->ne[0]   == 4*dirty_rows->ne[0]*n_ns);
+    GGML_ASSERT(dirty_rows  == nullptr ||  dirty_rows->ne[1]  == n_ns);
 
     GGML_ASSERT(n_tokens % n_ns == 0);
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
@@ -730,14 +733,12 @@ void llama_memory_hybrid_idx::set_input_qsa(
         // are immutable, so rows below the watermark stay valid; rollbacks arrive as
         // seq_rm/state_read, which clamp the watermark before this runs.
         if (dirty_cells != nullptr) {
-            GGML_ASSERT(n_ns == 1 && "the pooled cache path is single-stream only");
-
             const int64_t n_dirty_max = dirty_rows->ne[0];
             const int64_t dustbin     = (int64_t) get_pooled_rows() - 1;
 
-            int32_t * dst_d_cells = (int32_t *) dirty_cells->data;
+            int32_t * dst_d_cells = (int32_t *) dirty_cells->data + s*(r*n_dirty_max);
             int32_t * dst_d_pos   = (int32_t *) dirty_pos->data;
-            int64_t * dst_d_rows  = (int64_t *) dirty_rows->data;
+            int64_t * dst_d_rows  = (int64_t *) dirty_rows->data  + s*n_dirty_max;
 
             // the bids are the complete blocks, pushed in position-block order: the last
             // bid's block ends the complete range
@@ -767,7 +768,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 dst_d_rows[i] = live ? b : dustbin;
 
                 for (int64_t sec = 0; sec < 4; ++sec) {
-                    dst_d_pos[sec*n_dirty_max + i] = t >= 0 ? loc_blk_pos[sec*n_blocks + t] : 0;
+                    dst_d_pos[sec*(n_dirty_max*n_ns) + s*n_dirty_max + i] = t >= 0 ? loc_blk_pos[sec*n_blocks + t] : 0;
                 }
                 for (int64_t j = 0; j < r; ++j) {
                     dst_d_cells[i*r + j] = t >= 0 ? loc_blk_cells[t*r + j] : 0;
@@ -962,6 +963,10 @@ uint32_t llama_memory_hybrid_idx_context::get_n_stream() const {
     return ns_ubatch[i_cur];
 }
 
+uint32_t llama_memory_hybrid_idx_context::get_s0() const {
+    return get_idx() ? get_idx()->get_s0() : 0;
+}
+
 void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,
@@ -999,22 +1004,30 @@ uint32_t llama_memory_hybrid_idx_context::qsa_pooled_n_dirty_max(const llama_uba
         return (ubatch.n_tokens + ratio - 1)/ratio + 1;
     }
 
-    // single-stream memories only (get_pooled_k gates the callers); like the block tables,
-    // the watermark follows the first token's sequence
-    const llama_seq_id seq = ubatch.seq_id[0][0];
+    const uint32_t n_stream = get_n_stream();
+    const uint32_t n_tps    = n_stream > 0 ? ubatch.n_tokens / n_stream : ubatch.n_tokens;
 
-    llama_pos q_max = -1;
-    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-        q_max = std::max(q_max, ubatch.pos[i]);
+    uint32_t max_dirty = 1;
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        if (s * n_tps >= ubatch.n_tokens) break;
+        const llama_seq_id seq = ubatch.seq_id[s * n_tps][0];
+
+        llama_pos q_max = -1;
+        for (uint32_t i = s * n_tps; i < (s + 1) * n_tps && i < ubatch.n_tokens; ++i) {
+            q_max = std::max(q_max, ubatch.pos[i]);
+        }
+
+        // mrope repeats one position across an image, so set_input_qsa ranks the cells instead of
+        // using their positions: blocks then cut the live-cell line, which an image advances far
+        // faster than the position line. bound both, or the tables undersize on any image ubatch
+        const int64_t n_used = (int64_t) mem->get_mem_idx()->get_cells(seq).get_used();
+
+        const int64_t n_complete = std::max<int64_t>((int64_t) (q_max + 1)/ratio, n_used/ratio);
+        const int64_t w          = std::min(mem->pooled_valid(seq), n_complete);
+
+        max_dirty = std::max(max_dirty, (uint32_t) std::max<int64_t>(1, n_complete - w));
     }
 
-    // mrope repeats one position across an image, so set_input_qsa ranks the cells instead of
-    // using their positions: blocks then cut the live-cell line, which an image advances far
-    // faster than the position line. bound both, or the tables undersize on any image ubatch
-    const int64_t n_used = (int64_t) mem->get_mem_idx()->get_cells(seq).get_used();
-
-    const int64_t n_complete = std::max<int64_t>((int64_t) (q_max + 1)/ratio, n_used/ratio);
-    const int64_t w          = std::min(mem->pooled_valid(seq), n_complete);
-
-    return (uint32_t) std::max<int64_t>(1, n_complete - w);
+    return max_dirty;
 }

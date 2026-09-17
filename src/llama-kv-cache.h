@@ -429,6 +429,9 @@ public:
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
+    uint32_t get_s0() const { return sinfos.empty() ? 0 : sinfos[i_cur].s0; }
+    uint32_t get_s1() const { return sinfos.empty() ? 0 : sinfos[i_cur].s1; }
+
 private:
     llama_memory_status status;
 

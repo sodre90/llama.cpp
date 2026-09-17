@@ -615,6 +615,7 @@ public:
         // steady decode needs at most one block, so the capacity is stable at 1 there
         if (dirty_rows != nullptr) {
             res &= dirty_rows->ne[0] == (int64_t) mctx->qsa_pooled_n_dirty_max(params.ubatch, ratio);
+            res &= dirty_rows->ne[1] == n_stream;
         }
 
         return res;
@@ -628,9 +629,9 @@ public:
     ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
 
     // [TAG_QSA_POOLED_CACHE] present only when the pooled cache path is active
-    ggml_tensor * dirty_cells = nullptr; // I32 [ratio*n_dirty_max, 1]
-    ggml_tensor * dirty_pos   = nullptr; // I32 [4*n_dirty_max]
-    ggml_tensor * dirty_rows  = nullptr; // I64 [n_dirty_max]
+    ggml_tensor * dirty_cells = nullptr; // I32 [ratio*n_dirty_max, n_stream]
+    ggml_tensor * dirty_pos   = nullptr; // I32 [4*n_dirty_max*n_stream]
+    ggml_tensor * dirty_rows  = nullptr; // I64 [n_dirty_max, n_stream]
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t ratio;
@@ -696,7 +697,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         // then dead graph inputs, so they are not created at all (an unreferenced input is
         // never allocated, and filling it would write through a null pointer).
         // Kill switch for A/B testing.
-        const bool use_pooled = mctx_hyb->get_pooled_k(il) != nullptr && n_stream == 1 &&
+        const bool use_pooled = mctx_hyb->get_pooled_k(il) != nullptr &&
             getenv("LLAMA_QSA_NO_POOLED_CACHE") == nullptr;
 
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
@@ -718,9 +719,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         if (use_pooled) {
             const int64_t n_dirty_max = mctx_hyb->qsa_pooled_n_dirty_max(ubatch, (uint32_t) r);
 
-            qsa->dirty_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_dirty_max, 1);
-            qsa->dirty_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_dirty_max);
-            qsa->dirty_rows  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_dirty_max);
+            qsa->dirty_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_dirty_max, n_stream);
+            qsa->dirty_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_dirty_max*n_stream);
+            qsa->dirty_rows  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I64, n_dirty_max, n_stream);
 
             ggml_set_input(qsa->dirty_cells);
             ggml_set_input(qsa->dirty_pos);
@@ -757,15 +758,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_tensor * store = mctx_hyb->get_pooled_k(il);
         GGML_ASSERT(store != nullptr);
 
-        const int64_t n_dirty_max = inp->dirty_rows->ne[0];
+        const int64_t  n_dirty_max = inp->dirty_rows->ne[0];
+        const uint32_t s0          = mctx_hyb->get_s0();
 
         ggml_tensor * members = ggml_get_rows(ctx0, k_all, inp->dirty_cells);
-        members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_dirty_max, 1);
+        members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_dirty_max, n_stream);
 
         ggml_tensor * fresh = nullptr;
         for (int64_t i = 0; i < r; ++i) {
             ggml_tensor * slice = ggml_cont(ctx0,
-                    ggml_view_3d(ctx0, members, idx_dim, n_dirty_max, 1,
+                    ggml_view_3d(ctx0, members, idx_dim, n_dirty_max, n_stream,
                             members->nb[2], members->nb[3], i*members->nb[1]));
             fresh = fresh ? ggml_add(ctx0, fresh, slice) : slice;
         }
@@ -773,21 +775,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         cb(fresh, "indexer_k_pooled", il);
 
         // count dirty blocks along ne1: rms_norm launches gridDim.y = ne2, capped at 65535
-        fresh = ggml_reshape_3d(ctx0, fresh, idx_dim, n_dirty_max, 1);
+        fresh = ggml_reshape_3d(ctx0, fresh, idx_dim, n_dirty_max*n_stream, 1);
         fresh = build_norm(fresh, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
 
-        fresh = ggml_reshape_3d(ctx0, fresh, idx_dim, 1, n_dirty_max);
+        fresh = ggml_reshape_3d(ctx0, fresh, idx_dim, 1, n_dirty_max*n_stream);
         fresh = ggml_rope_multi(ctx0, fresh, inp->dirty_pos, nullptr,
                 n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
                 ext_factor, attn_factor, beta_fast, beta_slow);
-        fresh = ggml_reshape_2d(ctx0, fresh, idx_dim, n_dirty_max);
+        fresh = ggml_reshape_3d(ctx0, fresh, idx_dim, n_dirty_max, n_stream);
 
-        ggml_tensor * store_view = ggml_view_2d(ctx0, store,
-                idx_dim, store->ne[1], store->nb[1], 0);
-        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, store_view, fresh, inp->dirty_rows));
+        ggml_tensor * store_cur = ggml_view_3d(ctx0, store,
+                idx_dim, store->ne[1], n_stream,
+                store->nb[1], store->nb[2], store->nb[2] * s0);
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, store_cur, fresh, inp->dirty_rows));
 
-        pooled = ggml_view_3d(ctx0, store, idx_dim, n_blocks, 1,
-                store->nb[1], store->nb[1]*n_blocks, 0);
+        pooled = ggml_view_3d(ctx0, store, idx_dim, n_blocks, n_stream,
+                store->nb[1], store->nb[2], store->nb[2] * s0);
         cb(pooled, "indexer_k", il);
     } else {
         // gathers per stream: blk_cells row s indexes stream s's own cells
