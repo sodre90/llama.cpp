@@ -885,6 +885,10 @@ private:
 
     server_batch batch;
 
+    // set when a slot was spilled to host RAM mid-batch: the remaining views describe tokens that
+    // were never decoded, so the batch is abandoned and rebuilt from slot state
+    bool batch_needs_rebuild = false;
+
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
 
@@ -1698,6 +1702,14 @@ private:
             if (slot.prompt.n_tokens() > 0) {
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
 
+                // spill to host RAM before releasing the cells, so the agent's next turn
+                // restores instead of re-prefilling. [TAG_IDLE_SLOT_CLEAR] does this on the
+                // task-launch path; a slot that fell idle since then only gets here.
+                // prompt_cache is only constructed when --cache-ram is non-zero.
+                if (prompt_cache && slot.prompt_save(*prompt_cache)) {
+                    prompt_cache->update();
+                }
+
                 slot.prompt_clear();
 
                 res = true;
@@ -1708,6 +1720,108 @@ private:
         }
 
         return res;
+    }
+
+    // [TAG_PREEMPT_ON_FULL] the KV pool is full and no slot is idle to purge. Failing here means
+    // erroring every in-flight request, so instead hand one slot's context to host RAM and put its
+    // task back on the deferred queue: it resumes from the prompt cache once the pool has room,
+    // rather than re-prefilling from scratch. Only a slot still processing its prompt is a lossless
+    // victim - a generating slot has already streamed tokens to its client, and suspending a live
+    // generation is not modelled here.
+    // a slot is only safe to preempt while it is still working through its prompt: nothing has
+    // been streamed to the client yet, so the task can simply be run again from the spilled state
+    static bool is_lossless_victim(const server_slot & slot) {
+        return slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT;
+    }
+
+    bool try_preempt_on_full(int32_t off) {
+        if (!params_base.kv_unified || !prompt_cache) {
+            return false;
+        }
+
+        server_slot * victim = nullptr;
+
+        // the slot owning the token we could not place is the one demanding space it cannot have.
+        // Preempting it leaves every other agent untouched, and cannot livelock: it only comes back
+        // when the pool genuinely has room.
+        if (off < batch.size()) {
+            const int32_t id_blocked = batch.tokens[off].id_slot;
+
+            for (auto & slot : slots) {
+                if (slot.id == id_blocked && is_lossless_victim(slot)) {
+                    victim = &slot;
+                    break;
+                }
+            }
+        }
+
+        // otherwise give up the largest prompt still being processed - it frees the most cells
+        if (victim == nullptr) {
+            for (auto & slot : slots) {
+                if (!is_lossless_victim(slot)) {
+                    continue;
+                }
+
+                if (victim == nullptr || slot.prompt.n_tokens() > victim->prompt.n_tokens()) {
+                    victim = &slot;
+                }
+            }
+        }
+
+        if (victim == nullptr || !victim->task) {
+            return false;
+        }
+
+        // prompt.tokens is filled while the batch is built, not as it is decoded, so everything
+        // from off onwards is claimed but absent from the KV cache. The batch is about to be
+        // abandoned, so trim every processing slot back to what the cache actually holds.
+        for (auto & slot : slots) {
+            if (!slot.is_processing()) {
+                continue;
+            }
+
+            int32_t n_undecoded = 0;
+            for (int32_t i = off; i < batch.size(); ++i) {
+                n_undecoded += batch.tokens[i].id_slot == slot.id;
+            }
+
+            if (n_undecoded > 0) {
+                slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_undecoded);
+
+                // a slot whose prompt ended inside the abandoned region was moved to DONE_PROMPT
+                // with i_batch pointing at a logit that will never be produced. Put it back to
+                // processing so the prefill path picks it up again, or it waits forever.
+                slot.i_batch = -1;
+
+                if (slot.state == SLOT_STATE_DONE_PROMPT) {
+                    slot.state = SLOT_STATE_PROCESSING_PROMPT;
+                }
+            }
+        }
+
+        const bool spilled = victim->prompt_save(*prompt_cache);
+        if (spilled) {
+            prompt_cache->update();
+        }
+
+        // a failed save is not fatal - the task simply re-prefills from scratch when it resumes -
+        // but it is the difference between a fast and a very slow resume, so say which happened
+        SRV_WRN("KV cache full and no idle slot: preempting slot %d (%d tokens), spilled to host RAM = %d\n",
+                victim->id, victim->prompt.n_tokens(), spilled);
+
+        victim->release();
+
+        // server_task is move-only, and release() parks the task in task_prev (which is otherwise
+        // kept only for debugging), so move it out from there. Deferring it under its original id
+        // keeps the client's pending response bound to it.
+        GGML_ASSERT(victim->task_prev);
+        server_task task = std::move(const_cast<server_task &>(*victim->task_prev));
+
+        victim->prompt_clear();
+
+        queue_tasks.defer(std::move(task));
+
+        return true;
     }
 
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
@@ -2917,6 +3031,14 @@ private:
                 llama_synchronize(ctx_tgt);
 #endif
 
+                if (batch_needs_rebuild) {
+                    batch_needs_rebuild = false;
+
+                    // a slot was spilled and every slot trimmed to what the KV cache holds;
+                    // update_slots() re-forms the batch from slot state on the next iteration
+                    break;
+                }
+
                 if (ok) {
                     // move the head of the batch forward with the number of tokens we just processed
                     off_next = off + n_tokens;
@@ -3756,8 +3878,13 @@ private:
                 std::string err;
 
                 if (n_batch == 1 && ret == 1) {
-                    // TODO: try to terminate only the largest active slot/sequence and continue with the rest
-                    //       need to remove the tokens from the current batch too
+                    // spill one slot to host RAM and rebuild the batch without it, rather than
+                    // failing every in-flight request
+                    if (try_preempt_on_full(off)) {
+                        batch_needs_rebuild = true;
+                        return false;
+                    }
+
                     err = "Context size has been exceeded.";
                 }
 
