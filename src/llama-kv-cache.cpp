@@ -13,6 +13,7 @@
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -137,6 +138,11 @@ llama_kv_cache::llama_kv_cache(
     v_heads.resize(n_stream);
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_heads[s] = 0;
+    }
+
+    v_heads_seq.assign(LLAMA_MAX_SEQ, 0);
+    for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+        v_heads_seq[s] = seq_head_base(s);
     }
 
     v_cells.resize(n_stream);
@@ -372,6 +378,10 @@ void llama_kv_cache::clear(bool data) {
         v_heads[s] = 0;
     }
 
+    for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+        v_heads_seq[s] = seq_head_base(s);
+    }
+
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
@@ -417,6 +427,13 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         // If we freed up a slot, set head to it so searching can start there.
         if (new_head != cells.size() && new_head < head) {
             head = new_head;
+        }
+
+        // [TAG_KV_UNIFIED_CLUSTER] the sequence gave up every cell it had, so the slot is about to be
+        // reused - most often by a prefix-cache restore. Send its head back to its base, or the
+        // restore would scatter the whole context from wherever the old conversation happened to end.
+        if (cells.seq_pos_min(seq_id) < 0 && (size_t) seq_id < v_heads_seq.size()) {
+            v_heads_seq[seq_id] = seq_head_base(seq_id);
         }
     } else {
         // match any sequence
@@ -908,6 +925,43 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     return updated;
 }
 
+// [TAG_KV_UNIFIED_CLUSTER] where sequence seq_id starts looking for cells. Spacing the sequences
+// across the pool gives each one room to grow into without immediately running into the next, which
+// is what keeps its cells clustered and its n_kv window short. It is a seed, not a reservation: a
+// sequence that outgrows its share scans on into whatever is free, and only then pays the full
+// unified cost - where a partitioned cache would refuse the request outright.
+uint32_t llama_kv_cache::seq_head_base(llama_seq_id seq_id) const {
+    if (n_stream != 1 || n_seq_max <= 1 || v_cells.empty()) {
+        return 0;
+    }
+
+    return (uint32_t) ((uint64_t) v_cells[0].size()*seq_id/n_seq_max);
+}
+
+// a cell can take a new token when it is empty, or when its single occupant is already outside
+// that sequence's SWA window and so will never be read again
+bool llama_kv_cache::cell_can_use(const llama_kv_cells & cells, uint32_t idx) const {
+    if (cells.is_empty(idx)) {
+        return true;
+    }
+
+    if (cells.seq_count(idx) != 1) {
+        return false;
+    }
+
+    const llama_pos pos_cell = cells.pos_get(idx);
+
+    // (disabled) causal mask
+    // note: it's better to purge any "future" tokens beforehand
+    //if (cells.seq_has(idx, seq_id)) {
+    //    return pos_cell >= pos;
+    //}
+
+    const llama_seq_id seq_id_cell = cells.seq_get(idx);
+
+    return llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, cells.seq_pos_max(seq_id_cell) + 1);
+}
+
 llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {
 
     if (debug > 0) {
@@ -995,6 +1049,68 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
     res.resize(n_seqs);
 
+    // [TAG_KV_UNIFIED_CLUSTER] a unified cache puts every sequence in one stream behind one rolling
+    // head, so consecutive decode steps interleave the active sequences' cells. Nothing then keeps a
+    // sequence's cells clustered, and n_kv - sized from the stream's high-water cell - stays pinned
+    // at the deepest sequence's mark, so every sequence pays attention and QSA block top-k over
+    // every other's extent. Search from each sequence's own head instead. Capacity stays shared:
+    // the head is only a starting hint, and a search that meets occupied cells scans on as before.
+    if (!cont && n_stream == 1 && n_seq_max > 1) {
+        const auto & cells = v_cells[0];
+
+        if (n_tokens > cells.size()) {
+            LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
+            return { };
+        }
+
+        res.s0 = 0;
+        res.s1 = 0;
+        res.strm[0] = 0;
+        res.idxs[0].reserve(n_tokens);
+
+        // find_slot does not mutate cells, so a cell taken earlier in this ubatch still reads empty
+        std::unordered_set<uint32_t> claimed;
+        claimed.reserve(n_tokens);
+
+        std::vector<uint32_t> head_seq = v_heads_seq;
+
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            const llama_seq_id seq_id = ubatch.seq_id[i][0];
+
+            GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) head_seq.size());
+
+            uint32_t & head_cur = head_seq[seq_id];
+
+            // enough unused cells below this sequence's head -> restart from its base, so space it
+            // freed on a rollback is reused instead of stranded until the head wraps
+            if (head_cur > cells.get_used() + 2*n_tokens) {
+                head_cur = seq_head_base(seq_id);
+            }
+
+            bool found = false;
+            for (uint32_t n_tested = 0; n_tested < cells.size(); ++n_tested) {
+                if (head_cur >= cells.size()) {
+                    head_cur = 0;
+                }
+
+                const uint32_t idx = head_cur++;
+
+                if (claimed.count(idx) == 0 && cell_can_use(cells, idx)) {
+                    res.idxs[0].push_back(idx);
+                    claimed.insert(idx);
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found) {
+                return { };
+            }
+        }
+
+        return res;
+    }
+
     for (uint32_t s = 0; s < n_seqs; ++s) {
         const auto seq_id = ubatch.seq_id_unq[s];
 
@@ -1052,26 +1168,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                 //    - (disabled) mask causally, if the sequence is the same as the one we are inserting
                 //    - mask SWA, using current max pos for that sequence in the cache
                 //                always insert in the cell with minimum pos
-                bool can_use = cells.is_empty(idx);
-
-                if (!can_use && cells.seq_count(idx) == 1) {
-                    const llama_pos pos_cell = cells.pos_get(idx);
-
-                    // (disabled) causal mask
-                    // note: it's better to purge any "future" tokens beforehand
-                    //if (cells.seq_has(idx, seq_id)) {
-                    //    can_use = pos_cell >= pos;
-                    //}
-
-                    if (!can_use) {
-                        const llama_seq_id seq_id_cell = cells.seq_get(idx);
-
-                        // SWA mask
-                        if (llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
-                            can_use = true;
-                        }
-                    }
-                }
+                const bool can_use = cell_can_use(cells, idx);
 
                 if (can_use) {
                     res.idxs[s].push_back(idx);
@@ -1195,6 +1292,20 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         auto & head = v_heads[sinfo.strm[s]];
 
         head = sinfo.idxs[s].back() + 1;
+    }
+
+    // [TAG_KV_UNIFIED_CLUSTER] advance each sequence's own head past the cells it just took, so its
+    // next tokens land beside them instead of wherever the shared head happens to be
+    if (n_stream == 1 && n_seq_max > 1 && sinfo.n_stream() == 1) {
+        const auto & idxs = sinfo.idxs[0];
+
+        for (uint32_t i = 0; i < ubatch.n_tokens && i < idxs.size(); ++i) {
+            const llama_seq_id seq_id = ubatch.seq_id[i][0];
+
+            if (seq_id >= 0 && seq_id < (llama_seq_id) v_heads_seq.size()) {
+                v_heads_seq[seq_id] = idxs[i] + 1;
+            }
+        }
     }
 }
 
