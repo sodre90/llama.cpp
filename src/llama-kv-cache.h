@@ -185,12 +185,6 @@ public:
 
     uint32_t get_n_kv(const slot_info & sinfo, const llama_ubatch & ubatch) const;
 
-    // whether a new token may be placed in cell idx
-    bool cell_can_use(const llama_kv_cells & cells, uint32_t idx) const;
-
-    // where sequence seq_id starts looking for free cells in a unified cache
-    uint32_t seq_head_base(llama_seq_id seq_id) const;
-
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -300,11 +294,6 @@ private:
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
     std::vector<uint32_t> v_heads;
-
-    // [TAG_KV_UNIFIED_CLUSTER] per-sequence search head, used only by a unified cache to keep each
-    // sequence's cells clustered so its n_kv window can stay short. A starting hint, never an
-    // invariant: find_slot validates every cell it lands on, so a stale head only costs a scan.
-    std::vector<uint32_t> v_heads_seq;
 
     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
     llama_kv_cache * other;
