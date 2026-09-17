@@ -45,7 +45,8 @@ public:
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
                             /* the indexer cache exists only if this is given */
-    const layer_filter_cb & filter_idx);
+    const layer_filter_cb & filter_idx,
+                 uint32_t   kv_unified_per_slot = 0);
 
     // Defined out of line because kpool_layout is incomplete here.
     ~llama_memory_hybrid_idx();
@@ -101,7 +102,8 @@ public:
                        bool blk_bias, bool causal_attn,
                        ggml_tensor * dirty_cells = nullptr,
                        ggml_tensor * dirty_pos   = nullptr,
-                       ggml_tensor * dirty_rows  = nullptr) const;
+                       ggml_tensor * dirty_rows  = nullptr,
+                       ggml_tensor * blk_rows    = nullptr) const;
 
     // The model's indexer pool size.
     uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
@@ -137,6 +139,36 @@ public:
     // finite data and are masked by the -inf bias. Single-stream memories only.
     ggml_tensor * get_pooled_k(int32_t il) const;              // nullptr: no indexer / multi-stream
     uint32_t get_pooled_rows() const { return pooled_rows; }   // rows per stream, incl. trailing dustbin row
+
+    // A unified cache holds every sequence in one stream, so the position block alone no longer
+    // identifies a row: two agents at the same positions would share it and overwrite each other.
+    // Rows are then keyed on (seq_id, position block) and the reader gathers rather than viewing
+    // a contiguous range. With one sequence per stream the base is 0 and nothing changes.
+    bool     pooled_is_keyed_by_seq() const { return pooled_seq_stride > 0; }
+    uint32_t get_pooled_seq_stride()  const { return pooled_seq_stride; }
+
+    int64_t pooled_row_base(llama_seq_id seq_id) const {
+        return (int64_t) pooled_seq_stride * seq_id;
+    }
+
+    // row holding block blk of seq_id, or the shared dustbin when blk is past the range reserved
+    // for one sequence. A block scored from the dustbin is wrong for that block alone; a row taken
+    // from the next sequence's range would corrupt another agent. The server admits no prompt long
+    // enough to reach this, so it is a bound on --kv-unified-per-slot, not a live path.
+    int64_t pooled_row_of(llama_seq_id seq_id, int64_t blk) const {
+        const int64_t lim = pooled_seq_stride > 0 ? (int64_t) pooled_seq_stride : (int64_t) pooled_rows - 1;
+
+        if (blk < 0 || blk >= lim) {
+            return (int64_t) pooled_rows - 1;
+        }
+
+        return pooled_row_base(seq_id) + blk;
+    }
+
+    // sequences the store has row ranges for; 1 when a stream owns one sequence
+    uint32_t pooled_n_seq() const {
+        return pooled_seq_stride > 0 ? (pooled_rows - 1)/pooled_seq_stride : 1;
+    }
 
     // blocks of seq_id whose pooled rows are known valid; mutable like a cache's bookkeeping
     int64_t & pooled_valid(llama_seq_id seq_id) const;
@@ -175,6 +207,14 @@ private:
 
     uint32_t pooled_rows  = 0;
     uint32_t pooled_ratio = 0;
+
+    // rows reserved per sequence when the cache is unified; 0 when a stream owns one sequence
+    // and the position block indexes the store directly
+    uint32_t pooled_seq_stride = 0;
+
+    // set once seq_cp has put one block's cells in several sequences: their rows are then no
+    // longer independent, so a later removal has to invalidate every watermark, not just one
+    bool pooled_shared = false;
 
     mutable std::unordered_map<llama_seq_id, int64_t> pooled_w;
 
@@ -240,6 +280,7 @@ public:
 
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
+    uint32_t get_s0() const;
 
     // glm5-next, complete pools of kpool consecutive positions per sequence, scored as whole pools.
     uint32_t get_n_kpool    () const; // Padded pool count, where the last pool is always unused.
@@ -257,12 +298,19 @@ public:
     //   dirty_cells I32 [ratio*n_dirty_max, ns] cells of each block to (re)pool, 0-padded
     //   dirty_pos   I32 [4*n_dirty_max*ns]      mrope position rows of those blocks
     //   dirty_rows  I64 [n_dirty_max*ns]        pooled-cache rows to write, dustbin-padded
+    //   blk_rows    I32 [n_blocks*ns]           pooled-cache row each block reads, dustbin-padded
+    //                                           (unified only; otherwise the reader views a range)
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias, bool causal_attn,
                        ggml_tensor * dirty_cells = nullptr,
                        ggml_tensor * dirty_pos   = nullptr,
-                       ggml_tensor * dirty_rows  = nullptr) const;
+                       ggml_tensor * dirty_rows  = nullptr,
+                       ggml_tensor * blk_rows    = nullptr) const;
+
+    // [TAG_QSA_POOLED_CACHE] true when store rows are keyed on (seq_id, position block) rather
+    // than the position block alone, which a unified pool requires - see the memory class
+    bool pooled_is_keyed_by_seq() const;
 
     // [TAG_QSA_POOLED_CACHE] pooled tensor for il, or nullptr when the cache is unavailable
     // (no indexer, multi-stream memory, or a non-batch context)

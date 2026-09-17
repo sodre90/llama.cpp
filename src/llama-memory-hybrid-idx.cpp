@@ -43,7 +43,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
                             /* layer filters */
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
-    const layer_filter_cb & filter_idx) :
+    const layer_filter_cb & filter_idx,
+    uint32_t kv_unified_per_slot) :
     llama_memory_hybrid(
         model,
         type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
@@ -72,9 +73,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {
-    // [TAG_QSA_POOLED_CACHE] one f32 row per position block per layer; single-stream memories
-    // only (a unified cache shares one stream; block rows are position-indexed)
-    if (mem_idx && mem_idx->get_n_stream() == 1) {
+    // [TAG_QSA_POOLED_CACHE] one f32 row per position block per layer; multi-stream aware
+    if (mem_idx) {
         uint32_t ratio = 0;
         for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
             if (model.hparams.dsv4_compress_ratios[il] > 0) {
@@ -83,12 +83,23 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             }
         }
 
-        const uint32_t idx_dim = model.hparams.indexer_head_size;
+        const uint32_t idx_dim        = model.hparams.indexer_head_size;
+        const uint32_t n_stream_total = mem_idx->get_n_stream();
 
-        if (ratio > 0 && idx_dim > 0) {
+        if (ratio > 0 && idx_dim > 0 && n_stream_total > 0) {
+            const uint32_t per_seq_limit = (kv_unified_per_slot > 0 && kv_unified_per_slot < kv_size)
+                                         ? kv_unified_per_slot
+                                         : kv_size;
             // + 1 so a partial trailing block has a slot, + 1 dustbin row for padded writes
-            pooled_rows  = kv_size/ratio + 2;
+            pooled_rows  = per_seq_limit/ratio + 2;
             pooled_ratio = ratio;
+
+            // a unified cache puts every sequence in one stream, so give each its own row range:
+            // the position block alone would alias two agents sitting at the same positions
+            if (n_stream_total == 1 && n_seq_max > 1) {
+                pooled_seq_stride = pooled_rows;
+                pooled_rows       = pooled_seq_stride*n_seq_max + 1; // + 1 shared dustbin row
+            }
 
             // one context+buffer per device: the indexer caches of the QSA layers are spread
             // across the layer-split devices, and a row written by a device that does not own
@@ -129,7 +140,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
                     pooled_ctxs.emplace_back(ggml_init(ip));
                 }
 
-                ggml_tensor * t = ggml_new_tensor_2d(pooled_ctxs[ci].get(), GGML_TYPE_F32, idx_dim, pooled_rows);
+                ggml_tensor * t = ggml_new_tensor_3d(pooled_ctxs[ci].get(), GGML_TYPE_F32, idx_dim, pooled_rows, n_stream_total);
                 ggml_format_name(t, "idx_pooled_l%u", il);
                 pooled_k[(int32_t) il] = t;
                 per_buf_tensors[ci].push_back(t);
@@ -145,8 +156,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             }
 
             if (!pooled_k.empty()) {
-                LLAMA_LOG_INFO("%s: pooled indexer key cache, %zu layers x %u rows on %zu buffers, %.2f MiB\n",
-                        __func__, pooled_k.size(), pooled_rows, pooled_bufs.size(),
+                LLAMA_LOG_INFO("%s: pooled indexer key cache, %zu layers x %u rows x %u streams on %zu buffers, %.2f MiB\n",
+                        __func__, pooled_k.size(), pooled_rows, n_stream_total, pooled_bufs.size(),
                         total_bytes/1024.0/1024.0);
             }
         }
@@ -301,6 +312,7 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
 
     // [TAG_QSA_POOLED_CACHE] rows are shared in the single-stream cache; the copy's blocks
     // are refilled from its own cells on its first ubatch
+    pooled_shared = pooled_shared || pooled_seq_stride > 0;
     pooled_reset(seq_id_dst);
 }
 
@@ -313,8 +325,9 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
         mem_idx_stale_set(-1, 0);
     }
 
-    // [TAG_QSA_POOLED_CACHE] only seq_id's rows survive as trusted
-    const int64_t keep = pooled_w.count(seq_id) ? pooled_w[seq_id] : 0;
+    // [TAG_QSA_POOLED_CACHE] only seq_id's rows survive as trusted, and not even those if it
+    // may have been reading a row pooled into a sequence that just went away
+    const int64_t keep = pooled_shared || !pooled_w.count(seq_id) ? 0 : pooled_w[seq_id];
     pooled_w.clear();
     pooled_w[seq_id] = keep;
 }
@@ -458,8 +471,27 @@ void llama_memory_hybrid_idx::pooled_rm(llama_seq_id seq_id, llama_pos p0, llama
         return;
     }
 
+    if (seq_id < 0) {
+        if (p0 <= 0 && p1 < 0) {
+            pooled_reset(-1);
+            return;
+        }
+        for (int sq = 0; sq < LLAMA_MAX_SEQ; ++sq) {
+            pooled_rm(sq, p0, p1);
+        }
+        return;
+    }
+
     if (p0 <= 0 && p1 < 0) {
-        pooled_w[seq_id] = 0;
+        pooled_reset(seq_id);
+        return;
+    }
+
+    // a block whose cells belong to several sequences is pooled once, into the lowest sharer's
+    // row, and every sharer reads that row. When sharing ends the block changes owner, so the
+    // new owner's own row is stale - repool everything rather than track which blocks moved.
+    if (pooled_shared) {
+        pooled_w.clear();
         return;
     }
 
@@ -474,6 +506,7 @@ void llama_memory_hybrid_idx::pooled_rm(llama_seq_id seq_id, llama_pos p0, llama
 void llama_memory_hybrid_idx::pooled_reset(llama_seq_id seq_id) {
     if (seq_id < 0) {
         pooled_w.clear();
+        pooled_shared = false;
     } else {
         pooled_w[seq_id] = 0;
     }
@@ -492,7 +525,8 @@ void llama_memory_hybrid_idx::set_input_qsa(
         bool causal_attn,
         ggml_tensor * dirty_cells,
         ggml_tensor * dirty_pos,
-        ggml_tensor * dirty_rows) const {
+        ggml_tensor * dirty_rows,
+        ggml_tensor * blk_rows) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(get_mem_idx() != nullptr);
 
@@ -516,6 +550,10 @@ void llama_memory_hybrid_idx::set_input_qsa(
     GGML_ASSERT(blk_cells == nullptr || (blk_cells->ne[0] == r*n_blocks  && blk_cells->ne[1] == n_ns));
     GGML_ASSERT(blk_pos   == nullptr ||  blk_pos->ne[0]   == 4*n_blocks*n_ns);
     GGML_ASSERT(bias->ne[0] == (blk_bias ? n_blocks : n_kv));
+    GGML_ASSERT(dirty_cells == nullptr || (dirty_cells->ne[0] == r*dirty_rows->ne[0] && dirty_cells->ne[1] == n_ns));
+    GGML_ASSERT(dirty_pos   == nullptr ||  dirty_pos->ne[0]   == 4*dirty_rows->ne[0]*n_ns);
+    GGML_ASSERT(dirty_rows  == nullptr ||  dirty_rows->ne[1]  == n_ns);
+    GGML_ASSERT(blk_rows    == nullptr || (blk_rows->ne[0]    == n_blocks    && blk_rows->ne[1] == n_ns));
 
     GGML_ASSERT(n_tokens % n_ns == 0);
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
@@ -792,56 +830,127 @@ void llama_memory_hybrid_idx::set_input_qsa(
             }
         }
 
-        // [TAG_QSA_POOLED_CACHE] resolve which blocks the graph must (re)pool this ubatch:
-        // the range from the sequence's watermark to its last complete block. Complete blocks
-        // are immutable, so rows below the watermark stay valid; rollbacks arrive as
-        // seq_rm/state_read, which clamp the watermark before this runs.
-        if (dirty_cells != nullptr) {
-            GGML_ASSERT(n_ns == 1 && "the pooled cache path is single-stream only");
+        // [TAG_QSA_POOLED_CACHE] which sequence owns each complete block. Groups are keyed on
+        // (sequence set, position bucket), so a block never mixes sequences, but a block shared
+        // after seq_cp carries several bits: take the lowest. That is not a shortcut - the pooled
+        // key is a function of the member cells alone, so the sharers read identical data.
+        const int64_t dustbin = (int64_t) get_pooled_rows() - 1;
 
-            const int64_t n_dirty_max = dirty_rows->ne[0];
-            const int64_t dustbin     = (int64_t) get_pooled_rows() - 1;
+        std::vector<int32_t> blk_seq;
+        if (pooled_is_keyed_by_seq()) {
+            blk_seq.resize(n_bid);
 
-            int32_t * dst_d_cells = (int32_t *) dirty_cells->data;
-            int32_t * dst_d_pos   = (int32_t *) dirty_pos->data;
-            int64_t * dst_d_rows  = (int64_t *) dirty_rows->data;
-
-            // the bids are the complete blocks, pushed in position-block order: the last
-            // bid's block ends the complete range
-            const int64_t n_complete = n_bid > 0 ? (int64_t) bid_idx[n_bid - 1]/r + 1 : 0;
-
-            auto & w = pooled_valid(seq_of_stream);
-            w = std::min(w, n_complete);
-
-            const int64_t n_dirty = n_complete - w;
-            GGML_ASSERT(n_dirty <= n_dirty_max && "dirty tables sized at graph build; see qsa_pooled_n_dirty_max");
-
-            // position block -> bid: an incomplete block below the complete end pools nothing
-            // this time and keeps its stale row, masked by the bias
-            std::vector<int32_t> pb_bid(n_complete > 0 ? (size_t) n_complete : 1u, -1);
             for (int32_t t = 0; t < n_bid; ++t) {
-                const int64_t pb = bid_idx[t]/r;
-                if (pb < n_complete) {
-                    pb_bid[pb] = t;
+                const auto set = cells.seq_get_all((uint32_t) bid_cell[t]);
+
+                int32_t sq = 0;
+                while (sq + 1 < LLAMA_MAX_SEQ && !set.test(sq)) {
+                    ++sq;
+                }
+                blk_seq[t] = sq;
+            }
+        }
+
+        // the reader gathers one pooled row per block; blocks past n_bid are spare or dead and
+        // must still name a finite row
+        if (blk_rows != nullptr) {
+            int32_t * dst_b_rows = (int32_t *) blk_rows->data + s*n_blocks;
+
+            for (int64_t b = 0; b < n_blocks; ++b) {
+                if (b < n_bid) {
+                    const int64_t pb = bid_idx[b]/r;
+                    dst_b_rows[b] = (int32_t) pooled_row_of(blk_seq[b], pb);
+                } else {
+                    dst_b_rows[b] = (int32_t) dustbin;
                 }
             }
+        }
 
-            for (int64_t i = 0; i < n_dirty_max; ++i) {
-                const bool    live = i < n_dirty;
-                const int64_t b    = w + i;
-                const int32_t t    = live && b < n_complete ? pb_bid[b] : -1;
+        // resolve which blocks the graph must (re)pool this ubatch: for every sequence with
+        // tokens here, the range from its watermark to its last complete block. Complete blocks
+        // are immutable, so rows below a watermark stay valid; rollbacks arrive as
+        // seq_rm/state_read, which clamp the watermark before this runs. A sequence with no
+        // tokens in this ubatch is left alone - its rows are masked by the bias either way.
+        if (dirty_cells != nullptr) {
+            const int64_t n_dirty_max = dirty_rows->ne[0];
 
-                dst_d_rows[i] = live ? b : dustbin;
+            int32_t * dst_d_cells = (int32_t *) dirty_cells->data + s*(r*n_dirty_max);
+            int32_t * dst_d_pos   = (int32_t *) dirty_pos->data;
+            int64_t * dst_d_rows  = (int64_t *) dirty_rows->data  + s*n_dirty_max;
+
+            // sequences carrying tokens in this stream, in first-appearance order
+            std::vector<llama_seq_id> seqs;
+            if (pooled_is_keyed_by_seq()) {
+                for (int64_t ii = 0; ii < n_tps; ++ii) {
+                    const llama_seq_id sq = ubatch->seq_id[s*n_tps + ii][0];
+                    if (std::find(seqs.begin(), seqs.end(), sq) == seqs.end()) {
+                        seqs.push_back(sq);
+                    }
+                }
+            } else {
+                seqs.push_back(seq_of_stream);
+            }
+
+            int64_t n_filled = 0;
+
+            for (const llama_seq_id sq : seqs) {
+                // last complete block belonging to this sequence; bids are in position-block order
+                int64_t n_complete = 0;
+                for (int32_t t = 0; t < n_bid; ++t) {
+                    if (blk_seq.empty() || blk_seq[t] == sq) {
+                        n_complete = (int64_t) bid_idx[t]/r + 1;
+                    }
+                }
+
+                auto & w = pooled_valid(sq);
+                w = std::min(w, n_complete);
+
+                // position block -> bid for this sequence; an incomplete block below the complete
+                // end pools nothing this time and keeps its stale row, masked by the bias
+                std::vector<int32_t> pb_bid(n_complete > 0 ? (size_t) n_complete : 1u, -1);
+                for (int32_t t = 0; t < n_bid; ++t) {
+                    if (!blk_seq.empty() && blk_seq[t] != sq) {
+                        continue;
+                    }
+                    const int64_t pb = bid_idx[t]/r;
+                    if (pb < n_complete) {
+                        pb_bid[pb] = t;
+                    }
+                }
+
+                for (int64_t b = w; b < n_complete; ++b) {
+                    GGML_ASSERT(n_filled < n_dirty_max &&
+                            "dirty tables sized at graph build; see qsa_pooled_n_dirty_max");
+
+                    const int32_t t = pb_bid[b];
+
+                    dst_d_rows[n_filled] = pooled_row_of(sq, b);
+
+                    for (int64_t sec = 0; sec < 4; ++sec) {
+                        dst_d_pos[sec*(n_dirty_max*n_ns) + s*n_dirty_max + n_filled] =
+                                t >= 0 ? loc_blk_pos[sec*n_blocks + t] : 0;
+                    }
+                    for (int64_t j = 0; j < r; ++j) {
+                        dst_d_cells[n_filled*r + j] = t >= 0 ? loc_blk_cells[t*r + j] : 0;
+                    }
+
+                    n_filled++;
+                }
+
+                w = n_complete;
+            }
+
+            // unused slots write the shared dustbin row, which nothing ever reads
+            for (int64_t i = n_filled; i < n_dirty_max; ++i) {
+                dst_d_rows[i] = dustbin;
 
                 for (int64_t sec = 0; sec < 4; ++sec) {
-                    dst_d_pos[sec*n_dirty_max + i] = t >= 0 ? loc_blk_pos[sec*n_blocks + t] : 0;
+                    dst_d_pos[sec*(n_dirty_max*n_ns) + s*n_dirty_max + i] = 0;
                 }
                 for (int64_t j = 0; j < r; ++j) {
-                    dst_d_cells[i*r + j] = t >= 0 ? loc_blk_cells[t*r + j] : 0;
+                    dst_d_cells[i*r + j] = 0;
                 }
             }
-
-            w = n_complete;
         }
 
         for (int64_t ii = 0; ii < n_tps; ++ii) {
@@ -1219,6 +1328,10 @@ uint32_t llama_memory_hybrid_idx_context::get_n_stream() const {
     return ns_ubatch[i_cur];
 }
 
+uint32_t llama_memory_hybrid_idx_context::get_s0() const {
+    return get_idx() ? get_idx()->get_s0() : 0;
+}
+
 void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,
@@ -1230,13 +1343,14 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         bool causal_attn,
         ggml_tensor * dirty_cells,
         ggml_tensor * dirty_pos,
-        ggml_tensor * dirty_rows) const {
+        ggml_tensor * dirty_rows,
+        ggml_tensor * blk_rows) const {
     GGML_ASSERT(mem != nullptr);
     GGML_ASSERT(get_idx() != nullptr);
 
     mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch,
             get_idx()->get_n_kv(), get_n_stream(), ratio, blk_bias, causal_attn,
-            dirty_cells, dirty_pos, dirty_rows);
+            dirty_cells, dirty_pos, dirty_rows, blk_rows);
 }
 
 llama_memory_hybrid_idx_context::kpool_access::kpool_access(ggml_context * ctx, ggml_tensor * k, int64_t n_embd) : ctx(ctx) {
@@ -1619,32 +1733,89 @@ uint32_t llama_memory_hybrid_idx_context::get_pooled_rows() const {
     return mem != nullptr ? mem->get_pooled_rows() : 0;
 }
 
+bool llama_memory_hybrid_idx_context::pooled_is_keyed_by_seq() const {
+    return mem != nullptr && mem->pooled_is_keyed_by_seq();
+}
+
 uint32_t llama_memory_hybrid_idx_context::qsa_pooled_n_dirty_max(const llama_ubatch & ubatch, uint32_t ratio) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(mem != nullptr);
 
+    const bool keyed_by_seq = mem->pooled_is_keyed_by_seq();
+
     // the reserve pass builds worst-case graphs from a mock ubatch with no seq/pos data;
-    // give it the per-ubatch bound (the refill after a state load resizes on a live ubatch)
+    // give it the per-ubatch bound (the refill after a state load resizes on a live ubatch).
+    // Keyed by sequence the worst case is every sequence on its first ubatch after a restore,
+    // each repooling its own range, so the bound multiplies rather than adds.
     if (ubatch.seq_id == nullptr || ubatch.seq_id[0] == nullptr || ubatch.pos == nullptr) {
-        return (ubatch.n_tokens + ratio - 1)/ratio + 1;
+        return ((ubatch.n_tokens + ratio - 1)/ratio + 1) * (keyed_by_seq ? mem->pooled_n_seq() : 1);
     }
 
-    // single-stream memories only (get_pooled_k gates the callers); like the block tables,
-    // the watermark follows the first token's sequence
-    const llama_seq_id seq = ubatch.seq_id[0][0];
+    const uint32_t n_stream = get_n_stream();
+    const uint32_t n_tps    = n_stream > 0 ? ubatch.n_tokens / n_stream : ubatch.n_tokens;
 
-    llama_pos q_max = -1;
-    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-        q_max = std::max(q_max, ubatch.pos[i]);
+    uint32_t max_dirty = 1;
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        if (s * n_tps >= ubatch.n_tokens) break;
+
+        // keyed by sequence, each sequence in the stream fills its own slice of the tables, so the
+        // stream needs the SUM over them; otherwise a stream carries exactly one sequence
+        std::vector<llama_seq_id> seqs;
+        for (uint32_t i = s * n_tps; i < (s + 1) * n_tps && i < ubatch.n_tokens; ++i) {
+            const llama_seq_id sq = ubatch.seq_id[i][0];
+            if (std::find(seqs.begin(), seqs.end(), sq) == seqs.end()) {
+                seqs.push_back(sq);
+            }
+            if (!keyed_by_seq) {
+                break;
+            }
+        }
+
+        // mrope repeats one position across an image, so set_input_qsa ranks the cells instead of
+        // using their positions: blocks then cut the live-cell line, which an image advances far
+        // faster than the position line. bound both, or the tables undersize on any image ubatch.
+        //
+        // set_input_qsa only ranks when one sequence is present, so mirror that test exactly. Whether
+        // the stream is shared is a property of the stream, not of a sequence in it, so test it once.
+        bool stream_shared = false;
+        {
+            const auto & cells = mem->get_mem_idx()->get_cells(seqs.front());
+
+            int n_seq_present = 0;
+            for (int sq = 0; sq < LLAMA_MAX_SEQ && n_seq_present < 2; ++sq) {
+                if (cells.seq_pos_min(sq) >= 0) {
+                    n_seq_present++;
+                }
+            }
+            stream_shared = n_seq_present > 1;
+        }
+
+        int64_t stream_dirty = 0;
+
+        for (const llama_seq_id seq : seqs) {
+            llama_pos q_max = -1;
+            for (uint32_t i = s * n_tps; i < (s + 1) * n_tps && i < ubatch.n_tokens; ++i) {
+                if (!keyed_by_seq || ubatch.seq_id[i][0] == seq) {
+                    q_max = std::max(q_max, ubatch.pos[i]);
+                }
+            }
+
+            const auto & cells = mem->get_mem_idx()->get_cells(seq);
+
+            // a shared stream cuts positions, and get_used() would then be the whole pool -
+            // this sequence's own position span is the bound that belongs to it
+            const int64_t n_live = stream_shared ? (int64_t) cells.seq_pos_max(seq) + 1
+                                                 : (int64_t) cells.get_used();
+
+            const int64_t n_complete = std::max<int64_t>((int64_t) (q_max + 1)/ratio, n_live/ratio);
+            const int64_t w          = std::min(mem->pooled_valid(seq), n_complete);
+
+            stream_dirty += std::max<int64_t>(1, n_complete - w);
+        }
+
+        max_dirty = std::max(max_dirty, (uint32_t) std::max<int64_t>(1, stream_dirty));
     }
 
-    // mrope repeats one position across an image, so set_input_qsa ranks the cells instead of
-    // using their positions: blocks then cut the live-cell line, which an image advances far
-    // faster than the position line. bound both, or the tables undersize on any image ubatch
-    const int64_t n_used = (int64_t) mem->get_mem_idx()->get_cells(seq).get_used();
-
-    const int64_t n_complete = std::max<int64_t>((int64_t) (q_max + 1)/ratio, n_used/ratio);
-    const int64_t w          = std::min(mem->pooled_valid(seq), n_complete);
-
-    return (uint32_t) std::max<int64_t>(1, n_complete - w);
+    return max_dirty;
 }
