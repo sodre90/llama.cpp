@@ -165,6 +165,22 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
 }
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
+    // [TAG_QSA_PAD_CELL] set_input_qsa pads the last spare block with an empty cell of the pool, so a
+    // batch that fills the pool completely can be placed but aborts the process later, in the graph
+    // input. Failing it here instead lets the server halve the batch and, at n_batch 1, spill a slot
+    // to host RAM and defer its task until the pool has room (this killed the server 2026-09-19 at
+    // 3 x 115-122k prompts against a 280k pool).
+    if (get_mem_attn()->get_n_stream() == 1) {
+        const uint32_t used = get_mem_attn()->get_used();
+        const uint32_t size = get_mem_attn()->get_size();
+
+        if (used + balloc.get_n_tokens() >= size) {
+            LLAMA_LOG_WARN("%s: refusing %u tokens into a pool with %u of %u cells used - qsa keeps one empty cell\n",
+                    __func__, balloc.get_n_tokens(), used, size);
+            return std::make_unique<llama_memory_hybrid_idx_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+        }
+    }
+
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
     do {
         balloc.split_reset();

@@ -157,6 +157,7 @@ public:
 
     uint32_t get_size()     const;
     uint32_t get_n_seq_max() const;
+    uint32_t get_used()     const;
     uint32_t get_n_stream() const;
 
     bool get_has_shift() const;
