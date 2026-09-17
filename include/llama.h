@@ -1619,6 +1619,22 @@ extern "C" {
     LLAMA_API void                           llama_perf_sampler_print(const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_reset(      struct llama_sampler * chain);
 
+    // GPU-resident MoE expert cache (--moe-expert-cache). Monotonic counters summed
+    // over every cached layer, so a caller can derive the steady-state hit rate and
+    // insert churn from a rate over a window instead of a since-boot ratio.
+    struct llama_moe_cache_stats {
+        int32_t  n_layers;
+        int32_t  n_slots;  // slots per layer
+
+        uint64_t n_hit;    // routed expert ids observed already resident
+        uint64_t n_miss;   // routed expert ids observed not resident
+        uint64_t n_insert; // uploads scheduled
+        uint64_t n_evict;  // resident experts displaced to make room
+    };
+
+    // false when the cache is disabled
+    LLAMA_API bool llama_moe_cache_get_stats(struct llama_moe_cache_stats * out);
+
     //
     // training
     //

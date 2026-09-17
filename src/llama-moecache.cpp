@@ -30,8 +30,10 @@ struct layer_state {
 
     std::vector<bool>     slot_in_flight; // slot has an upload pending
 
-    uint64_t n_hit  = 0;
-    uint64_t n_miss = 0;
+    uint64_t n_hit    = 0;
+    uint64_t n_miss   = 0;
+    uint64_t n_insert = 0;
+    uint64_t n_evict  = 0;
 };
 
 struct upload_job {
@@ -319,6 +321,27 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
     }();
 }
 
+bool llama_moe_cache_get_stats(llama_moe_cache_stats * out) {
+    moe_cache * mc = g_cache;
+    if (!mc || !out) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(mc->mtx);
+
+    *out = {};
+    out->n_layers = (int32_t) mc->layers.size();
+    out->n_slots  = mc->n_slots;
+    for (const auto & ls : mc->layers) {
+        out->n_hit    += ls.n_hit;
+        out->n_miss   += ls.n_miss;
+        out->n_insert += ls.n_insert;
+        out->n_evict  += ls.n_evict;
+    }
+
+    return true;
+}
+
 const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * up_exps) {
     if (!g_cache) {
         return nullptr;
@@ -388,8 +411,10 @@ void llama_moe_cache_step() {
                 ls.expert_slot[victim] = -1;
                 ls.slot_expert[slot]   = -1;
                 set_table_entry(ls.pub, victim, mc->n_slots);
+                ls.n_evict++;
             }
             ls.slot_in_flight[slot] = true;
+            ls.n_insert++;
 
             std::lock_guard<std::mutex> wlk(mc->wmtx);
             mc->todo.push_back({li, id, slot});

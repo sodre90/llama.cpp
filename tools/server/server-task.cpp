@@ -1602,6 +1602,22 @@ std::string server_task_result_metrics::to_metrics() {
     add_items("counter", counters);
     add_items("gauge",   gauges);
 
+    // the MoE expert cache lives in libllama, not in the slot metrics, and its
+    // own logging is demoted to TRACE and filtered at the default verbosity
+    llama_moe_cache_stats moe_cache;
+    if (llama_moe_cache_get_stats(&moe_cache)) {
+        add_items("counter", {
+            { "moe_cache_hits_total",     "MoE expert cache: routed expert ids found resident",      (double) moe_cache.n_hit    },
+            { "moe_cache_misses_total",   "MoE expert cache: routed expert ids not resident",        (double) moe_cache.n_miss   },
+            { "moe_cache_inserts_total",  "MoE expert cache: expert uploads scheduled",              (double) moe_cache.n_insert },
+            { "moe_cache_evictions_total","MoE expert cache: resident experts displaced",            (double) moe_cache.n_evict  },
+        });
+        add_items("gauge", {
+            { "moe_cache_layers",         "MoE expert cache: cached layers",                         (double) moe_cache.n_layers },
+            { "moe_cache_slots_per_layer","MoE expert cache: slots per cached layer",                (double) moe_cache.n_slots  },
+        });
+    }
+
     // labeled counter: one time series per draft position
     if (!metrics.n_accepted_per_pos.empty()) {
         prometheus << "# HELP llamacpp:spec_decode_num_accepted_tokens_per_pos_total"
