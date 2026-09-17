@@ -318,7 +318,7 @@ void load_cache_map(moe_cache & mc, const char * path) {
 
             ls.slot_expert[slot]    = exp;
             ls.expert_slot[exp]     = slot;
-            ls.slot_protected[slot] = true;
+            ls.slot_protected[slot] = slot < (mc.n_slots * 3) / 4;
             ls.slot_last_use[slot]  = ++mc.clock;
             ls.slot_in_flight[slot] = false;
 
