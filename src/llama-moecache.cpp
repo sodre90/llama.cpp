@@ -6,6 +6,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstdlib>
@@ -16,19 +17,22 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <unistd.h>
 
 namespace {
 
 struct layer_state {
     llama_moe_cache_layer pub;
 
-    // LRU bookkeeping (host side; the tables mirror expert_slot)
-    std::vector<int32_t>  slot_expert;   // slot -> expert id, -1 when empty
-    std::vector<int32_t>  expert_slot;   // expert id -> slot, -1 when uncached
-    std::vector<uint64_t> slot_last_use; // slot -> lamport clock of last hit
-    std::vector<int32_t>  pending;       // uncached ids observed since last step (dedup, obs order)
+    // LRU and SLRU bookkeeping (host side; tables mirror expert_slot)
+    std::vector<int32_t>  slot_expert;    // slot -> expert id, -1 when empty
+    std::vector<int32_t>  expert_slot;    // expert id -> slot, -1 when uncached
+    std::vector<uint64_t> slot_last_use;  // slot -> lamport clock of last hit
+    std::vector<bool>     slot_protected; // SLRU: true if in protected segment
+    std::vector<int32_t>  pending;        // uncached ids observed since last step (dedup, obs order)
 
     std::vector<bool>     slot_in_flight; // slot has an upload pending
+
 
     uint64_t n_hit    = 0;
     uint64_t n_miss   = 0;
@@ -47,8 +51,12 @@ struct moe_cache {
     int32_t n_slots     = 0;
     int32_t max_inserts = 2;
 
+
     uint64_t clock   = 0;
     uint64_t n_steps = 0;
+
+    uint64_t last_log_hits   = 0;
+    uint64_t last_log_misses = 0;
 
     std::mutex mtx; // guards pending lists + clock (observe runs during graph exec)
 
@@ -81,6 +89,9 @@ int parse_layer_from_name(const char * name) {
     return atoi(name + 4);
 }
 
+void promote_to_protected(layer_state & ls, int32_t slot, int32_t n_slots, uint64_t clock);
+int32_t find_eviction_victim(const layer_state & ls, int32_t n_slots);
+
 void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
     moe_cache * mc = (moe_cache *) ud;
 
@@ -110,12 +121,16 @@ void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
             if (id < 0 || id >= (int32_t) ls->expert_slot.size()) {
                 continue;
             }
+
             const int32_t slot = ls->expert_slot[id];
             if (slot >= 0) {
                 ls->n_hit++;
-                ls->slot_last_use[slot] = ++mc->clock;
+                promote_to_protected(*ls, slot, mc->n_slots, ++mc->clock);
             } else {
                 ls->n_miss++;
+                if (slot == -2) {
+                    continue;
+                }
                 bool dup = false;
                 for (int32_t p : ls->pending) {
                     if (p == id) { dup = true; break; }
@@ -142,6 +157,71 @@ void set_table_entry(llama_moe_cache_layer & pub, int32_t expert, int32_t slot_o
     const int32_t v = slot_or_dummy;
     ggml_backend_tensor_set(pub.dev_table,  &v, (size_t) expert*sizeof(int32_t), sizeof(int32_t));
     ggml_backend_tensor_set(pub.host_table, &v, (size_t) expert*sizeof(int32_t), sizeof(int32_t));
+}
+
+void promote_to_protected(layer_state & ls, int32_t slot, int32_t n_slots, uint64_t clock) {
+    ls.slot_last_use[slot] = clock;
+    if (ls.slot_protected[slot]) {
+        return;
+    }
+
+    ls.slot_protected[slot] = true;
+
+    int n_protected = 0;
+    for (int32_t s = 0; s < n_slots; ++s) {
+        if (ls.slot_protected[s]) {
+            n_protected++;
+        }
+    }
+
+    const int max_protected = (n_slots * 3) / 4;
+    if (n_protected <= max_protected) {
+        return;
+    }
+
+    int32_t lru_slot = -1;
+    uint64_t oldest_clock = UINT64_MAX;
+    for (int32_t s = 0; s < n_slots; ++s) {
+        if (ls.slot_protected[s] && s != slot && ls.slot_last_use[s] < oldest_clock) {
+            oldest_clock = ls.slot_last_use[s];
+            lru_slot = s;
+        }
+    }
+
+    if (lru_slot >= 0) {
+        ls.slot_protected[lru_slot] = false;
+    }
+}
+
+int32_t find_eviction_victim(const layer_state & ls, int32_t n_slots) {
+    for (int32_t s = 0; s < n_slots; ++s) {
+        if (!ls.slot_in_flight[s] && ls.slot_expert[s] < 0) {
+            return s;
+        }
+    }
+
+    int32_t victim = -1;
+    uint64_t oldest_probation = UINT64_MAX;
+    for (int32_t s = 0; s < n_slots; ++s) {
+        if (!ls.slot_in_flight[s] && !ls.slot_protected[s] && ls.slot_last_use[s] < oldest_probation) {
+            oldest_probation = ls.slot_last_use[s];
+            victim = s;
+        }
+    }
+
+    if (victim >= 0) {
+        return victim;
+    }
+
+    uint64_t oldest_protected = UINT64_MAX;
+    for (int32_t s = 0; s < n_slots; ++s) {
+        if (!ls.slot_in_flight[s] && ls.slot_last_use[s] < oldest_protected) {
+            oldest_protected = ls.slot_last_use[s];
+            victim = s;
+        }
+    }
+
+    return victim;
 }
 
 } // namespace
@@ -276,6 +356,7 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
             ls.slot_expert.assign(n_slots, -1);
             ls.expert_slot.assign(n_expert, -1);
             ls.slot_last_use.assign(n_slots, 0);
+            ls.slot_protected.assign(n_slots, false);
             ls.slot_in_flight.assign(n_slots, false);
 
             std::vector<int32_t> dummy(n_expert, n_slots);
@@ -385,23 +466,20 @@ void llama_moe_cache_step() {
             continue;
         }
 
-        int budget = mc->max_inserts;
+        int n_empty = 0;
+        for (int32_t s = 0; s < mc->n_slots; ++s) {
+            if (ls.slot_expert[s] < 0 && !ls.slot_in_flight[s]) {
+                n_empty++;
+            }
+        }
+        int budget = n_empty > 0 ? std::max(mc->max_inserts, std::min(4, n_empty)) : mc->max_inserts;
         for (auto it = ls.pending.rbegin(); it != ls.pending.rend() && budget > 0; ++it, --budget) {
             const int32_t id = *it;
-            if (ls.expert_slot[id] >= 0) {
+            if (ls.expert_slot[id] >= 0 || ls.expert_slot[id] == -2) {
                 continue;
             }
 
-            // victim: an empty non-in-flight slot if any, else the LRU non-in-flight slot
-            int32_t slot = -1;
-            uint64_t best = UINT64_MAX;
-            for (int32_t s = 0; s < mc->n_slots; ++s) {
-                if (ls.slot_in_flight[s]) {
-                    continue;
-                }
-                if (ls.slot_expert[s] < 0) { slot = s; break; }
-                if (ls.slot_last_use[s] < best) { best = ls.slot_last_use[s]; slot = s; }
-            }
+            const int32_t slot = find_eviction_victim(ls, mc->n_slots);
             if (slot < 0) {
                 break; // every slot is in flight; try again next step
             }
@@ -413,7 +491,9 @@ void llama_moe_cache_step() {
                 set_table_entry(ls.pub, victim, mc->n_slots);
                 ls.n_evict++;
             }
+            ls.slot_protected[slot] = false;
             ls.slot_in_flight[slot] = true;
+            ls.expert_slot[id]      = -2;
             ls.n_insert++;
 
             std::lock_guard<std::mutex> wlk(mc->wmtx);
@@ -423,10 +503,26 @@ void llama_moe_cache_step() {
     }
     mc->wcv.notify_one();
 
-    if (mc->n_steps % 512 == 0) {
-        uint64_t h = 0, m = 0;
-        for (auto & ls : mc->layers) { h += ls.n_hit; m += ls.n_miss; }
-        LLAMA_LOG_DEBUG("moe-cache: steps=%" PRIu64 " hits=%" PRIu64 " misses=%" PRIu64 " hit-rate=%.1f%%\n",
-                mc->n_steps, h, m, h + m ? 100.0*h/(h + m) : 0.0);
+    if (mc->n_steps % 128 == 0) {
+        uint64_t h = 0;
+        uint64_t m = 0;
+        uint64_t ins = 0;
+        uint64_t ev = 0;
+        for (const auto & ls : mc->layers) {
+            h   += ls.n_hit;
+            m   += ls.n_miss;
+            ins += ls.n_insert;
+            ev  += ls.n_evict;
+        }
+        const uint64_t dh = h - mc->last_log_hits;
+        const uint64_t dm = m - mc->last_log_misses;
+        mc->last_log_hits   = h;
+        mc->last_log_misses = m;
+
+        const double total_rate = (h + m > 0) ? (100.0 * h / (h + m)) : 0.0;
+        const double win_rate   = (dh + dm > 0) ? (100.0 * dh / (dh + dm)) : 0.0;
+
+        LLAMA_LOG_WARN("moe-cache: steps=%" PRIu64 " win_hit=%.1f%% (%" PRIu64 "/%" PRIu64 ") total_hit=%.1f%% (%" PRIu64 "/%" PRIu64 ") ins=%" PRIu64 " evict=%" PRIu64 "\n",
+                mc->n_steps, win_rate, dh, dh + dm, total_rate, h, h + m, ins, ev);
     }
 }
