@@ -669,6 +669,21 @@ void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t b
     ggml_backend_tensor_copy(src, dst);
 }
 
+bool ggml_backend_tensor_copy_range_async(ggml_backend_t backend, const struct ggml_tensor * src, size_t src_offset, struct ggml_tensor * dst, size_t dst_offset, size_t size) {
+    GGML_ASSERT(backend);
+    GGML_ASSERT(src);
+    GGML_ASSERT(dst);
+    GGML_ASSERT(src->data != NULL && dst->data != NULL && "tensor not allocated");
+    GGML_ASSERT(src_offset + size <= ggml_nbytes(src) && "tensor read out of bounds");
+    GGML_ASSERT(dst_offset + size <= ggml_nbytes(dst) && "tensor write out of bounds");
+
+    if (backend->iface.cpy_range_async == NULL) {
+        return false;
+    }
+
+    return backend->iface.cpy_range_async(backend, src, src_offset, dst, dst_offset, size);
+}
+
 // events
 
 ggml_backend_event_t ggml_backend_event_new(ggml_backend_dev_t device) {
@@ -990,6 +1005,14 @@ struct ggml_backend_sched {
     ggml_backend_event_t  prefetch_free [GGML_SCHED_MAX_PREFETCH_SLOTS];
     bool prefetch_used[GGML_SCHED_MAX_PREFETCH_SLOTS];
     int prefetch_cur;
+
+    // expert rows already resident on the device (see ggml_backend_sched_set_expert_rows_callback):
+    // the used-experts upload fills them device-to-device. GGML_SCHED_EXPERT_CACHE_D2D=0 disables the
+    // device fill, GGML_SCHED_EXPERT_COPY_STATS=1 logs per-graph upload counts.
+    ggml_backend_sched_expert_rows_fn expert_rows_fn;
+    void * expert_rows_user_data;
+    bool expert_rows_d2d;
+    bool expert_copy_stats;
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -2202,6 +2225,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     }
 
+    if (sched->expert_copy_stats && stat_tensors > 0) {
+        GGML_LOG_WARN("sched expert upload: %d weight tensors, %.1f%% of experts used, %.1f%% of the used rows device-filled, %.1f MiB over the host link\n",
+                stat_tensors, 100.0*stat_used/stat_experts, stat_used > 0 ? 100.0*stat_resident/stat_used : 0.0, stat_bytes_host/1024.0/1024.0);
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
@@ -2238,6 +2266,13 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->prefetch_wait_mode = 0;
     sched->prefetch_n_slots   = 2;
     sched->prefetch_cur       = 0;
+
+    sched->expert_rows_fn        = NULL;
+    sched->expert_rows_user_data = NULL;
+    const char * GGML_SCHED_EXPERT_CACHE_D2D = getenv("GGML_SCHED_EXPERT_CACHE_D2D");
+    sched->expert_rows_d2d = GGML_SCHED_EXPERT_CACHE_D2D ? atoi(GGML_SCHED_EXPERT_CACHE_D2D) != 0 : true;
+    const char * GGML_SCHED_EXPERT_COPY_STATS = getenv("GGML_SCHED_EXPERT_COPY_STATS");
+    sched->expert_copy_stats = GGML_SCHED_EXPERT_COPY_STATS ? atoi(GGML_SCHED_EXPERT_COPY_STATS) != 0 : false;
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
@@ -2299,6 +2334,12 @@ void ggml_backend_sched_set_prefetch_experts_slots(ggml_backend_sched_t sched, i
     sched->prefetch_n_slots   = slots;
     sched->prefetch_lookahead = 1; // measured-optimal (mindcontrol prefetch-wait A/B verdict)
     sched->prefetch_wait_mode = 1; // per-split wait: only mode that preserves tool_calls
+}
+
+void ggml_backend_sched_set_expert_rows_callback(ggml_backend_sched_t sched, ggml_backend_sched_expert_rows_fn fn, void * user_data) {
+    if (sched == NULL) { return; }
+    sched->expert_rows_fn        = fn;
+    sched->expert_rows_user_data = user_data;
 }
 
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {

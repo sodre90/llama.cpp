@@ -649,6 +649,7 @@ void llama_context::sched_reserve() {
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_prefetch_experts_slots(sched.get(), cparams.prefetch_experts_slots);
+    ggml_backend_sched_set_expert_rows_callback(sched.get(), llama_moe_cache_expert_rows, nullptr);
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -690,6 +691,7 @@ void llama_context::sched_reserve() {
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
                 ggml_backend_sched_set_prefetch_experts_slots(sched.get(), cparams.prefetch_experts_slots);
+                ggml_backend_sched_set_expert_rows_callback(sched.get(), llama_moe_cache_expert_rows, nullptr);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -2692,21 +2694,55 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         st.ids = ids;
     }
 
+    // experts the model already keeps on this device (its decode-time expert cache) are
+    // filled from those rows; only the experts left in host_used cross the host link
+    const ggml_tensor * cache_rows    = NULL;
+    const int32_t     * expert_slot   = NULL;
+    int32_t             n_cache_slots = 0;
+    const bool device_rows = llama_moe_cache_expert_rows(src, &cache_rows, &expert_slot, &n_cache_slots, nullptr) &&
+        cache_rows && cache_rows->data && expert_slot && n_cache_slots > 0 &&
+        cache_rows->type == src->type && cache_rows->ne[0] == src->ne[0] && cache_rows->ne[1] == src->ne[1] &&
+        cache_rows->nb[1] == src->nb[1] && cache_rows->nb[2] == expert_size && cache_rows->ne[2] >= n_cache_slots;
+
+    const size_t padding = std::min<size_t>(expert_size, 512);
+
+    std::vector<bool> host_used = st.used;
+    if (device_rows) {
+        for (int32_t id = 0; id < n_expert; ++id) {
+            if (!st.used[id]) {
+                continue;
+            }
+            const int32_t slot = expert_slot[id];
+            if (slot < 0 || slot >= n_cache_slots) {
+                continue;
+            }
+            if (!ggml_backend_tensor_copy_range_async(backend,
+                    cache_rows, (size_t) slot*expert_size, dst, (size_t) id*expert_size, expert_size)) {
+                continue;
+            }
+            host_used[id] = false;
+            if (id + 1 < n_expert && !st.used[id + 1]) {
+                ggml_backend_tensor_set_async(backend, dst,
+                    (const uint8_t *) src->data + (size_t) (id + 1)*expert_size, (size_t) (id + 1)*expert_size, padding);
+            }
+        }
+    }
+
     // group consecutive experts and copy them together
     for (int64_t first = 0; first < n_expert; ) {
-        if (!st.used[first]) {
+        if (!host_used[first]) {
             first++;
             continue;
         }
         int64_t last = first;
-        while (last + 1 < n_expert && st.used[last + 1]) {
+        while (last + 1 < n_expert && host_used[last + 1]) {
             last++;
         }
 
         // copy a bit extra to ensure there are no NaNs in the padding of the last expert, this is necessary for MMQ in the CUDA backend
         const size_t offset  = first*expert_size;
-        const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
-        ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, (last - first + 1)*expert_size + padding);
+        const size_t padding_end = last < n_expert - 1 ? padding : 0;
+        ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, (last - first + 1)*expert_size + padding_end);
 
         first = last + 1;
     }
