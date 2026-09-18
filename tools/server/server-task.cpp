@@ -1586,6 +1586,18 @@ std::string server_task_result_metrics::to_metrics() {
             "n_busy_slots_per_decode",
             "Average number of busy slots per llama_decode() call",
             (double) metrics.n_busy_slots / std::max((double) metrics.n_decode, 1.0)
+        }, {
+            "prompt_cache_bytes",
+            "Host RAM held by the prompt cache: serialized KV state plus context checkpoints",
+            (double) prompt_cache_bytes
+        }, {
+            "prompt_cache_tokens",
+            "Number of tokens whose state the prompt cache is holding",
+            (double) prompt_cache_tokens
+        }, {
+            "prompt_cache_limit_bytes",
+            "Prompt cache size limit from --cache-ram; 0 when unlimited or disabled",
+            (double) prompt_cache_limit_bytes
         },
     };
 

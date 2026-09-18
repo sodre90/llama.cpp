@@ -2673,6 +2673,16 @@ private:
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
                     res->metrics             = metrics;
 
+                    if (prompt_cache) {
+                        res->prompt_cache_bytes  = prompt_cache->size();
+                        res->prompt_cache_tokens = prompt_cache->n_tokens();
+
+                        // negative means no limit, and a limit of zero never builds a cache at all
+                        if (params_base.cache_ram_mib > 0) {
+                            res->prompt_cache_limit_bytes = (size_t) params_base.cache_ram_mib * 1024 * 1024;
+                        }
+                    }
+
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
                     }

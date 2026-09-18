@@ -495,6 +495,10 @@ struct server_task_result_metrics : server_task_result {
     int n_processing_slots = 0;
     int n_tasks_deferred = 0;
 
+    size_t prompt_cache_bytes       = 0;
+    size_t prompt_cache_tokens      = 0;
+    size_t prompt_cache_limit_bytes = 0; // 0 when the cache is disabled or has no limit
+
     server_metrics metrics;
 
     virtual json to_json() override;
