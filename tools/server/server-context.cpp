@@ -365,6 +365,8 @@ struct server_slot {
     // this is for printing timings with slot progress, not part of metrics
     int64_t t_print_last = 0;
     int32_t n_gen_last = 0;
+    int64_t t_print_pp_last = 0;
+    int32_t n_prompt_last = 0;
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
@@ -387,6 +389,9 @@ struct server_slot {
         generated_tokens.clear();
         generated_token_probs.clear();
         json_schema = json();
+
+        t_print_pp_last = 0;
+        n_prompt_last   = 0;
 
         task_prev = std::move(task);
         task.reset();
@@ -615,18 +620,30 @@ struct server_slot {
         SLT_INF(*this, "n_gen = %6d, tg = %6.2f t/s, tg_3s = %6.2f t/s\n", (int) stats.n_gen, n_gen_second, n_gen_second_win);
     }
 
-    void print_timings_pp() const {
+    void print_timings_pp() {
         const double t_prompt_total = stats.t_prompt_ms();
 
         if (t_prompt_total < 3000.0) {
             return;
         }
 
-        const double n_prompt_second = stats.n_prompt_tps();
+        const int64_t t_now = ggml_time_us();
+
+        // the rate since the request started hides a slowdown inside it, so report the rate over
+        // the chunk just processed as well - before the first line there is no earlier one to
+        // measure from, so the window is the whole prompt and the two rates agree
+        const int64_t t_window = t_print_pp_last > 0 ? t_now - t_print_pp_last : (int64_t) (t_prompt_total*1e3);
+
+        const double n_prompt_second     = stats.n_prompt_tps();
+        const double n_prompt_second_win = t_window > 0 ? 1e6 / t_window * (stats.n_prompt_processed - n_prompt_last) : 0.0;
+
         const double f_progress = task->n_tokens() > 0 ? (double) prompt.n_tokens() / task->n_tokens() : 0.0;
 
-        SLT_INF(*this, "prompt processing, n_tokens = %6d, progress = %.2f, t = %6.2f s / %.2f tokens per second\n",
-                (int) stats.n_prompt_processed, f_progress, t_prompt_total / 1e3, n_prompt_second);
+        t_print_pp_last = t_now;
+        n_prompt_last   = stats.n_prompt_processed;
+
+        SLT_INF(*this, "prompt processing, n_tokens = %6d, progress = %.2f, t = %6.2f s / %.2f tokens per second, pp_win = %.2f t/s\n",
+                (int) stats.n_prompt_processed, f_progress, t_prompt_total / 1e3, n_prompt_second, n_prompt_second_win);
     }
 
     void print_timings() const {
