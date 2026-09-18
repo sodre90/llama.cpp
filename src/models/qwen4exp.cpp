@@ -734,6 +734,23 @@ static bool qsa_direct_indices_apply(int64_t n_kv, int64_t width) {
         n_kv >= std::max<int64_t>(4096, 2*width);
 }
 
+// Which QSA path a shape actually takes is guesswork from the source: it turns on three separate
+// predicates, and a recorded belief that decode never reaches the sparse path turned out to
+// contradict the mask shape. Report each distinct combination once so the journal settles it on
+// the real workload. WARN because INFO never reaches the journal from libllama.
+static void qsa_report_path(int64_t n_tps, int64_t n_kv, bool gathered) {
+    static bool reported[4] = { false, false, false, false };
+
+    const int key = (gathered ? 2 : 0) | (n_tps > 1 ? 1 : 0);
+
+    if (!reported[key]) {
+        reported[key] = true;
+
+        LLAMA_LOG_WARN("qsa: path n_tps=%" PRId64 " n_kv=%" PRId64 " -> %s\n",
+                n_tps, n_kv, gathered ? "gathered (sparse cell list)" : "masked (dense over n_kv)");
+    }
+}
+
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         const llama_memory_hybrid_idx_context * mctx_hyb,
         ggml_tensor *                           cur,
@@ -1122,7 +1139,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k_cache = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v_cache = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = qsa_gather_pays_off(top_k, k_cache, v_cache)
+    const bool gathered = qsa_gather_pays_off(top_k, k_cache, v_cache);
+
+    qsa_report_path(kq_mask->ne[1], kq_mask->ne[0], gathered);
+
+    ggml_tensor * cur = gathered
         ? build_attn_qsa_gathered(q_cur, k_cache, v_cache, kq_mask, top_k, kq_scale, il)
         : build_attn_qsa_masked  (q_cur, k_cache, v_cache, kq_mask, top_k, kq_scale, il);
     cb(cur, "kqv_out", il);
