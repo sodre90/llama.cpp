@@ -2482,6 +2482,24 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
+static bool ggml_backend_cuda_cpy_range_async(ggml_backend_t backend, const ggml_tensor * src, size_t src_offset, ggml_tensor * dst, size_t dst_offset, size_t size) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
+    ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+
+    if (buf_src->buft != ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
+        buf_dst->buft != ggml_backend_cuda_buffer_type(cuda_ctx->device)) {
+        return false;
+    }
+
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + dst_offset, (const char *) src->data + src_offset, size,
+        cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+
+    return true;
+}
+
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
@@ -4800,6 +4818,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .event_record            = */ ggml_backend_cuda_event_record,
     /* .event_wait              = */ ggml_backend_cuda_event_wait,
     /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
+    /* .cpy_range_async         = */ ggml_backend_cuda_cpy_range_async,
 };
 
 static ggml_guid_t ggml_backend_cuda_guid() {

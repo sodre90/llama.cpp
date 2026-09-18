@@ -153,6 +153,10 @@ extern "C" {
 
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
+
+        // (optional) asynchronous copy of a byte range between two tensors resident on this backend.
+        // Kept last so that a backend leaving it unset needs no change to its interface table.
+        bool (*cpy_range_async)(ggml_backend_t backend, const struct ggml_tensor * src, size_t src_offset, struct ggml_tensor * dst, size_t dst_offset, size_t size);
     };
 
     struct ggml_backend {

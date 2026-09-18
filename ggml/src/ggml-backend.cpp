@@ -529,6 +529,21 @@ void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t b
     ggml_backend_tensor_copy(src, dst);
 }
 
+bool ggml_backend_tensor_copy_range_async(ggml_backend_t backend, const struct ggml_tensor * src, size_t src_offset, struct ggml_tensor * dst, size_t dst_offset, size_t size) {
+    GGML_ASSERT(backend);
+    GGML_ASSERT(src);
+    GGML_ASSERT(dst);
+    GGML_ASSERT(src->data != NULL && dst->data != NULL && "tensor not allocated");
+    GGML_ASSERT(src_offset + size <= ggml_nbytes(src) && "tensor read out of bounds");
+    GGML_ASSERT(dst_offset + size <= ggml_nbytes(dst) && "tensor write out of bounds");
+
+    if (backend->iface.cpy_range_async == NULL) {
+        return false;
+    }
+
+    return backend->iface.cpy_range_async(backend, src, src_offset, dst, dst_offset, size);
+}
+
 // events
 
 ggml_backend_event_t ggml_backend_event_new(ggml_backend_dev_t device) {
@@ -1995,34 +2010,50 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         prev_ids_tensor = ids_tensor;
                     }
 
-                    // used experts already resident on the device (an expert cache kept for decode) are
-                    // filled device-to-device below; only the rest cross the host link
+                    // experts the model already keeps on this device (its decode-time expert cache) are
+                    // filled from those rows; only the experts left in host_ids cross the host link
                     const ggml_tensor * cache_rows    = NULL;
                     const int32_t     * expert_slot   = NULL;
                     int32_t             n_cache_slots = 0;
                     const bool device_rows = sched->expert_rows_d2d && sched->expert_rows_fn && node->op == GGML_OP_MUL_MAT_ID &&
                         sched->expert_rows_fn(input, &cache_rows, &expert_slot, &n_cache_slots, sched->expert_rows_user_data) &&
-                        cache_rows && expert_slot && n_cache_slots > 0 &&
+                        cache_rows && cache_rows->data && expert_slot && n_cache_slots > 0 &&
+                        // a slot must hold exactly the bytes that expert occupies in the weight
                         cache_rows->type == input->type && cache_rows->ne[0] == input->ne[0] && cache_rows->ne[1] == input->ne[1] &&
-                        cache_rows->nb[1] == input->nb[1] && cache_rows->nb[2] == expert_size && cache_rows->ne[2] >= n_cache_slots &&
-                        cache_rows->buffer && input_cpy->buffer &&
-                        ggml_backend_buffer_get_type(cache_rows->buffer) == ggml_backend_buffer_get_type(input_cpy->buffer);
+                        cache_rows->nb[1] == input->nb[1] && cache_rows->nb[2] == expert_size && cache_rows->ne[2] >= n_cache_slots;
+
+                    const size_t padding = std::min<size_t>(expert_size, 512);
 
                     host_ids.assign(used_ids.begin(), used_ids.end());
-                    int32_t n_used = 0;
+                    int32_t n_used     = 0;
                     int32_t n_resident = 0;
                     for (int32_t id = 0; id < n_expert; ++id) {
                         if (!ggml_bitset_get(used_ids.data(), id)) {
                             continue;
                         }
                         n_used++;
-                        if (device_rows && expert_slot[id] >= 0 && expert_slot[id] < n_cache_slots) {
-                            ggml_bitset_clear(host_ids.data(), id);
-                            n_resident++;
+
+                        const int32_t slot = device_rows ? expert_slot[id] : -1;
+                        if (slot < 0 || slot >= n_cache_slots) {
+                            continue;
+                        }
+
+                        // a backend that cannot copy between these two tensors leaves the expert on the host path
+                        if (!ggml_backend_tensor_copy_range_async(split_backend,
+                                cache_rows, (size_t) slot*expert_size, input_cpy, (size_t) id*expert_size, expert_size)) {
+                            continue;
+                        }
+
+                        ggml_bitset_clear(host_ids.data(), id);
+                        n_resident++;
+
+                        // MMQ reads a little past a row, so when no other copy writes the next expert,
+                        // give it real bytes rather than whatever the padding holds
+                        if (id + 1 < n_expert && !ggml_bitset_get(used_ids.data(), id + 1)) {
+                            ggml_backend_tensor_set_async(split_backend, input_cpy,
+                                (const uint8_t *) input->data + (size_t) (id + 1)*expert_size, (size_t) (id + 1)*expert_size, padding);
                         }
                     }
-
-                    const size_t padding = std::min<size_t>(expert_size, 512);
 
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
@@ -2063,30 +2094,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             last_id = id;
                         }
                         copy_experts(first_id, last_id);
-                    }
-
-                    // the host uploads are queued first so the link is busy while these small copies are issued
-                    if (n_resident > 0) {
-                        ggml_tensor src_row = *cache_rows;
-                        ggml_tensor dst_row = *input_cpy;
-                        src_row.ne[2] = 1;
-                        dst_row.ne[2] = 1;
-                        src_row.nb[3] = dst_row.nb[3];
-                        src_row.view_src = NULL;
-                        dst_row.view_src = NULL;
-                        for (int32_t id = 0; id < n_expert; ++id) {
-                            if (!ggml_bitset_get(used_ids.data(), id) || ggml_bitset_get(host_ids.data(), id)) {
-                                continue;
-                            }
-                            src_row.data = (uint8_t *) cache_rows->data + (size_t) expert_slot[id]*expert_size;
-                            dst_row.data = (uint8_t *) input_cpy->data + (size_t) id*expert_size;
-                            ggml_backend_tensor_copy_async(split_backend, split_backend, &src_row, &dst_row);
-                            // MMQ reads a little past a row; when nothing else writes the next row, give it real bytes
-                            if (id + 1 < n_expert && !ggml_bitset_get(used_ids.data(), id + 1)) {
-                                ggml_backend_tensor_set_async(split_backend, input_cpy,
-                                    (const uint8_t *) input->data + (size_t) (id + 1)*expert_size, (size_t) (id + 1)*expert_size, padding);
-                            }
-                        }
                     }
 
                     stat_tensors++;
