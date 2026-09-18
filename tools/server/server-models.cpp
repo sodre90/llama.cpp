@@ -190,6 +190,12 @@ private:
     }
 
     void on_line(child_t & c, server_subproc_stream stream, const std::string & line) {
+        // every notify_to_router() opens with a newline to close whatever the logger left on the
+        // shared pipe, so a child that reports progress every 200ms would otherwise forward
+        // hundreds of bare prefixes
+        if (line.find_first_not_of(" \t\r\n") == std::string::npos) {
+            return;
+        }
         if (stream == SERVER_SUBPROC_STDERR) {
             LOG("[%5d] %s", c.port, line.c_str()); // forward log
         } else if (string_starts_with(line, CMD_CHILD_TO_ROUTER_STATE)) {
@@ -1697,6 +1703,19 @@ void server_models::handle_child_state(const std::string & name, const std::stri
             } break;
         case SERVER_STATE_LOADING:
             {
+                const std::string stage = json_value(payload, "current", std::string());
+                const int percentage = (int) (100.0 * json_value(payload, "value", 0.0));
+
+                // the child samples progress every 200ms, which is hundreds of lines over a load
+                auto & reported = load_progress[name];
+                if (reported.first != stage) {
+                    reported = { stage, 0 };
+                }
+                if (percentage >= reported.second) {
+                    reported.second = percentage - percentage % LOAD_PROGRESS_LOG_STEP + LOAD_PROGRESS_LOG_STEP;
+                    SRV_INF("loading model name=%s: %s %3d%%\n", name.c_str(), stage.c_str(), percentage);
+                }
+
                 update_status(name, {
                     SERVER_MODEL_STATUS_LOADING,
                     0,
@@ -1706,6 +1725,7 @@ void server_models::handle_child_state(const std::string & name, const std::stri
             } break;
         case SERVER_STATE_READY:
             {
+                load_progress.erase(name);
                 update_status(name, {
                     SERVER_MODEL_STATUS_LOADED,
                     0,
