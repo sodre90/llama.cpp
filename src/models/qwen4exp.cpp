@@ -739,9 +739,14 @@ static bool qsa_direct_indices_apply(int64_t n_kv, int64_t width) {
 // contradict the mask shape. Report each distinct combination once so the journal settles it on
 // the real workload. WARN because INFO never reaches the journal from libllama.
 static void qsa_report_path(int64_t n_tps, int64_t n_kv, bool gathered) {
-    static bool reported[4] = { false, false, false, false };
+    // keyed on the exact token count, capped: the load-time reserve pass runs at n_parallel tokens
+    // per stream, so collapsing every n_tps > 1 into one key would let it consume the slot that a
+    // real two-slot decode needs
+    constexpr int64_t n_tps_max = 8;
 
-    const int key = (gathered ? 2 : 0) | (n_tps > 1 ? 1 : 0);
+    static bool reported[2*(n_tps_max + 1)] = { false };
+
+    const int key = (gathered ? (n_tps_max + 1) : 0) + (int) std::min(n_tps, n_tps_max);
 
     if (!reported[key]) {
         reported[key] = true;

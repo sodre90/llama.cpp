@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <iterator>
 #include <stdexcept>
 
@@ -159,6 +160,26 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     }
 }
 
+// [TAG_QSA_STREAM_FA] The sparse gather needs one token per stream (qsa_gather_pays_off tests
+// top_k->ne[1] == 1), because flash attention shares one K/V set across the query batch and two
+// tokens select different cells. A unified cache has a single stream, so a decode ubatch carrying
+// several slots turns the sparse path off and attends densely over the whole pool - measured as
+// 12.3 t/s per slot at three slots against 30.2 t/s at one, same build.
+//
+// Splitting by sequence keeps each ubatch at one token per stream, at the cost of one graph per
+// active sequence. Restricted to batches that already fit a single ubatch, which is exactly the
+// decode case: every sequence then stays whole, so chunking cannot violate
+// [TAG_RECURRENT_ROLLBACK_SPLITS]. LLAMA_QSA_SPLIT_SEQ=0 restores the packed split so both arms
+// live in one image.
+static bool qsa_split_by_seq(const llama_batch_allocr & balloc, uint32_t n_ubatch, bool unified) {
+    static const bool enabled = []() {
+        const char * requested = getenv("LLAMA_QSA_SPLIT_SEQ");
+        return requested == nullptr || atoi(requested) != 0;
+    }();
+
+    return enabled && unified && balloc.get_n_tokens() <= n_ubatch;
+}
+
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
     do {
@@ -182,7 +203,9 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = get_mem_recr()->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                ubatch = qsa_split_by_seq(balloc, n_ubatch, unified)
+                    ? balloc.split_seq(n_ubatch)
+                    : balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
             }
 
             if (ubatch.n_tokens == 0) {
