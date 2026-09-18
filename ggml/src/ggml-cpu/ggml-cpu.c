@@ -1669,14 +1669,8 @@ static void ggml_compute_forward_mul_mat_id(
             }
         }
 
-        // MoE routing observation for the llama expert cache
-        {
-            void * moe_obs_ud = NULL;
-            ggml_moe_obs_cb_t moe_obs_cb = ggml_get_moe_obs_callback(&moe_obs_ud);
-            if (moe_obs_cb && strstr(src0->name, "ffn_gate_exps")) {
-                moe_obs_cb(src0->name, ids, moe_obs_ud);
-            }
-        }
+        // note: routing observation for the MoE expert cache lives in the graph node loop
+        // (ggml_moe_observe_routing), so that the fused MoE paths are seen too
 
         // GGML_MOE_LOG: append the routed expert ids of every ffn_gate_exps
         // mul_mat_id to the file named by the env var. Diagnostic only; the
@@ -3793,6 +3787,24 @@ static int ggml_cpu_try_fuse_ops(
     return 0;
 }
 
+// MoE routing observation for the llama expert cache. It belongs to the node rather than to the
+// kernel that serves it: the fused MoE paths swallow the gate mul_mat_id whole, and single-token
+// decode always takes one of them, so a site inside ggml_compute_forward_mul_mat_id is blind to
+// exactly the case the cache exists for. Call once per node, from one thread, before dispatch -
+// the table it reads only changes between graphs.
+static void ggml_moe_observe_routing(const struct ggml_tensor * node) {
+    if (node->op != GGML_OP_MUL_MAT_ID || node->src[2] == NULL) {
+        return;
+    }
+
+    void * ud = NULL;
+    ggml_moe_obs_cb_t cb = ggml_get_moe_obs_callback(&ud);
+
+    if (cb && strstr(node->src[0]->name, "ffn_gate_exps")) {
+        cb(node->src[0]->name, node->src[2], ud);
+    }
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -3831,6 +3843,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
+        }
+
+        if (state->ith == 0) {
+            ggml_moe_observe_routing(node);
         }
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
