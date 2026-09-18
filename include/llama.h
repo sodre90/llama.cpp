@@ -415,6 +415,8 @@ extern "C" {
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
 
+        uint32_t kv_unified_per_slot; // per-slot context limit when kv_unified is true (0 = unset, sizes to kv_size)
+
         // mindcontrol-port of --prefetch-experts-slots: MoE expert H2D staging slots.
         // 0 = off (no memory overhead); >=2 enables full-tensor lookahead prefetch of
         // host-resident (ncmoe) expert weights during prefill (GPU staging cost = slots

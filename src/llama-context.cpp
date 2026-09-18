@@ -348,6 +348,7 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.prefetch_experts_slots = params.prefetch_experts_slots;
     cparams.kv_unified = params.kv_unified;
+    cparams.kv_unified_per_slot = params.kv_unified_per_slot;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -3819,6 +3820,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.kv_unified_per_slot         =*/ 0,
         /*.prefetch_experts_slots      =*/ 0,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,

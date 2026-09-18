@@ -52,6 +52,7 @@ struct llama_cparams {
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
     bool kv_unified;
+    uint32_t kv_unified_per_slot = 0;
     bool pipeline_parallel;
 
     int prefetch_experts_slots = 0; // --prefetch-experts-slots: MoE expert H2D staging slots (0 = off, >=2 enables full-tensor lookahead prefetch; capped at 4)

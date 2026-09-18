@@ -39,14 +39,14 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
                             /* layer filters */
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
-    const layer_filter_cb & filter_idx) :
+    const layer_filter_cb & filter_idx,
+    uint32_t kv_unified_per_slot) :
     llama_memory_hybrid(
         model,
         type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
         type_r, type_s, rs_size,
         n_seq_max, n_rs_seq, offload, unified,
         filter_attn, filter_recr),
-    n_seq_max_idx(n_seq_max),
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
@@ -82,19 +82,18 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const uint32_t n_stream_total = mem_idx->get_n_stream();
 
         if (ratio > 0 && idx_dim > 0 && n_stream_total > 0) {
+            const uint32_t per_seq_limit = (kv_unified_per_slot > 0 && kv_unified_per_slot < kv_size)
+                                         ? kv_unified_per_slot
+                                         : kv_size;
             // + 1 so a partial trailing block has a slot, + 1 dustbin row for padded writes
-            pooled_rows  = kv_size/ratio + 2;
+            pooled_rows  = per_seq_limit/ratio + 2;
             pooled_ratio = ratio;
-            pooled_keyed = (n_stream_total == 1 && n_seq_max > 1);
 
-            // a unified cache puts every sequence in one stream, so active blocks dynamically
-            // allocate rows from a shared pool of (kv_size/ratio) rows. Since the whole KV pool
-            // can never hold more than kv_size/ratio complete blocks, the pool never exhausts.
-            if (pooled_keyed) {
-                free_rows.reserve(pooled_rows - 1);
-                for (int32_t i = 0; i < (int32_t) pooled_rows - 1; ++i) {
-                    free_rows.push_back(i);
-                }
+            // a unified cache puts every sequence in one stream, so give each its own row range:
+            // the position block alone would alias two agents sitting at the same positions
+            if (n_stream_total == 1 && n_seq_max > 1) {
+                pooled_seq_stride = pooled_rows;
+                pooled_rows       = pooled_seq_stride*n_seq_max + 1; // + 1 shared dustbin row
             }
 
             // one context+buffer per device: the indexer caches of the QSA layers are spread
@@ -269,7 +268,7 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
 
     // [TAG_QSA_POOLED_CACHE] rows are shared in the single-stream cache; the copy's blocks
     // are refilled from its own cells on its first ubatch
-    pooled_shared = pooled_shared || pooled_is_keyed_by_seq();
+    pooled_shared = pooled_shared || pooled_seq_stride > 0;
     pooled_reset(seq_id_dst);
 }
 
@@ -280,20 +279,11 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
         mem_idx->seq_keep(seq_id);
     }
 
-    if (pooled_is_keyed_by_seq()) {
-        for (int sq = 0; sq < LLAMA_MAX_SEQ; ++sq) {
-            if (sq != seq_id) {
-                pooled_reset(sq);
-            }
-        }
-    }
-
     // [TAG_QSA_POOLED_CACHE] only seq_id's rows survive as trusted, and not even those if it
     // may have been reading a row pooled into a sequence that just went away
     const int64_t keep = pooled_shared || !pooled_w.count(seq_id) ? 0 : pooled_w[seq_id];
     pooled_w.clear();
     pooled_w[seq_id] = keep;
-    pooled_shared = false;
 }
 
 void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
@@ -415,58 +405,6 @@ int64_t & llama_memory_hybrid_idx::pooled_valid(llama_seq_id seq_id) const {
     return pooled_w[seq_id];
 }
 
-int64_t llama_memory_hybrid_idx::pooled_row_of(llama_seq_id seq_id, int64_t blk) const {
-    const int64_t dustbin = (int64_t) pooled_rows - 1;
-
-    if (!pooled_is_keyed_by_seq()) {
-        if (blk < 0 || blk >= dustbin) {
-            return dustbin;
-        }
-        return blk;
-    }
-
-    if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ || blk < 0 || blk >= dustbin) {
-        return dustbin;
-    }
-
-    auto & srows = seq_block_rows[seq_id];
-    if ((size_t) blk >= srows.size()) {
-        srows.resize(blk + 1, -1);
-    }
-
-    if (srows[blk] < 0) {
-        if (!free_rows.empty()) {
-            srows[blk] = free_rows.back();
-            free_rows.pop_back();
-        } else {
-            return dustbin;
-        }
-    }
-
-    return srows[blk];
-}
-
-void llama_memory_hybrid_idx::pooled_free_range(llama_seq_id seq_id, int64_t b0, int64_t b1) {
-    if (!pooled_is_keyed_by_seq() || seq_id < 0 || seq_id >= LLAMA_MAX_SEQ) {
-        return;
-    }
-
-    auto & srows = seq_block_rows[seq_id];
-    b0 = std::max<int64_t>(0, b0);
-    b1 = std::min<int64_t>(b1, (int64_t) srows.size());
-
-    for (int64_t b = b0; b < b1; ++b) {
-        if (srows[b] >= 0) {
-            free_rows.push_back(srows[b]);
-            srows[b] = -1;
-        }
-    }
-
-    while (!srows.empty() && srows.back() < 0) {
-        srows.pop_back();
-    }
-}
-
 void llama_memory_hybrid_idx::pooled_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     if (pooled_k.empty()) {
         return;
@@ -493,41 +431,23 @@ void llama_memory_hybrid_idx::pooled_rm(llama_seq_id seq_id, llama_pos p0, llama
     // new owner's own row is stale - repool everything rather than track which blocks moved.
     if (pooled_shared) {
         pooled_w.clear();
+        return;
     }
 
+    // blocks at or beyond the first removed position lose members; earlier rows keep their
+    // content (removals only ever drop the tail or a middle range, never rewrite the prefix)
     const int64_t blk = pooled_ratio > 0 ? std::max<llama_pos>(p0, 0)/pooled_ratio : 0;
 
     auto & w = pooled_w[seq_id];
     w = std::min(w, blk);
-
-    if (p1 < 0) {
-        pooled_free_range(seq_id, blk, (int64_t) seq_block_rows[seq_id].size());
-    } else {
-        const int64_t blk1 = pooled_ratio > 0 ? (p1 + pooled_ratio - 1)/pooled_ratio : 0;
-        pooled_free_range(seq_id, blk, blk1);
-    }
 }
 
 void llama_memory_hybrid_idx::pooled_reset(llama_seq_id seq_id) {
     if (seq_id < 0) {
         pooled_w.clear();
         pooled_shared = false;
-        if (pooled_is_keyed_by_seq()) {
-            free_rows.clear();
-            free_rows.reserve(pooled_rows - 1);
-            for (int32_t i = 0; i < (int32_t) pooled_rows - 1; ++i) {
-                free_rows.push_back(i);
-            }
-            for (int sq = 0; sq < LLAMA_MAX_SEQ; ++sq) {
-                seq_block_rows[sq].clear();
-            }
-        }
     } else {
         pooled_w[seq_id] = 0;
-        if (pooled_is_keyed_by_seq() && seq_id >= 0 && seq_id < LLAMA_MAX_SEQ) {
-            pooled_free_range(seq_id, 0, (int64_t) seq_block_rows[seq_id].size());
-            seq_block_rows[seq_id].clear();
-        }
     }
 }
 

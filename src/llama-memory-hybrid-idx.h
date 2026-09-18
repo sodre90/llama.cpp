@@ -41,7 +41,8 @@ public:
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
                             /* the indexer cache exists only if this is given */
-    const layer_filter_cb & filter_idx);
+    const layer_filter_cb & filter_idx,
+                 uint32_t   kv_unified_per_slot = 0);
 
     ~llama_memory_hybrid_idx() = default;
 
@@ -109,15 +110,32 @@ public:
 
     // A unified cache holds every sequence in one stream, so the position block alone no longer
     // identifies a row: two agents at the same positions would share it and overwrite each other.
-    // Rows are dynamically allocated from a shared pool and the reader gathers rather than viewing
+    // Rows are then keyed on (seq_id, position block) and the reader gathers rather than viewing
     // a contiguous range. With one sequence per stream the base is 0 and nothing changes.
-    bool     pooled_is_keyed_by_seq() const { return pooled_keyed; }
+    bool     pooled_is_keyed_by_seq() const { return pooled_seq_stride > 0; }
+    uint32_t get_pooled_seq_stride()  const { return pooled_seq_stride; }
 
-    int64_t  pooled_row_of(llama_seq_id seq_id, int64_t blk) const;
+    int64_t pooled_row_base(llama_seq_id seq_id) const {
+        return (int64_t) pooled_seq_stride * seq_id;
+    }
+
+    // row holding block blk of seq_id, or the shared dustbin when blk is past the range reserved
+    // for one sequence. A block scored from the dustbin is wrong for that block alone; a row taken
+    // from the next sequence's range would corrupt another agent. The server admits no prompt long
+    // enough to reach this, so it is a bound on --kv-unified-per-slot, not a live path.
+    int64_t pooled_row_of(llama_seq_id seq_id, int64_t blk) const {
+        const int64_t lim = pooled_seq_stride > 0 ? (int64_t) pooled_seq_stride : (int64_t) pooled_rows - 1;
+
+        if (blk < 0 || blk >= lim) {
+            return (int64_t) pooled_rows - 1;
+        }
+
+        return pooled_row_base(seq_id) + blk;
+    }
 
     // sequences the store has row ranges for; 1 when a stream owns one sequence
     uint32_t pooled_n_seq() const {
-        return pooled_keyed ? n_seq_max_idx : 1;
+        return pooled_seq_stride > 0 ? (pooled_rows - 1)/pooled_seq_stride : 1;
     }
 
     // blocks of seq_id whose pooled rows are known valid; mutable like a cache's bookkeeping
@@ -127,8 +145,6 @@ private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);
-
-    uint32_t n_seq_max_idx = 1;
 
     // the indexer cache holds one key head per layer, so it needs its own hparams:
     // llama_kv_cache keeps a reference to what it is given
@@ -146,18 +162,17 @@ private:
     uint32_t pooled_rows  = 0;
     uint32_t pooled_ratio = 0;
 
-    bool pooled_keyed  = false;
+    // rows reserved per sequence when the cache is unified; 0 when a stream owns one sequence
+    // and the position block indexes the store directly
+    uint32_t pooled_seq_stride = 0;
+
+    // set once seq_cp has put one block's cells in several sequences: their rows are then no
+    // longer independent, so a later removal has to invalidate every watermark, not just one
     bool pooled_shared = false;
 
     mutable std::unordered_map<llama_seq_id, int64_t> pooled_w;
 
-    // [TAG_QSA_POOLED_CACHE] dynamic shared row pool for unified cache
-    // Active blocks are allocated rows from 0 to pooled_rows - 2.
-    // Row (pooled_rows - 1) is the shared dustbin row.
-    mutable std::vector<int32_t> seq_block_rows[LLAMA_MAX_SEQ];
-    mutable std::vector<int32_t> free_rows;
-
-    void pooled_free_range(llama_seq_id seq_id, int64_t b0, int64_t b1);
+    // clamp helpers, one per llama_memory_i operation that can invalidate rows
     void pooled_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
     void pooled_reset(llama_seq_id seq_id);   // -1 resets every sequence
 };

@@ -1750,6 +1750,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.prefetch_experts_slots = params.prefetch_experts_slots;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+    cparams.kv_unified_per_slot = params.kv_unified_per_slot > 0 ? (uint32_t) params.kv_unified_per_slot : 0;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
