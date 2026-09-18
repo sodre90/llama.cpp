@@ -409,6 +409,19 @@ size_t llama_file::size() const { return pimpl->size; }
 size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
 bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
 
+void llama_file::advise_willneed(size_t offset, size_t len) const {
+#if defined(POSIX_FADV_WILLNEED)
+    // direct io reads past the page cache the advice would fill, so it would only waste bandwidth
+    if (len == 0 || has_direct_io()) {
+        return;
+    }
+    posix_fadvise(file_id(), (off_t) offset, (off_t) len, POSIX_FADV_WILLNEED);
+#else
+    (void) offset;
+    (void) len;
+#endif
+}
+
 int llama_file::file_id() const {
 #ifdef _WIN32
     return _fileno(pimpl->fp);

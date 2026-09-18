@@ -1693,11 +1693,40 @@ bool llama_model_loader::load_all_data(
         });
     }
 
+    // The loop below reads one tensor and then waits on its upload, so the drive sits idle for much
+    // of the load, and the kernel's readahead cannot help: the sort above hands the tensors out in
+    // size order, not file order. Naming the ones about to be read keeps a window of them in flight.
+    // LLAMA_LOAD_PREFETCH_MB=0 turns it off.
+    const size_t prefetch_window = [] {
+        const char * mb = getenv("LLAMA_LOAD_PREFETCH_MB");
+        return (size_t) (mb ? atoi(mb) : 256) * 1024 * 1024;
+    }();
+    size_t prefetch_next  = 0; // first tensor not yet named to the kernel
+    size_t prefetch_bytes = 0; // named but not yet read
+
+    auto prefetch_extend = [&]() {
+        while (prefetch_next < tensors.size() && prefetch_bytes < prefetch_window) {
+            ggml_tensor * ahead = tensors[prefetch_next++];
+            const auto * w = get_weight(ggml_get_name(ahead));
+            if (w == nullptr || use_mmap || lazy.has(ahead)) {
+                continue;
+            }
+            const size_t n = ggml_nbytes(ahead);
+            files.at(w->idx)->advise_willneed(w->offs, n);
+            prefetch_bytes += n;
+        }
+    };
+
     for (struct ggml_tensor * cur : tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
             // this can happen with split experts models
             continue;
+        }
+
+        if (prefetch_window > 0) {
+            prefetch_extend();
+            prefetch_bytes -= std::min(prefetch_bytes, ggml_nbytes(cur));
         }
 
         if (progress_callback) {

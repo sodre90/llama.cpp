@@ -36,6 +36,9 @@ struct llama_file {
 
     size_t read_alignment() const;
     bool has_direct_io() const;
+
+    // name a range about to be read so the kernel can fetch it while the caller is busy elsewhere
+    void advise_willneed(size_t offset, size_t len) const;
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
