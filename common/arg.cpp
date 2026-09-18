@@ -2556,6 +2556,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.n_moe_cache_inserts = value;
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_INSERTS"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-map"}, "FNAME",
+        "persist the MoE expert popularity histogram to this file, written once at exit and reloaded "
+        "to pre-warm the cache (default: disabled). It survives restarts AND image changes, so leave "
+        "it off while A/B testing",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_map_path = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_MAP"));
     if (ex == LLAMA_EXAMPLE_SERVER) {
         // this is to make sure this option appears in the server-specific section of the help message
         add_opt(common_arg(

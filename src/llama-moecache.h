@@ -57,7 +57,10 @@ struct llama_moe_cache_layer {
 
 // build the cache for every host-resident expert layer of the model.
 // Safe to call more than once; only the first call does work.
-void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t max_inserts);
+// map_path persists the expert popularity histogram across restarts, and is written once at exit;
+// null or empty disables persistence, which is the default because it only buys a warm start and
+// it survives image changes, so it silently confounds any A/B taken across a restart.
+void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t max_inserts, const char * map_path);
 
 // nullptr when the cache is disabled or this tensor has no cached layer
 const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * up_exps);

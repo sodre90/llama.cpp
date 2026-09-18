@@ -17,7 +17,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include <sys/stat.h>
 #include <unistd.h>
 
 namespace {
@@ -52,6 +51,9 @@ struct upload_job {
 struct moe_cache {
     int32_t n_slots     = 0;
     int32_t max_inserts = 2;
+
+    // where to persist the expert popularity histogram; empty disables persistence entirely
+    std::string map_path;
 
     uint64_t clock   = 0;
     uint64_t n_steps = 0;
@@ -233,21 +235,12 @@ int32_t find_eviction_victim(const layer_state & ls, int32_t n_slots) {
     return victim;
 }
 
+// Persisting the expert popularity histogram only ever buys a warm start after a restart, so it is
+// opt-in: --moe-expert-cache-map. It used to default to /models/moe-cache-map.csv whenever /models
+// happened to exist, which made a file that survives restarts AND image changes invisible in both
+// models.ini and the rendered command line - and it faked a +18% A/B result exactly once.
 const char * get_moe_cache_map_path() {
-    const char * env = getenv("LLAMA_MOE_CACHE_MAP");
-    if (env) {
-        if (strcmp(env, "none") == 0 || strcmp(env, "0") == 0) {
-            return nullptr;
-        }
-        if (env[0]) {
-            return env;
-        }
-    }
-    struct stat st;
-    if (stat("/models", &st) == 0 && S_ISDIR(st.st_mode)) {
-        return "/models/moe-cache-map.csv";
-    }
-    return nullptr;
+    return g_cache && !g_cache->map_path.empty() ? g_cache->map_path.c_str() : nullptr;
 }
 
 void save_cache_map(const moe_cache & mc, const char * path) {
@@ -361,7 +354,7 @@ void moe_cache_atexit() {
 
 } // namespace
 
-void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t max_inserts) {
+void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t max_inserts, const char * map_path) {
     std::lock_guard<std::mutex> init_lock(g_init_mtx);
     if (g_init_done) {
         return;
@@ -374,6 +367,9 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
 
         auto * mc = new moe_cache();
         mc->n_slots = n_slots;
+        if (map_path && map_path[0]) {
+            mc->map_path = map_path;
+        }
         if (max_inserts > 0) {
             mc->max_inserts = max_inserts;
         }
@@ -508,9 +504,9 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
                     ls.pub.il, ls.pub.up_src->name, ls.pub.up_src->nb[2]);
         }
 
-        const char * map_path = get_moe_cache_map_path();
-        if (map_path) {
-            load_cache_map(*mc, map_path);
+        // not get_moe_cache_map_path(): that reads g_cache, which is only published below
+        if (!mc->map_path.empty()) {
+            load_cache_map(*mc, mc->map_path.c_str());
         }
         std::atexit(moe_cache_atexit);
 
@@ -688,12 +684,5 @@ void llama_moe_cache_step() {
 
         LLAMA_LOG_WARN("moe-cache: steps=%" PRIu64 " win_hit=%.1f%% (%" PRIu64 "/%" PRIu64 ") total_hit=%.1f%% (%" PRIu64 "/%" PRIu64 ") ins=%" PRIu64 " evict=%" PRIu64 "\n",
                 mc->n_steps, win_rate, dh, dh + dm, total_rate, h, h + m, ins, ev);
-
-        if (mc->n_steps % 512 == 0) {
-            const char * map_path = get_moe_cache_map_path();
-            if (map_path) {
-                save_cache_map(*mc, map_path);
-            }
-        }
     }
 }
