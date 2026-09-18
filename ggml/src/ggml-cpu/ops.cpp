@@ -9217,6 +9217,10 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
 
+    // a cell list restricts attention to the cells it names; ignoring it here would attend to the
+    // whole cache and return a plausible wrong answer instead of failing
+    GGML_ASSERT(dst->src[5] == NULL && "sparse flash attention has no CPU implementation");
+
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
     GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)

@@ -537,6 +537,8 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
         int32_t * cur_cell_blk  = dst_cell_blk != nullptr ? dst_cell_blk + s*n_kv : nullptr;
 
+        // blk_cells also feeds a ggml_get_rows over the whole key cache, so every slot has to name
+        // a real cell even when nothing selects it
         std::fill(loc_blk_cells.begin(), loc_blk_cells.end(), 0);
         std::fill(loc_blk_pos.begin(),   loc_blk_pos.end(),   0);
 
@@ -740,14 +742,19 @@ void llama_memory_hybrid_idx::set_input_qsa(
         // read cell 0 r times over, which the per-cell cell_blk expansion never did.
         if (blk_bias && n_dead > 0) {
             GGML_ASSERT(n_bid + n_dead <= n_blocks && "qsa: not enough block slots for unpooled cells");
-            GGML_ASSERT((n_up == n_dead*r || pad >= 0) && "qsa: no empty cell to pad the spare block with");
+            GGML_ASSERT((n_up == n_dead*r || pad >= 0) &&
+                    "qsa: no empty cell to pad the spare block with");
+
+            // an empty cell is -inf in the attention mask, so it pads the tail of a real spare
+            // block harmlessly - and a cell list built from these rows drops it for the same reason
+            const int32_t tail = pad;
 
             for (int64_t d = 0; d < n_dead; ++d) {
                 int32_t * dead_row = &loc_blk_cells[(int64_t) (n_bid + d)*r];
 
                 for (int64_t i = 0; i < r; ++i) {
                     const int64_t idx = d*r + i;
-                    dead_row[i] = idx < n_up ? unpooled_cells[idx] : pad;
+                    dead_row[i] = idx < n_up ? unpooled_cells[idx] : tail;
                 }
             }
         }

@@ -2454,6 +2454,11 @@ struct llama_model_qwen4exp : public llama_model_base {
         // so the layers sharing a ratio share one input set
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
 
+        // [TAG_QSA_DIRECT_IDX] hand the selected cells to flash attention instead of writing them
+        // into a copy of the mask for it to scan back out. Decided once per graph, since every QSA
+        // layer shares the depth that decides it
+        bool qsa_direct_indices = false;
+
         // QSA: token indices this layer's queries may attend to, or nullptr for dense
         ggml_tensor * build_qsa_top_k(
   const llama_memory_hybrid_idx_context * mctx_hyb,

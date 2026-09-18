@@ -646,6 +646,9 @@ public:
 
     // the per-cell half of the bias is the attention mask, so only the per-block half is uploaded
     const bool blk_bias;
+
+    // [TAG_QSA_DIRECT_IDX] the block map's unused rows are padded with -1 rather than cell 0, so a
+    // block the budget picks but the bias masks names no cell instead of naming cell 0 r times
 };
 
 // [TAG_QSA_BLOCK_TOPK] LLAMA_QSA_BLOCK_TOPK=0 restores the per-cell score expansion, so the
@@ -701,6 +704,36 @@ static ggml_tensor * qsa_token_range(ggml_context * ctx, ggml_tensor * t, int64_
     return ggml_reshape_3d(ctx, range, t->ne[0], t->ne[1], n_t*n_stream);
 }
 
+// Off by default: n_kv_max has to bound the finite entries in every mask row, and the base
+// kq_mask can leave more live cells than top_k names. A violation reads too few cells and
+// returns a wrong answer silently - it does not fault.
+static bool qsa_sparse_fa_enabled() {
+    static const bool enabled = []() {
+        const char * requested = getenv("LLAMA_QSA_SPARSE_FA");
+        return requested != nullptr && atoi(requested) != 0;
+    }();
+
+    return enabled;
+}
+
+// [TAG_QSA_DIRECT_IDX] LLAMA_QSA_DIRECT_IDX=0 restores the mask round trip so both can be measured
+static bool qsa_direct_indices_enabled() {
+    static const bool enabled = []() {
+        const char * requested = getenv("LLAMA_QSA_DIRECT_IDX");
+        return requested == nullptr || atoi(requested) != 0;
+    }();
+
+    return enabled;
+}
+
+// Mirrors ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse: shallower than this the backend picks
+// a dense kernel, which reads the mask and ignores any cell list. The selection then has to be
+// written into the mask, or every query would silently attend to the whole cache.
+static bool qsa_direct_indices_apply(int64_t n_kv, int64_t width) {
+    return qsa_sparse_fa_enabled() && qsa_direct_indices_enabled() &&
+        n_kv >= std::max<int64_t>(4096, 2*width);
+}
+
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         const llama_memory_hybrid_idx_context * mctx_hyb,
         ggml_tensor *                           cur,
@@ -731,6 +764,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     const bool blk_bias = qsa_block_top_k_enabled() && kq_mask != nullptr &&
         kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
         cparams.causal_attn && !hparams.use_alibi;
+
+    // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
+    const int64_t sel_width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
+
+    // [TAG_QSA_DIRECT_IDX] one decision for the whole graph: every QSA layer shares n_kv, and the
+    // block map has to know it too, because it changes how unused block rows are padded
+    const bool direct_idx = blk_bias && qsa_direct_indices_apply(n_kv, sel_width);
+    GGML_ASSERT((qsa_inps.empty() || qsa_direct_indices == direct_idx) &&
+            "qsa: layers disagree on the direct-index path");
+    qsa_direct_indices = direct_idx;
 
     // nothing above depends on the layer, so the layers sharing a ratio share one input set
     llm_graph_input_qsa * inp = nullptr;
@@ -893,8 +936,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ext_factor, attn_factor, beta_fast, beta_slow);
     cb(q, "indexer_q", il);
 
-    // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
-    const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
+    const int64_t width = sel_width;
 
     // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
     // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
@@ -1012,18 +1054,6 @@ static bool qsa_gather_enabled() {
     return enabled;
 }
 
-// Off by default: n_kv_max has to bound the finite entries in every mask row, and the base
-// kq_mask can leave more live cells than top_k names. A violation reads too few cells and
-// returns a wrong answer silently - it does not fault.
-static bool qsa_sparse_fa_enabled() {
-    static const bool enabled = []() {
-        const char * requested = getenv("LLAMA_QSA_SPARSE_FA");
-        return requested != nullptr && atoi(requested) != 0;
-    }();
-
-    return enabled;
-}
-
 // One gathered K/V can serve the whole batch only when every query named the same cells, which
 // means one token per stream; with more, each token has its own top_k. It also has to be a real
 // shrink, or the copy costs more than the masked read it replaces. A transposed V cache is laid
@@ -1113,6 +1143,45 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa_masked(
         ggml_tensor * top_k,
         float         kq_scale,
         int           il) {
+    const int64_t n_kv_max = qsa_sparse_fa_enabled() ? top_k->ne[0] : 0;
+    const int64_t n_stream = kq_mask->ne[3];
+    const int64_t n_tps    = kq_mask->ne[1];
+
+    if (qsa_direct_indices) {
+        GGML_ASSERT(qsa_direct_indices_apply(kq_mask->ne[0], top_k->ne[0]) &&
+                "the block map padded for the direct path but the mask says the backend will scan");
+
+        // [TAG_QSA_DIRECT_IDX] top_k already is the cell list flash attention wants, in the layout
+        // it wants, so the mask goes in untouched and nothing has to be filled, scattered or added
+        if (n_stream == 1) {
+            return build_attn_mha(q_cur, k_cache, v_cache, nullptr, kq_mask, nullptr, nullptr,
+                    n_kv_max, kq_scale, il, top_k);
+        }
+
+        ggml_tensor * out_direct = nullptr;
+
+        for (int64_t s = 0; s < n_stream; ++s) {
+            ggml_tensor * q_s = ggml_view_3d(ctx0, q_cur, q_cur->ne[0], q_cur->ne[1], n_tps,
+                    q_cur->nb[1], q_cur->nb[2], s*n_tps*q_cur->nb[2]);
+            ggml_tensor * k_s = ggml_view_4d(ctx0, k_cache, k_cache->ne[0], k_cache->ne[1], k_cache->ne[2], 1,
+                    k_cache->nb[1], k_cache->nb[2], k_cache->nb[3], s*k_cache->nb[3]);
+            ggml_tensor * v_s = ggml_view_4d(ctx0, v_cache, v_cache->ne[0], v_cache->ne[1], v_cache->ne[2], 1,
+                    v_cache->nb[1], v_cache->nb[2], v_cache->nb[3], s*v_cache->nb[3]);
+            ggml_tensor * mask_s = ggml_view_4d(ctx0, kq_mask, kq_mask->ne[0], kq_mask->ne[1], 1, 1,
+                    kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], s*kq_mask->nb[3]);
+            ggml_tensor * idx_s = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], 1, 1,
+                    top_k->nb[1], top_k->nb[2], top_k->nb[3], s*top_k->nb[3]);
+
+            ggml_tensor * out_s = build_attn_mha(q_s, k_s, v_s, nullptr, mask_s, nullptr, nullptr,
+                    n_kv_max, kq_scale, il, idx_s);
+
+            out_direct = out_direct ? ggml_concat(ctx0, out_direct, out_s, 1) : ggml_cont(ctx0, out_s);
+            ggml_build_forward_expand(gf, out_direct);
+        }
+
+        return out_direct;
+    }
+
     // prepare new kq mask - starts filled with -INFINITY
     ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
 
@@ -1138,10 +1207,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa_masked(
 
     // combine with the original kq mask
     kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
-
-    const int64_t n_kv_max = qsa_sparse_fa_enabled() ? top_k->ne[0] : 0;
-    const int64_t n_stream = kq_mask->ne[3];
-    const int64_t n_tps    = kq_mask->ne[1];
 
     if (n_stream == 1) {
         return build_attn_mha(q_cur, k_cache, v_cache, nullptr, kq_mask_top_k, nullptr, nullptr, n_kv_max, kq_scale, il);

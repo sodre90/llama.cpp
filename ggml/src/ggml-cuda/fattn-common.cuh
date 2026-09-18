@@ -721,6 +721,12 @@ static __global__ void flash_attn_mask_to_KV_max(
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t n_kv_max, cudaStream_t stream);
 
+// as above, but the cells to consider come from cand (i32, laid out like indices) rather than
+// from every entry of the mask
+void ggml_cuda_flash_attn_ext_compact_candidates(
+        const ggml_tensor * cand, const ggml_tensor * mask, int32_t * indices, int32_t n_kv_max,
+        cudaStream_t stream);
+
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
@@ -1092,14 +1098,34 @@ void launch_fattn(
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
     const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
 
+    // one pointer serves both roles: the sparse cell list, or the per-tile bound of the dense scan
+    const int * KV_max_ptr = nullptr;
+
     const int32_t n_kv_max = use_sparse ? ggml_get_op_params_i32(KQV, 4) : 0;
     if (use_sparse) {
         GGML_ASSERT(mask != nullptr);
         GGML_ASSERT(n_kv_max > 0);
-        const size_t mask_rows = size_t(mask->ne[1]) * mask->ne[3];
 
-        KV_max.alloc(size_t(n_kv_max) * mask_rows);
-        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, n_kv_max, main_stream);
+        // a caller that already knows the candidate cells hands them over, so the scan reads one
+        // mask entry per candidate instead of one per cache cell - and no copy of the mask has to
+        // be written to carry the selection in the first place
+        if (const ggml_tensor * cand = KQV->src[5]) {
+            GGML_ASSERT(cand->type == GGML_TYPE_I32);
+            GGML_ASSERT(cand->ne[0] == n_kv_max);
+            GGML_ASSERT(cand->ne[1] == mask->ne[1] && cand->ne[3] == mask->ne[3]);
+
+            const size_t mask_rows = size_t(mask->ne[1]) * mask->ne[3];
+
+            KV_max.alloc(size_t(n_kv_max) * mask_rows);
+            ggml_cuda_flash_attn_ext_compact_candidates(cand, mask, KV_max.ptr, n_kv_max, main_stream);
+            KV_max_ptr = KV_max.ptr;
+        } else {
+            const size_t mask_rows = size_t(mask->ne[1]) * mask->ne[3];
+
+            KV_max.alloc(size_t(n_kv_max) * mask_rows);
+            ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, n_kv_max, main_stream);
+            KV_max_ptr = KV_max.ptr;
+        }
     }
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
@@ -1120,6 +1146,7 @@ void launch_fattn(
         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
             (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
         CUDA_CHECK(cudaGetLastError());
+        KV_max_ptr = KV_max.ptr;
     }
 
     const dim3 block_dim(warp_size, nwarps, 1);
@@ -1238,7 +1265,7 @@ void launch_fattn(
         V_data,
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
-        KV_max.ptr,
+        KV_max_ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
