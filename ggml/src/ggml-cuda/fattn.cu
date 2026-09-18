@@ -253,6 +253,12 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
+    // [TAG_QSA_DIRECT_IDX] past this point every instantiation reads the mask and nothing else, so
+    // a cell list that arrives here would be dropped without a trace and the query would attend to
+    // the whole cache. The top-level check catches a wrong kernel; this catches a wrong tiling.
+    GGML_ASSERT(dst->src[5] == nullptr &&
+        "flash attention reached a dense tiling with a sparse cell list attached");
+
     if constexpr (ncols2 <= 8) {
         if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
@@ -718,7 +724,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
-    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    // [TAG_QSA_DIRECT_IDX] only the MMA kernel reads a cell list, and a few tokens in a stream is
+    // exactly when the vector kernel would otherwise win - so a caller that attached one would get
+    // its selection dropped. Naming the cells is a correctness request, not a hint, so it decides
+    // the kernel rather than being checked against it afterwards.
+    const bool can_use_vector_kernel = dst->src[5] == nullptr &&
+        Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
