@@ -2517,6 +2517,16 @@ extern "C" {
             struct ggml_tensor * a,
             int32_t              n_kv_max);
 
+    // Name the candidate K/V cells outright instead of letting the backend recover them from the
+    // mask: i32 [n_kv_max, n_batch, 1, n_seq], one row of candidates per query row, negative
+    // entries ignored. The mask still decides which candidates count, so this does not change the
+    // result - it saves the backend a scan of every mask entry, and saves a caller that already
+    // has the set from having to write it into a copy of the mask for the backend to read back.
+    // Requires n_kv_max set to the row length.
+    GGML_API void ggml_flash_attn_ext_set_sparse_candidates(
+            struct ggml_tensor * a,
+            struct ggml_tensor * indices);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
