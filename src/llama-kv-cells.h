@@ -50,8 +50,7 @@ public:
         used.clear();
 
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
-            seq_pos [s].clear();
-            seq_used[s].clear();
+            seq_pos[s].clear();
         }
     }
 
@@ -97,16 +96,6 @@ public:
     // return 0 if no cells are used
     uint32_t used_max_p1() const {
         return used.empty() ? 0 : *used.rbegin() + 1;
-    }
-
-    // the per-sequence counterpart of used_max_p1(): the index of the last cell carrying seq_id + 1
-    // return 0 if the sequence is not present
-    uint32_t seq_used_max_p1(llama_seq_id seq_id) const {
-        if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ) {
-            return 0;
-        }
-
-        return seq_used[seq_id].empty() ? 0 : *seq_used[seq_id].rbegin() + 1;
     }
 
     bool get_has_shift() const {
@@ -534,26 +523,16 @@ private:
     //
     std::set<std::pair<llama_pos, uint32_t>> seq_pos[LLAMA_MAX_SEQ];
 
-    // the set seq_used[s] holds the index of every cell carrying sequence s, ordered by index -
-    // the per-sequence counterpart of `used`, so seq_used[s].rbegin() gives that sequence's own
-    // high-water cell. A unified cache puts every sequence in one stream, where `used` alone
-    // cannot tell a shallow sequence's extent from a deep neighbour's. Keyed on the cell index
-    // only, so a position change does not move an entry.
-    std::set<uint32_t> seq_used[LLAMA_MAX_SEQ];
-
-    // helper functions for updating `seq_pos` and `seq_used`, once cell at a time:
+    // helper functions for updating `seq_pos`, once cell at a time:
 
     void seq_pos_dec(llama_seq_id s, uint32_t i) {
         const auto n = seq_pos[s].erase({ pos[i], i });
         assert(n == 1);
         GGML_UNUSED(n);
-
-        seq_used[s].erase(i);
     }
 
     void seq_pos_inc(llama_seq_id s, uint32_t i) {
-        seq_pos [s].insert({ pos[i], i });
-        seq_used[s].insert(i);
+        seq_pos[s].insert({ pos[i], i });
     }
 
     // remove cell i

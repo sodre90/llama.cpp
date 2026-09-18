@@ -556,8 +556,13 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
         const bool one_seq = n_seq_present <= 1;
 
-        // a cell no block covers needs its own -inf, which a per-block bias cannot carry
-        // every cache path keeps the position below the cell window, so this stays false
+        // a cell no block covers needs its own -inf, which a per-block bias cannot carry.
+        // This stays false only while n_kv bounds every cell INDEX in the stream: the scan below
+        // walks [0, n_kv) without filtering by sequence, buckets each cell by its POSITION, and a
+        // sequence of T tokens holds T cells, so pos <= T-1 < used_max_p1 <= n_kv for all of them.
+        // Bounding n_kv by the ubatch's own sequences breaks that - an idle neighbour whose cells
+        // wrapped to low indices keeps its high positions and runs past n_blocks. Measured: that is
+        // what aborted production on 2026-09-18.
         bool oor = false;
 
         bool dup = false;
