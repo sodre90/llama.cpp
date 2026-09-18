@@ -64,6 +64,13 @@ struct moe_cache {
     std::vector<layer_state> layers;
     std::map<const ggml_tensor *, size_t> by_up_src;
 
+    // any of the three host weights -> its layer and the cache tensor holding its rows
+    struct cached_rows {
+        size_t layer_idx;
+        ggml_tensor * llama_moe_cache_layer::* rows;
+    };
+    std::map<const ggml_tensor *, cached_rows> by_src;
+
     std::vector<ggml_context *>         ctxs;
     std::vector<ggml_backend_buffer_t>  bufs;
 
@@ -493,6 +500,9 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
             ggml_backend_tensor_set(ls.pub.host_table, dummy.data(), 0, n_expert*sizeof(int32_t));
 
             mc->by_up_src[ls.pub.up_src] = &ls - mc->layers.data();
+            mc->by_src[ls.pub.up_src]   = {(size_t) (&ls - mc->layers.data()), &llama_moe_cache_layer::up_c};
+            mc->by_src[ls.pub.gate_src] = {(size_t) (&ls - mc->layers.data()), &llama_moe_cache_layer::gate_c};
+            mc->by_src[ls.pub.down_src] = {(size_t) (&ls - mc->layers.data()), &llama_moe_cache_layer::down_c};
             vram += ggml_nbytes(ls.pub.up_c) + ggml_nbytes(ls.pub.gate_c) + ggml_nbytes(ls.pub.down_c);
             LLAMA_LOG_DEBUG("moe-cache: init layer %d '%s' %zu bytes/expert\n",
                     ls.pub.il, ls.pub.up_src->name, ls.pub.up_src->nb[2]);
@@ -567,6 +577,25 @@ const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * up_exps
         return nullptr;
     }
     return &g_cache->layers[it->second].pub;
+}
+
+bool llama_moe_cache_expert_rows(const ggml_tensor * weight, const ggml_tensor ** rows, const int32_t ** expert_slot, int32_t * n_slots, void * /*user_data*/) {
+    moe_cache * mc = g_cache;
+    if (!mc) {
+        return false;
+    }
+    auto it = mc->by_src.find(weight);
+    if (it == mc->by_src.end()) {
+        return false;
+    }
+    const llama_moe_cache_layer & pub = mc->layers[it->second.layer_idx].pub;
+    if (!pub.host_table || !pub.host_table->data) {
+        return false;
+    }
+    *rows        = pub.*(it->second.rows);
+    *expert_slot = (const int32_t *) pub.host_table->data;
+    *n_slots     = pub.n_slots;
+    return *rows != nullptr;
 }
 
 void llama_moe_cache_step() {
