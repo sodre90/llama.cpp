@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -942,6 +943,16 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+struct ggml_backend_sched_split_profile {
+    struct split_acc {
+        int64_t n_graphs = 0;
+        std::vector<int64_t> t_inputs_us;   // from the start of the split to the compute launch
+        std::vector<int64_t> t_compute_us;  // the compute launch (the whole compute on a synchronous backend)
+        std::vector<std::string> label;     // "backend nodes=N inputs=M first..last"
+    };
+    std::unordered_map<int, split_acc> by_n_splits;
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -1013,6 +1024,10 @@ struct ggml_backend_sched {
     void * expert_rows_user_data;
     bool expert_rows_d2d;
     bool expert_copy_stats;
+
+    // GGML_SCHED_SPLIT_STATS=1: per-split wall time (input copies and syncs vs compute launch),
+    // accumulated over graphs with the same split count and logged every 256 of them
+    struct ggml_backend_sched_split_profile * split_profile;
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -1988,6 +2003,52 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
     }
     return true;
 }
+
+static std::string ggml_backend_sched_split_label(ggml_backend_sched_t sched, const struct ggml_backend_sched_split * split) {
+    const struct ggml_tensor * first = split->graph.n_nodes > 0 ? split->graph.nodes[0] : NULL;
+    const struct ggml_tensor * last  = split->graph.n_nodes > 0 ? split->graph.nodes[split->graph.n_nodes - 1] : NULL;
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%-8s nodes=%4d inputs=%2d  %s(%s) .. %s(%s)",
+            ggml_backend_name(sched->backends[split->backend_id]), split->graph.n_nodes, split->n_inputs,
+            first ? ggml_op_desc(first) : "-", first ? first->name : "-",
+            last  ? ggml_op_desc(last)  : "-", last  ? last->name  : "-");
+    return buf;
+}
+
+// per-split wall time, keyed by the split count so decode and prefill graphs do not mix
+static void ggml_backend_sched_split_profile_add(ggml_backend_sched_t sched,
+        const std::vector<int64_t> & t_inputs, const std::vector<int64_t> & t_compute) {
+    auto & acc = sched->split_profile->by_n_splits[sched->n_splits];
+    if (acc.n_graphs == 0) {
+        acc.t_inputs_us.assign(sched->n_splits, 0);
+        acc.t_compute_us.assign(sched->n_splits, 0);
+        acc.label.resize(sched->n_splits);
+        for (int i = 0; i < sched->n_splits; i++) {
+            acc.label[i] = ggml_backend_sched_split_label(sched, &sched->splits[i]);
+        }
+    }
+    for (int i = 0; i < sched->n_splits; i++) {
+        acc.t_inputs_us[i]  += t_inputs[i];
+        acc.t_compute_us[i] += t_compute[i];
+    }
+    acc.n_graphs++;
+    if (acc.n_graphs % 256 != 0) {
+        return;
+    }
+    const double n = (double) acc.n_graphs;
+    double total_inputs = 0, total_compute = 0;
+    for (int i = 0; i < sched->n_splits; i++) {
+        total_inputs  += acc.t_inputs_us[i];
+        total_compute += acc.t_compute_us[i];
+    }
+    GGML_LOG_WARN("sched split profile: %d splits, %lld graphs, per graph: inputs %.2f ms, compute %.2f ms\n",
+            sched->n_splits, (long long) acc.n_graphs, total_inputs/n/1000.0, total_compute/n/1000.0);
+    for (int i = 0; i < sched->n_splits; i++) {
+        GGML_LOG_WARN("  split %3d: inputs %7.1f us  compute %7.1f us  %s\n", i,
+                acc.t_inputs_us[i]/n, acc.t_compute_us[i]/n, acc.label[i].c_str());
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -2063,10 +2124,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     }
 
+    std::vector<int64_t> prof_t_inputs;
+    std::vector<int64_t> prof_t_compute;
+    if (sched->split_profile) {
+        prof_t_inputs.resize(sched->n_splits);
+        prof_t_compute.resize(sched->n_splits);
+    }
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const int64_t prof_t0 = sched->split_profile ? ggml_time_us() : 0;
 
         // mindcontrol-port: per-split prefetch state, consumed when this split was the
         // target of a lookahead fire
@@ -2159,7 +2228,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     last_prefetch_split_backend = split_backend;
                 }
             }
+            const int64_t prof_t1 = sched->split_profile ? ggml_time_us() : 0;
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if (sched->split_profile) {
+                prof_t_inputs[split_id]  = prof_t1 - prof_t0;
+                prof_t_compute[split_id] = ggml_time_us() - prof_t1;
+            }
             if (split_prefetch_slot != -1) {
                 // the kernels have captured the slot address at launch, safe to restore
                 ggml_backend_event_record(sched->prefetch_free[split_prefetch_slot], split_backend);
@@ -2230,6 +2304,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 stat_tensors, 100.0*stat_used/stat_experts, stat_used > 0 ? 100.0*stat_resident/stat_used : 0.0, stat_bytes_host/1024.0/1024.0);
     }
 
+    if (sched->split_profile) {
+        ggml_backend_sched_split_profile_add(sched, prof_t_inputs, prof_t_compute);
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
@@ -2273,6 +2351,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->expert_rows_d2d = GGML_SCHED_EXPERT_CACHE_D2D ? atoi(GGML_SCHED_EXPERT_CACHE_D2D) != 0 : true;
     const char * GGML_SCHED_EXPERT_COPY_STATS = getenv("GGML_SCHED_EXPERT_COPY_STATS");
     sched->expert_copy_stats = GGML_SCHED_EXPERT_COPY_STATS ? atoi(GGML_SCHED_EXPERT_COPY_STATS) != 0 : false;
+    const char * GGML_SCHED_SPLIT_STATS = getenv("GGML_SCHED_SPLIT_STATS");
+    sched->split_profile = GGML_SCHED_SPLIT_STATS && atoi(GGML_SCHED_SPLIT_STATS) != 0 ? new ggml_backend_sched_split_profile() : NULL;
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
@@ -2376,6 +2456,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->context_buffer);
     free(sched->graph.nodes);
     free(sched->graph.leafs);
+    delete sched->split_profile;
     free(sched);
 }
 
