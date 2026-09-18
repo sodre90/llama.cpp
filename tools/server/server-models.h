@@ -305,12 +305,17 @@ public:
     // raw input must starts with CMD_CHILD_TO_ROUTER_STATE, followed by a JSON string
     // called from the monitor thread
     // payload per state:
-    //     state = loading     -> payload = {} (TODO: add progress info)
+    //     state = loading     -> payload = {stages, current, value}
     //     state = ready       -> payload = model_info (json), or {} if wakeup from sleeping
     //     state = sleeping    -> payload = {}
     void handle_child_state(const std::string & name, const std::string & raw_input);
 
 private:
+    static constexpr int LOAD_PROGRESS_LOG_STEP = 5; // percent between load progress log lines
+
+    // stage and next percentage to log, per model; only the monitor thread touches it
+    std::map<std::string, std::pair<std::string, int>> load_progress;
+
     // one thread watching every child; keep last, the destructor joins the thread
     std::unique_ptr<server_monitor> monitor;
 };
