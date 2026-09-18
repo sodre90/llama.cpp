@@ -117,6 +117,12 @@ extern "C" {
     // automatic fallback to sync copy if async is not supported
     GGML_API void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
 
+    // asynchronous copy of a byte range from one tensor into another, both resident on this backend.
+    // Unlike ggml_backend_tensor_copy_async the two tensors need no common shape: the range is raw
+    // bytes, so a caller that knows the layout can move single rows. No fallback - returns false when
+    // the backend cannot do it, leaving dst untouched.
+    GGML_API bool ggml_backend_tensor_copy_range_async(ggml_backend_t backend, const struct ggml_tensor * src, size_t src_offset, struct ggml_tensor * dst, size_t dst_offset, size_t size);
+
     GGML_API ggml_backend_dev_t ggml_backend_get_device(ggml_backend_t backend);
 
     //
@@ -363,6 +369,15 @@ extern "C" {
     //   slots >= 2  -> prefetch enabled with 1-deep lookahead and per-split cross-stream wait;
     //                  GPU staging cost = slots * max_expert_tensor. Capped at GGML_SCHED_MAX_PREFETCH_SLOTS.
     GGML_API void                 ggml_backend_sched_set_prefetch_experts_slots(ggml_backend_sched_t sched, int slots);
+
+    // Device-resident copies of individual expert rows of a host-resident MUL_MAT_ID weight (an expert
+    // cache kept for decode). When set, the scheduler's used-experts upload fills those rows
+    // device-to-device instead of over the host link. `rows` has the weight's type and row layout with
+    // ne[2] >= n_slots; `expert_slot[e]` is the row index in `rows` holding expert e, or >= n_slots when
+    // expert e is not resident. Return false when the weight has no resident rows. The table must stay
+    // valid and unchanged for the whole graph compute.
+    typedef bool (*ggml_backend_sched_expert_rows_fn)(const struct ggml_tensor * weight, const struct ggml_tensor ** rows, const int32_t ** expert_slot, int32_t * n_slots, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_expert_rows_callback(ggml_backend_sched_t sched, ggml_backend_sched_expert_rows_fn fn, void * user_data);
 
     //
     // Meta backend

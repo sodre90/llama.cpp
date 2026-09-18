@@ -669,6 +669,21 @@ void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t b
     ggml_backend_tensor_copy(src, dst);
 }
 
+bool ggml_backend_tensor_copy_range_async(ggml_backend_t backend, const struct ggml_tensor * src, size_t src_offset, struct ggml_tensor * dst, size_t dst_offset, size_t size) {
+    GGML_ASSERT(backend);
+    GGML_ASSERT(src);
+    GGML_ASSERT(dst);
+    GGML_ASSERT(src->data != NULL && dst->data != NULL && "tensor not allocated");
+    GGML_ASSERT(src_offset + size <= ggml_nbytes(src) && "tensor read out of bounds");
+    GGML_ASSERT(dst_offset + size <= ggml_nbytes(dst) && "tensor write out of bounds");
+
+    if (backend->iface.cpy_range_async == NULL) {
+        return false;
+    }
+
+    return backend->iface.cpy_range_async(backend, src, src_offset, dst, dst_offset, size);
+}
+
 // events
 
 ggml_backend_event_t ggml_backend_event_new(ggml_backend_dev_t device) {
@@ -987,6 +1002,14 @@ struct ggml_backend_sched {
     ggml_backend_event_t  prefetch_free [GGML_SCHED_MAX_PREFETCH_SLOTS];
     bool prefetch_used[GGML_SCHED_MAX_PREFETCH_SLOTS];
     int prefetch_cur;
+
+    // expert rows already resident on the device (see ggml_backend_sched_set_expert_rows_callback):
+    // the used-experts upload fills them device-to-device. GGML_SCHED_EXPERT_CACHE_D2D=0 disables the
+    // device fill, GGML_SCHED_EXPERT_COPY_STATS=1 logs per-graph upload counts.
+    ggml_backend_sched_expert_rows_fn expert_rows_fn;
+    void * expert_rows_user_data;
+    bool expert_rows_d2d;
+    bool expert_copy_stats;
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -1913,6 +1936,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
+    std::vector<ggml_bitset_t> host_ids; // used experts that are not resident on the device
+
+    int     stat_tensors    = 0;
+    int64_t stat_experts    = 0;
+    int64_t stat_used       = 0;
+    int64_t stat_resident   = 0;
+    size_t  stat_bytes_host = 0;
 
     int prev_backend_id = -1;
 
@@ -2136,11 +2166,55 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         prev_ids_tensor = ids_tensor;
                     }
 
+                    // experts the model already keeps on this device (its decode-time expert cache) are
+                    // filled from those rows; only the experts left in host_ids cross the host link
+                    const ggml_tensor * cache_rows    = NULL;
+                    const int32_t     * expert_slot   = NULL;
+                    int32_t             n_cache_slots = 0;
+                    const bool device_rows = sched->expert_rows_d2d && sched->expert_rows_fn && node->op == GGML_OP_MUL_MAT_ID &&
+                        sched->expert_rows_fn(input, &cache_rows, &expert_slot, &n_cache_slots, sched->expert_rows_user_data) &&
+                        cache_rows && cache_rows->data && expert_slot && n_cache_slots > 0 &&
+                        // a slot must hold exactly the bytes that expert occupies in the weight
+                        cache_rows->type == input->type && cache_rows->ne[0] == input->ne[0] && cache_rows->ne[1] == input->ne[1] &&
+                        cache_rows->nb[1] == input->nb[1] && cache_rows->nb[2] == expert_size && cache_rows->ne[2] >= n_cache_slots;
+
+                    const size_t padding = std::min<size_t>(expert_size, 512);
+
+                    host_ids.assign(used_ids.begin(), used_ids.end());
+                    int32_t n_used     = 0;
+                    int32_t n_resident = 0;
+                    for (int32_t id = 0; id < n_expert; ++id) {
+                        if (!ggml_bitset_get(used_ids.data(), id)) {
+                            continue;
+                        }
+                        n_used++;
+
+                        const int32_t slot = device_rows ? expert_slot[id] : -1;
+                        if (slot < 0 || slot >= n_cache_slots) {
+                            continue;
+                        }
+
+                        // a backend that cannot copy between these two tensors leaves the expert on the host path
+                        if (!ggml_backend_tensor_copy_range_async(split_backend,
+                                cache_rows, (size_t) slot*expert_size, input_cpy, (size_t) id*expert_size, expert_size)) {
+                            continue;
+                        }
+
+                        ggml_bitset_clear(host_ids.data(), id);
+                        n_resident++;
+
+                        // MMQ reads a little past a row, so when no other copy writes the next expert,
+                        // give it real bytes rather than whatever the padding holds
+                        if (id + 1 < n_expert && !ggml_bitset_get(used_ids.data(), id + 1)) {
+                            ggml_backend_tensor_set_async(split_backend, input_cpy,
+                                (const uint8_t *) input->data + (size_t) (id + 1)*expert_size, (size_t) (id + 1)*expert_size, padding);
+                        }
+                    }
+
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                         const size_t expert_offset = first_id * expert_size;
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
-                        const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 
                         ggml_backend_tensor_set_async(split_backend,
@@ -2149,31 +2223,39 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
                             // this is necessary for MMQ in the CUDA backend
                             expert_size_copy + padding_end);
+                        stat_bytes_host += expert_size_copy;
                     };
 
                     int id = 0;
-                    while (!ggml_bitset_get(used_ids.data(), id)) {
+                    while (id < n_expert && !ggml_bitset_get(host_ids.data(), id)) {
                         id++;
                     }
-                    int32_t first_id = id;
-                    int32_t last_id = first_id;
+                    if (id < n_expert) {
+                        int32_t first_id = id;
+                        int32_t last_id = first_id;
 
-                    for (++id; id < n_expert; ++id) {
-                        if (!ggml_bitset_get(used_ids.data(), id)) {
-                            continue;
-                        }
+                        for (++id; id < n_expert; ++id) {
+                            if (!ggml_bitset_get(host_ids.data(), id)) {
+                                continue;
+                            }
 
-                        if (id == last_id + 1) {
+                            if (id == last_id + 1) {
+                                last_id = id;
+                                continue;
+                            }
+
+                            copy_experts(first_id, last_id);
+
+                            first_id = id;
                             last_id = id;
-                            continue;
                         }
-
                         copy_experts(first_id, last_id);
-
-                        first_id = id;
-                        last_id = id;
                     }
-                    copy_experts(first_id, last_id);
+
+                    stat_tensors++;
+                    stat_used     += n_used;
+                    stat_resident += n_resident;
+                    stat_experts  += n_expert;
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
@@ -2282,6 +2364,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     }
 
+    if (sched->expert_copy_stats && stat_tensors > 0) {
+        GGML_LOG_WARN("sched expert upload: %d weight tensors, %.1f%% of experts used, %.1f%% of the used rows device-filled, %.1f MiB over the host link\n",
+                stat_tensors, 100.0*stat_used/stat_experts, stat_used > 0 ? 100.0*stat_resident/stat_used : 0.0, stat_bytes_host/1024.0/1024.0);
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
@@ -2318,6 +2405,13 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->prefetch_wait_mode = 0;
     sched->prefetch_n_slots   = 2;
     sched->prefetch_cur       = 0;
+
+    sched->expert_rows_fn        = NULL;
+    sched->expert_rows_user_data = NULL;
+    const char * GGML_SCHED_EXPERT_CACHE_D2D = getenv("GGML_SCHED_EXPERT_CACHE_D2D");
+    sched->expert_rows_d2d = GGML_SCHED_EXPERT_CACHE_D2D ? atoi(GGML_SCHED_EXPERT_CACHE_D2D) != 0 : true;
+    const char * GGML_SCHED_EXPERT_COPY_STATS = getenv("GGML_SCHED_EXPERT_COPY_STATS");
+    sched->expert_copy_stats = GGML_SCHED_EXPERT_COPY_STATS ? atoi(GGML_SCHED_EXPERT_COPY_STATS) != 0 : false;
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
@@ -2379,6 +2473,12 @@ void ggml_backend_sched_set_prefetch_experts_slots(ggml_backend_sched_t sched, i
     sched->prefetch_n_slots   = slots;
     sched->prefetch_lookahead = 1; // measured-optimal (mindcontrol prefetch-wait A/B verdict)
     sched->prefetch_wait_mode = 1; // per-split wait: only mode that preserves tool_calls
+}
+
+void ggml_backend_sched_set_expert_rows_callback(ggml_backend_sched_t sched, ggml_backend_sched_expert_rows_fn fn, void * user_data) {
+    if (sched == NULL) { return; }
+    sched->expert_rows_fn        = fn;
+    sched->expert_rows_user_data = user_data;
 }
 
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {

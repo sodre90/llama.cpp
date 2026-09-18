@@ -62,5 +62,10 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
 // nullptr when the cache is disabled or this tensor has no cached layer
 const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * up_exps);
 
+// ggml_backend_sched_expert_rows_fn over the cache: lets the scheduler's prefill upload of a
+// host-resident up/gate/down weight fill the resident experts from their slots instead of over the
+// host link. The table it hands out only changes in llama_moe_cache_step(), between graphs.
+bool llama_moe_cache_expert_rows(const ggml_tensor * weight, const ggml_tensor ** rows, const int32_t ** expert_slot, int32_t * n_slots, void * user_data);
+
 // apply throttled LRU updates; call between graph executions only
 void llama_moe_cache_step();
