@@ -659,6 +659,48 @@ static bool qsa_block_top_k_enabled() {
     return enabled;
 }
 
+// [TAG_QSA_TOKEN_CHUNKS] the indexer score is an [n_blocks, n_tokens] tensor and its top-k
+// selection works on it, so that workspace grows with the ubatch: at 180k context it, not the KV
+// cache, is what caps the ubatch. Scoring a chunk of tokens at a time keeps the peak at one
+// chunk - chunk c's buffers are dead before chunk c+1 allocates, so the graph allocator reuses
+// them. Decode ubatches fit in one chunk and are untouched.
+// The attention itself stays one op per layer: on CUDA every flash-attention op with a quantized
+// KV cache reserves an f16 copy of the whole K and V it can see (704 MiB per op at 180k context),
+// so splitting it multiplies that constant and re-converts the cache once per chunk.
+// LLAMA_QSA_CHUNK=N sets the chunk length, 0 restores the whole-ubatch path.
+static int64_t qsa_token_chunk() {
+    static const int64_t chunk = []() {
+        const char * requested = getenv("LLAMA_QSA_CHUNK");
+        return requested == nullptr ? (int64_t) 128 : (int64_t) atoi(requested);
+    }();
+
+    return chunk;
+}
+
+// the chunk is a budget of ubatch tokens; every stream of the ubatch contributes an equal share
+static bool qsa_chunk_tokens(int64_t n_stream, int64_t n_tps) {
+    const int64_t chunk = qsa_token_chunk();
+
+    return chunk > 0 && n_tps*n_stream > chunk;
+}
+
+static int64_t qsa_chunk_per_stream(int64_t n_stream) {
+    return std::max<int64_t>(1, qsa_token_chunk()/n_stream);
+}
+
+// tokens [t0, t0 + n_t) of every stream of a stream-major [ne0, ne1, n_tps*n_stream] tensor,
+// returned as [ne0, ne1, n_t*n_stream]; with several streams the range is strided, so it is copied
+static ggml_tensor * qsa_token_range(ggml_context * ctx, ggml_tensor * t, int64_t n_stream, int64_t n_tps, int64_t t0, int64_t n_t) {
+    ggml_tensor * range = ggml_view_4d(ctx, t, t->ne[0], t->ne[1], n_t, n_stream,
+            t->nb[1], t->nb[2], n_tps*t->nb[2], t0*t->nb[2]);
+
+    if (!ggml_is_contiguous(range)) {
+        range = ggml_cont(ctx, range);
+    }
+
+    return ggml_reshape_3d(ctx, range, t->ne[0], t->ne[1], n_t*n_stream);
+}
+
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         const llama_memory_hybrid_idx_context * mctx_hyb,
         ggml_tensor *                           cur,
@@ -851,61 +893,101 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ext_factor, attn_factor, beta_fast, beta_slow);
     cb(q, "indexer_q", il);
 
-    // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
-    // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
-    ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
-            ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream));
-    score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
-    score = ggml_relu(ctx0, score);
-
-    // the heads sit side by side on ne[1] and there are only a few of them
-    ggml_tensor * summed = nullptr;
-    for (int64_t h = 0; h < n_idx_h; ++h) {
-        ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_tps, n_stream,
-                score->nb[2], score->nb[3], h*score->nb[1]);
-        summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
-    }
-
-    score = summed;
-    cb(score, "indexer_score", il);
-
     // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
     const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
 
-    if (blk_bias) {
-        // one value per block, so it is cheaper to bias here than after the cells are expanded
-        score = ggml_add(ctx0, score, inp->bias);
+    // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
+    // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
+    // q_t holds n_t tokens per stream: [idx_dim, n_idx_h, n_t*n_stream], contiguous
+    auto score_blocks = [&](ggml_tensor * q_t, int64_t n_t) {
+        ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
+                ggml_reshape_3d(ctx0, q_t, idx_dim, n_idx_h*n_t, n_stream));
+        score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_t, n_stream);
+        score = ggml_relu(ctx0, score);
 
-        // the budget is whole blocks: select top-k at block level
+        // the heads sit side by side on ne[1] and there are only a few of them
+        ggml_tensor * summed = nullptr;
+        for (int64_t h = 0; h < n_idx_h; ++h) {
+            ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_t, n_stream,
+                    score->nb[2], score->nb[3], h*score->nb[1]);
+            summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+        }
+
+        cb(summed, "indexer_score", il);
+        return summed;
+    };
+
+    // the budget is whole blocks: select top-k at block level, then expand the winners to cells
+    // score_t: [n_blocks, n_t, n_stream], bias_t: [n_blocks, n_t, n_stream] -> [width, n_t, 1, n_stream]
+    auto select_top_blocks = [&](ggml_tensor * score_t, ggml_tensor * bias_t, ggml_tensor * cells, int64_t n_t) {
+        // one value per block, so it is cheaper to bias here than after the cells are expanded
+        ggml_tensor * score = ggml_add(ctx0, score_t, bias_t);
+
         const int64_t n_top_blocks = std::min<int64_t>(n_blocks, (width + r - 1)/r);
 
-        // top-k directly on block scores: [n_blocks, n_tps, n_stream] -> [n_top_blocks, n_tps, n_stream, 1]
+        // top-k directly on block scores: [n_blocks, n_t, n_stream] -> [n_top_blocks, n_t, n_stream, 1]
         ggml_tensor * top_blocks = ggml_cont(ctx0, ggml_top_k(ctx0, score, n_top_blocks));
 
         // view blk_cells as 3D tensor: [r, n_blocks, n_stream]
-        ggml_tensor * blk_cells_3d = ggml_view_3d(ctx0, inp->blk_cells,
+        ggml_tensor * blk_cells_3d = ggml_view_3d(ctx0, cells,
                 r, n_blocks, n_stream,
                 r*sizeof(int32_t), r*n_blocks*sizeof(int32_t), 0);
 
-        // reshape top_blocks to [n_top_blocks*n_tps, n_stream, 1, 1] to match ggml_get_rows batching
-        ggml_tensor * top_blocks_reshaped = ggml_reshape_2d(ctx0, top_blocks, n_top_blocks*n_tps, n_stream);
+        // reshape top_blocks to [n_top_blocks*n_t, n_stream, 1, 1] to match ggml_get_rows batching
+        ggml_tensor * top_blocks_reshaped = ggml_reshape_2d(ctx0, top_blocks, n_top_blocks*n_t, n_stream);
 
-        // ggml_get_rows gathers cell indices: [r, n_top_blocks*n_tps, n_stream, 1]
+        // ggml_get_rows gathers cell indices: [r, n_top_blocks*n_t, n_stream, 1]
         ggml_tensor * top_cells = ggml_get_rows(ctx0, blk_cells_3d, top_blocks_reshaped);
 
-        // reshape to [r*n_top_blocks, n_tps, 1, n_stream]
+        // reshape to [r*n_top_blocks, n_t, 1, n_stream]
         const int64_t total_top_cells = r*n_top_blocks;
-        ggml_tensor * top_k = ggml_reshape_4d(ctx0, top_cells, total_top_cells, n_tps, 1, n_stream);
+        ggml_tensor * top_k = ggml_reshape_4d(ctx0, top_cells, total_top_cells, n_t, 1, n_stream);
 
         // truncate to width if total_top_cells exceeds width
         if (total_top_cells > width) {
-            top_k = ggml_cont(ctx0, ggml_view_4d(ctx0, top_k, width, n_tps, 1, n_stream,
+            top_k = ggml_cont(ctx0, ggml_view_4d(ctx0, top_k, width, n_t, 1, n_stream,
                     top_k->nb[1], top_k->nb[2], top_k->nb[3], 0));
+        }
+
+        return top_k;
+    };
+
+    if (blk_bias) {
+        ggml_tensor * top_k = nullptr;
+
+        if (qsa_chunk_tokens(n_stream, n_tps)) {
+            // [TAG_QSA_TOKEN_CHUNKS] score a token range of every stream at a time; the chunks'
+            // selections concatenate back along the token axis, which keeps the stream axis intact
+            const int64_t chunk = qsa_chunk_per_stream(n_stream);
+
+            // graph inputs belong to the CPU backend and the scheduler uploads every view of one
+            // to the device as a separate copy: one device copy per layer, sliced on the device
+            ggml_tensor * bias_dev  = ggml_cont(ctx0, inp->bias);
+            ggml_tensor * cells_dev = ggml_cont(ctx0, inp->blk_cells);
+
+            for (int64_t t0 = 0; t0 < n_tps; t0 += chunk) {
+                const int64_t n_t = std::min(chunk, n_tps - t0);
+
+                ggml_tensor * q_t = qsa_token_range(ctx0, q, n_stream, n_tps, t0, n_t);
+                ggml_tensor * bias_t = ggml_view_3d(ctx0, bias_dev, n_blocks, n_t, n_stream,
+                        bias_dev->nb[1], bias_dev->nb[2], t0*bias_dev->nb[1]);
+
+                ggml_tensor * top_k_t = select_top_blocks(score_blocks(q_t, n_t), bias_t, cells_dev, n_t);
+
+                // pin the graph order so each chunk's workspace is released before the next
+                ggml_build_forward_expand(gf, top_k_t);
+
+                top_k = top_k ? ggml_concat(ctx0, top_k, top_k_t, 1) : top_k_t;
+            }
+        } else {
+            top_k = select_top_blocks(score_blocks(q, n_tps), inp->bias, inp->blk_cells, n_tps);
         }
 
         cb(top_k, "indexer_top_k", il);
         return top_k;
     }
+
+    ggml_tensor * score = score_blocks(q, n_tps);
 
     // Fallback for non-causal attention when blk_bias is false
     ggml_tensor * expanded = ggml_get_rows(ctx0,
@@ -1057,8 +1139,38 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa_masked(
     // combine with the original kq mask
     kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
 
-    return build_attn_mha(q_cur, k_cache, v_cache, nullptr, kq_mask_top_k, nullptr, nullptr,
-            qsa_sparse_fa_enabled() ? top_k->ne[0] : 0, kq_scale, il);
+    const int64_t n_kv_max = qsa_sparse_fa_enabled() ? top_k->ne[0] : 0;
+    const int64_t n_stream = kq_mask->ne[3];
+    const int64_t n_tps    = kq_mask->ne[1];
+
+    if (n_stream == 1) {
+        return build_attn_mha(q_cur, k_cache, v_cache, nullptr, kq_mask_top_k, nullptr, nullptr, n_kv_max, kq_scale, il);
+    }
+
+    // [TAG_QSA_STREAM_FA] on CUDA a flash-attention op over a quantized KV cache is allocated
+    // together with an f16 copy of all the K and V it can see, so one op over both streams
+    // reserves both streams' caches at once. Attending one stream at a time halves that, provided
+    // the previous stream's op is consumed (its result copied out) before the next one is built:
+    // the graph allocator frees an op's memory only once every consumer of it has been placed
+    ggml_tensor * out = nullptr;
+
+    for (int64_t s = 0; s < n_stream; ++s) {
+        ggml_tensor * q_s = ggml_view_3d(ctx0, q_cur, q_cur->ne[0], q_cur->ne[1], n_tps,
+                q_cur->nb[1], q_cur->nb[2], s*n_tps*q_cur->nb[2]);
+        ggml_tensor * k_s = ggml_view_4d(ctx0, k_cache, k_cache->ne[0], k_cache->ne[1], k_cache->ne[2], 1,
+                k_cache->nb[1], k_cache->nb[2], k_cache->nb[3], s*k_cache->nb[3]);
+        ggml_tensor * v_s = ggml_view_4d(ctx0, v_cache, v_cache->ne[0], v_cache->ne[1], v_cache->ne[2], 1,
+                v_cache->nb[1], v_cache->nb[2], v_cache->nb[3], s*v_cache->nb[3]);
+        ggml_tensor * mask_s = ggml_view_4d(ctx0, kq_mask_top_k, kq_mask_top_k->ne[0], kq_mask_top_k->ne[1], 1, 1,
+                kq_mask_top_k->nb[1], kq_mask_top_k->nb[2], kq_mask_top_k->nb[3], s*kq_mask_top_k->nb[3]);
+
+        ggml_tensor * out_s = build_attn_mha(q_s, k_s, v_s, nullptr, mask_s, nullptr, nullptr, n_kv_max, kq_scale, il);
+
+        out = out ? ggml_concat(ctx0, out, out_s, 1) : ggml_cont(ctx0, out_s);
+        ggml_build_forward_expand(gf, out);
+    }
+
+    return out;
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa_gathered(
