@@ -19,8 +19,11 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <algorithm>
+#include <map>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 //
 // llama_context
@@ -32,6 +35,75 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
         case LLAMA_CONTEXT_TYPE_MTP    : return LLM_GRAPH_TYPE_DECODER_MTP;
     }
     throw std::runtime_error("Unsupported ctx type");
+}
+
+// [TAG_SCHED_ALLOC_DUMP] LLAMA_SCHED_ALLOC_DUMP=1 prints, once, the tensors that sit highest in the
+// compute buffers of the first prompt-sized graph: a reserve larger than the graph's own peak is
+// explained by whatever holds the top of the buffer, which a CPU-only run cannot show
+static void report_highest_compute_allocations(ggml_cgraph * gf, uint32_t n_tokens, const char * label) {
+    static int n_reported = 0;
+    if (n_reported >= 3 || n_tokens < 256 || getenv("LLAMA_SCHED_ALLOC_DUMP") == nullptr) {
+        return;
+    }
+    n_reported++;
+
+    struct allocation {
+        size_t end;
+        size_t offset;
+        size_t size;
+        std::string desc;
+    };
+    std::vector<allocation> allocations;
+    std::map<const ggml_tensor *, bool> seen;
+
+    auto record = [&](const ggml_tensor * t) {
+        if (t == nullptr || t->data == nullptr || t->buffer == nullptr || ggml_is_view(t) || seen[t]) {
+            return;
+        }
+        seen[t] = true;
+        if (ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            return;
+        }
+        // the backend may reserve more than the tensor's bytes (CUDA flash attention appends its
+        // f16 K/V conversion space to the output), and only the reserved extent explains the buffer
+        const size_t size = ggml_backend_buft_get_alloc_size(ggml_backend_buffer_get_type(t->buffer), t);
+        if (size < (8u << 20)) {
+            return;
+        }
+        const size_t offset = (const char *) t->data - (const char *) ggml_backend_buffer_get_base(t->buffer);
+        allocations.push_back({offset + size, offset, size,
+            format("%s %s %s [%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] bytes %zu MiB in %s (%zu MiB)",
+                t->name, ggml_op_name(t->op), ggml_type_name(t->type), t->ne[0], t->ne[1], t->ne[2], t->ne[3],
+                ggml_nbytes(t) >> 20, ggml_backend_buffer_name(t->buffer), ggml_backend_buffer_get_size(t->buffer) >> 20)});
+    };
+
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        record(node);
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            record(node->src[j]);
+        }
+    }
+    std::sort(allocations.begin(), allocations.end(), [](const allocation & a, const allocation & b) { return a.end > b.end; });
+
+    LLAMA_LOG_WARN("%s: %s: %zu compute allocations >= 8 MiB in the %u-token graph, highest end first\n", __func__, label, allocations.size(), n_tokens);
+    for (size_t i = 0; i < allocations.size() && i < 40; ++i) {
+        const auto & a = allocations[i];
+        LLAMA_LOG_WARN("%s:   end %8.1f MiB  off %8.1f MiB  size %7.1f MiB  %s\n", __func__,
+            a.end / 1048576.0, a.offset / 1048576.0, a.size / 1048576.0, a.desc.c_str());
+    }
+
+    // the band below the peak, by offset, without the streamed expert weights and MoE outputs
+    // whose place is already known from the list above
+    std::sort(allocations.begin(), allocations.end(), [](const allocation & a, const allocation & b) { return a.offset < b.offset; });
+    LLAMA_LOG_WARN("%s: %s: allocations >= 32 MiB by offset, expert weights and ffn_moe outputs omitted\n", __func__, label);
+    for (const auto & a : allocations) {
+        if (a.size < (32u << 20) || a.desc.find("_exps.weight") != std::string::npos || a.desc.compare(0, 8, "ffn_moe_") == 0) {
+            continue;
+        }
+        LLAMA_LOG_WARN("%s:   off %8.1f MiB  end %8.1f MiB  size %7.1f MiB  %s\n", __func__,
+            a.offset / 1048576.0, a.end / 1048576.0, a.size / 1048576.0, a.desc.c_str());
+    }
 }
 
 struct llm_fused_op_probe {
@@ -672,6 +744,39 @@ void llama_context::sched_reserve() {
         n_nodes_tg  = ggml_graph_n_nodes(gf);
     }
 
+    // [TAG_SCHED_CPU_REPORT] LLAMA_SCHED_CPU_REPORT=1 lists the ops the scheduler leaves on the
+    // CPU backend in the worst-case prompt graph, at WARN so the report survives the INFO demotion
+    auto report_cpu_assigned_nodes = [&](ggml_cgraph * gf) {
+        if (getenv("LLAMA_SCHED_CPU_REPORT") == nullptr) {
+            return;
+        }
+
+        std::map<std::string, int> per_op;
+        std::string first_names;
+        int n_cpu = 0;
+
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            if (ggml_backend_sched_get_tensor_backend(sched.get(), node) != backend_cpu) {
+                continue;
+            }
+            per_op[ggml_op_name(node->op)]++;
+            if (++n_cpu <= 16) {
+                first_names += ' ';
+                first_names += node->name;
+            }
+        }
+
+        std::string ops;
+        for (const auto & [op, n] : per_op) {
+            ops += ' ' + op + ':' + std::to_string(n);
+        }
+
+        LLAMA_LOG_WARN("%s: pp graph %d nodes, %d splits, %d on the CPU backend:%s\n", __func__,
+                ggml_graph_n_nodes(gf), ggml_backend_sched_get_n_splits(sched.get()), n_cpu, ops.c_str());
+        LLAMA_LOG_WARN("%s: first CPU nodes:%s\n", __func__, first_names.c_str());
+    };
+
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
         // TODO: the worst case graph is not always reached for `n_seqs > 1`
@@ -692,6 +797,8 @@ void llama_context::sched_reserve() {
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
+
+        report_cpu_assigned_nodes(gf);
     }
 
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -704,6 +811,11 @@ void llama_context::sched_reserve() {
             LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
                     ggml_backend_buft_name(buft),
                     backend_buf_exp_size[i] / 1024.0 / 1024.0);
+            if (getenv("LLAMA_SCHED_CPU_REPORT") != nullptr) {
+                LLAMA_LOG_WARN("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
+                        ggml_backend_buft_name(buft),
+                        backend_buf_exp_size[i] / 1024.0 / 1024.0);
+            }
         }
     }
 
@@ -1400,6 +1512,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         gf_res_prev_active = res;
+
+        report_highest_compute_allocations(gf, ubatch.n_tokens, "runtime ubatch");
     }
 
     // set the input data for the input tensors
@@ -2500,6 +2614,18 @@ ggml_cgraph * llama_context::graph_reserve(
         GGML_ASSERT(!sizes);
         LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
         return nullptr;
+    } else if (getenv("LLAMA_SCHED_ALLOC_DUMP") != nullptr && n_tokens >= 256) {
+        // [TAG_SCHED_ALLOC_DUMP] the reserve graph carries the full-context masks that no runtime
+        // ubatch reaches at shallow depth; a fresh copy (the scheduler rewrote the sources of the
+        // first one) is allocated for real in the buffers just reserved and its layout reported
+        this->n_outputs = n_outputs;
+        res->reset();
+        gf = model.build_graph(gparams);
+        this->n_outputs = save_n_outputs;
+        if (ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+            report_highest_compute_allocations(gf, n_tokens, "reserve pp graph");
+        }
+        ggml_backend_sched_reset(sched.get());
     }
 
     return gf;
