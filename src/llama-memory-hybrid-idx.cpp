@@ -542,7 +542,8 @@ void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * dirty_cells,
         ggml_tensor * dirty_pos,
         ggml_tensor * dirty_rows,
-        ggml_tensor * blk_rows) const {
+        ggml_tensor * blk_rows,
+        const llama_qsa_device_inputs * dev) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(get_mem_idx() != nullptr);
 
@@ -565,7 +566,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
     GGML_ASSERT(cell_blk  == nullptr || (cell_blk->ne[0]  == n_kv        && cell_blk->ne[1] == n_ns));
     GGML_ASSERT(blk_cells == nullptr || (blk_cells->ne[0] == r*n_blocks  && blk_cells->ne[1] == n_ns));
     GGML_ASSERT(blk_pos   == nullptr ||  blk_pos->ne[0]   == 4*n_blocks*n_ns);
-    GGML_ASSERT(bias->ne[0] == (blk_bias ? n_blocks : n_kv));
+    GGML_ASSERT(bias == nullptr || bias->ne[0] == (blk_bias ? n_blocks : n_kv));
     GGML_ASSERT(dirty_cells == nullptr || (dirty_cells->ne[0] == r*dirty_rows->ne[0] && dirty_cells->ne[1] == n_ns));
     GGML_ASSERT(dirty_pos   == nullptr ||  dirty_pos->ne[0]   == 4*dirty_rows->ne[0]*n_ns);
     GGML_ASSERT(dirty_rows  == nullptr ||  dirty_rows->ne[1]  == n_ns);
@@ -575,7 +576,32 @@ void llama_memory_hybrid_idx::set_input_qsa(
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
 
     int32_t * dst_cell_blk  = cell_blk != nullptr ? (int32_t *) cell_blk->data : nullptr;
-    float   * dst_bias      = (float   *) bias->data;
+    float   * dst_bias      = bias != nullptr ? (float *) bias->data : nullptr;
+
+    // [TAG_QSA_DEVICE_INPUTS] an unreferenced input is never allocated, so only a table with a
+    // buffer is filled; the bias tables and the visibility tables are independent sets
+    static const llama_qsa_device_inputs no_dev;
+    const llama_qsa_device_inputs & tbl = dev != nullptr ? *dev : no_dev;
+
+    const bool dev_bias = tbl.blk_start != nullptr && tbl.blk_start->buffer != nullptr;
+    const bool dev_vis  = tbl.cell_idx  != nullptr && tbl.cell_idx->buffer  != nullptr;
+
+    GGML_ASSERT((dev_bias || bias != nullptr) && "qsa: neither a bias input nor its tables");
+    GGML_ASSERT(!dev_bias || (blk_bias && tbl.blk_start->ne[0] == n_blocks && tbl.blk_start->ne[2] == n_ns &&
+            tbl.blk_spare->ne[0] == n_blocks && tbl.blk_spare->ne[2] == n_ns &&
+            tbl.tok_seq->ne[0] == n_tps && tbl.tok_seq->ne[1] == n_ns &&
+            tbl.tok_q->ne[1] == n_tps && tbl.tok_q->ne[2] == n_ns &&
+            tbl.tok_m->ne[1] == n_tps && tbl.tok_m->ne[2] == n_ns));
+    GGML_ASSERT(!dev_vis || (tbl.cell_idx->ne[0] == n_kv && tbl.cell_idx->ne[3] == n_ns &&
+            tbl.q_meta->ne[0] == 2 && tbl.q_meta->ne[1] == n_tps && tbl.q_meta->ne[3] == n_ns &&
+            tbl.zero_mask->ne[0] == n_kv && ggml_nelements(tbl.zero_mask) == n_kv));
+
+    const int64_t n_seq_bias = dev_bias ? tbl.blk_start->ne[1] : 0;
+    const int64_t n_seq_vis  = dev_vis  ? tbl.cell_idx->ne[1]  : 0;
+
+    if (dev_vis) {
+        memset(tbl.zero_mask->data, 0, ggml_nbytes(tbl.zero_mask));
+    }
 
     // [TAG_QSA_POOLED_CACHE] the pooled path drops blk_cells/blk_pos from the graph (the dirty
     // tables replace them), so they may be null here; the block map is still needed for the
@@ -888,6 +914,78 @@ void llama_memory_hybrid_idx::set_input_qsa(
             std::copy(loc_blk_cells.begin(), loc_blk_cells.end(), dst_blk_cells + s*(r*n_blocks));
         }
 
+        // the causal index of a cell: its rank under an image, else its position
+        auto idx_of = [&](int64_t j) {
+            return ranked ? (int64_t) rank[j] : (int64_t) cells.pos_get(j);
+        };
+
+        // [TAG_QSA_DEVICE_INPUTS] the per-block half of the bias rule, per sequence: what the
+        // per-token loop below compares q against. A spare block's start is the lowest index of
+        // the sequence's cells in it, so "start <= q" is exactly its "holds a visible cell"
+        if (dev_bias) {
+            constexpr float never = 1e30f;
+
+            float * dst_start = (float *) tbl.blk_start->data + s*(n_blocks*n_seq_bias);
+            float * dst_spare = (float *) tbl.blk_spare->data + s*n_blocks;
+
+            std::fill(dst_start, dst_start + n_blocks*n_seq_bias, never);
+            std::fill(dst_spare, dst_spare + n_blocks, 0.0f);
+
+            for (int32_t b = 0; b < n_bid; ++b) {
+                for (int64_t sq = 0; sq < n_seq_bias; ++sq) {
+                    if (cells.seq_has((uint32_t) bid_cell[b], (llama_seq_id) sq)) {
+                        dst_start[sq*n_blocks + b] = (float) bid_idx[b];
+                    }
+                }
+            }
+
+            for (int64_t d = 0; d < n_dead; ++d) {
+                const int32_t   bid      = n_bid + (int32_t) d;
+                const int32_t * dead_row = &loc_blk_cells[(int64_t) bid*r];
+
+                dst_spare[bid] = 1.0f;
+
+                for (int64_t k = 0; k < r; ++k) {
+                    const int32_t c = dead_row[k];
+
+                    if (c < 0 || cells.is_empty(c)) {
+                        continue;
+                    }
+
+                    for (int64_t sq = 0; sq < n_seq_bias; ++sq) {
+                        if (cells.seq_has(c, (llama_seq_id) sq)) {
+                            float & start = dst_start[sq*n_blocks + bid];
+                            start = std::min(start, (float) idx_of(c));
+                        }
+                    }
+                }
+            }
+        }
+
+        // [TAG_QSA_DEVICE_VIS] the per-cell half of the attention mask's rule, per sequence: a
+        // cell is visible to a query of sequence sq when cell_idx[sq][cell] <= q. Under an image
+        // the rank orders (pos, y, x) exactly as the mrope mask compares them; otherwise positions
+        // are unique within a sequence and the rule is the causal one
+        if (dev_vis) {
+            int32_t * dst_idx = (int32_t *) tbl.cell_idx->data + s*(n_kv*n_seq_vis);
+
+            std::fill(dst_idx, dst_idx + n_kv*n_seq_vis, INT32_MAX);
+
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (cells.is_empty(j)) {
+                    continue;
+                }
+
+                const int32_t idx = (int32_t) idx_of(j);
+
+                for (int64_t sq = 0; sq < n_seq_vis; ++sq) {
+                    if (cells.seq_has(j, (llama_seq_id) sq)) {
+                        dst_idx[sq*n_kv + j] = idx;
+                    }
+                }
+            }
+        }
+
         if (dst_blk_pos != nullptr) {
             for (int64_t sec = 0; sec < 4; ++sec) {
                 std::copy(loc_blk_pos.begin() + sec*n_blocks, loc_blk_pos.begin() + (sec + 1)*n_blocks,
@@ -1051,6 +1149,22 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
             // the tail is an incomplete block and is always visible, as in the reference
             const int64_t tail_start = (q + 1)/r*r;
+
+            if (dev_bias) {
+                ((int32_t *) tbl.tok_seq->data)[s*n_tps + ii] = (int32_t) seq_id;
+                ((float   *) tbl.tok_q->data)  [s*n_tps + ii] = (float) q;
+                ((float   *) tbl.tok_m->data)  [s*n_tps + ii] = (float) ((q + 1) % r);
+            }
+
+            if (dev_vis) {
+                int32_t * meta = (int32_t *) tbl.q_meta->data + 2*(s*n_tps + ii);
+                meta[0] = (int32_t) seq_id;
+                meta[1] = (int32_t) q;
+            }
+
+            if (dst_bias == nullptr) {
+                continue;
+            }
 
             if (blk_bias) {
                 // a block sits wholly inside or outside the tail, so one value covers it
@@ -1411,13 +1525,14 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * dirty_cells,
         ggml_tensor * dirty_pos,
         ggml_tensor * dirty_rows,
-        ggml_tensor * blk_rows) const {
+        ggml_tensor * blk_rows,
+        const llama_qsa_device_inputs * dev) const {
     GGML_ASSERT(mem != nullptr);
     GGML_ASSERT(get_idx() != nullptr);
 
     mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch,
             get_idx()->get_n_kv(), get_n_stream(), ratio, blk_bias, causal_attn,
-            dirty_cells, dirty_pos, dirty_rows, blk_rows);
+            dirty_cells, dirty_pos, dirty_rows, blk_rows, dev);
 }
 
 llama_memory_hybrid_idx_context::kpool_access::kpool_access(ggml_context * ctx, ggml_tensor * k, int64_t n_embd) : ctx(ctx) {

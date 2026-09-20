@@ -2527,6 +2527,18 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * indices);
 
+    // Decide which candidates count from the cache's own bookkeeping instead of the mask:
+    //   cell_idx i32 [n_kv, n_seq, 1, n_batch_seq]: the causal index of each cell per sequence,
+    //                                               INT32_MAX where the cell is empty or foreign
+    //   query    i32 [2, n_batch, 1, n_batch_seq]:  (sequence, causal index) of each query row
+    // A candidate is visible when cell_idx[sequence][cell] <= index. The mask is then only read
+    // for the visible cells and may be a single row of n_kv entries, which frees the caller from
+    // materializing an [n_kv, n_batch] mask at all. Requires sparse candidates.
+    GGML_API void ggml_flash_attn_ext_set_sparse_visibility(
+            struct ggml_tensor * a,
+            struct ggml_tensor * cell_idx,
+            struct ggml_tensor * query);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);

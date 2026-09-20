@@ -20,6 +20,30 @@
 
 // TODO: this memory module is pending complete reimplementation - do not use for model other than Qwen4
 
+// [TAG_QSA_DEVICE_INPUTS] tables the graph derives the per-query QSA bias and visibility from,
+// in place of inputs that grow with n_tokens times the context. Any of them may be null.
+//   blk_start F32 [n_blocks, n_seq, ns]  first causal index of each block as seen by each sequence:
+//                                        bid_idx for a block the sequence shares, the lowest visible
+//                                        index of a spare block, +1e30 otherwise
+//   blk_spare F32 [n_blocks, 1, ns]      1 for a spare block (unpooled cells), else 0
+//   tok_seq   I32 [n_tps, ns]            sequence of each token
+//   tok_q     F32 [1, n_tps, ns]         causal index of each token (its rank under an image, else its position)
+//   tok_m     F32 [1, n_tps, ns]         (q + 1) % ratio: how far the token's own incomplete block reaches back
+//   cell_idx  I32 [n_kv, n_seq, 1, ns]   causal index of each cell per sequence, INT32_MAX when empty or foreign
+//   q_meta    I32 [2, n_tps, 1, ns]      (sequence, causal index) of each token
+//   zero_mask F16 [n_kv, 1, 1, 1]        the one mask row the attention op reads at visible cells
+struct llama_qsa_device_inputs {
+    ggml_tensor * blk_start = nullptr;
+    ggml_tensor * blk_spare = nullptr;
+    ggml_tensor * tok_seq   = nullptr;
+    ggml_tensor * tok_q     = nullptr;
+    ggml_tensor * tok_m     = nullptr;
+
+    ggml_tensor * cell_idx  = nullptr;
+    ggml_tensor * q_meta    = nullptr;
+    ggml_tensor * zero_mask = nullptr;
+};
+
 class llama_memory_hybrid_idx : public llama_memory_hybrid {
 public:
     llama_memory_hybrid_idx(
@@ -103,7 +127,8 @@ public:
                        ggml_tensor * dirty_cells = nullptr,
                        ggml_tensor * dirty_pos   = nullptr,
                        ggml_tensor * dirty_rows  = nullptr,
-                       ggml_tensor * blk_rows    = nullptr) const;
+                       ggml_tensor * blk_rows    = nullptr,
+                       const llama_qsa_device_inputs * dev = nullptr) const;
 
     // The model's indexer pool size.
     uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
@@ -306,7 +331,8 @@ public:
                        ggml_tensor * dirty_cells = nullptr,
                        ggml_tensor * dirty_pos   = nullptr,
                        ggml_tensor * dirty_rows  = nullptr,
-                       ggml_tensor * blk_rows    = nullptr) const;
+                       ggml_tensor * blk_rows    = nullptr,
+                       const llama_qsa_device_inputs * dev = nullptr) const;
 
     // [TAG_QSA_POOLED_CACHE] true when store rows are keyed on (seq_id, position block) rather
     // than the position block alone, which a unified pool requires - see the memory class

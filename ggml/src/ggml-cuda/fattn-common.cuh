@@ -732,6 +732,13 @@ void ggml_cuda_flash_attn_ext_compact_candidates(
         const ggml_tensor * cand, const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries,
         int32_t n_kv_max, cudaStream_t stream);
 
+// as above, but a candidate counts when cell_idx (i32 [n_kv, n_seq, 1, n_sequences]) at the
+// query's sequence is at most the query's causal index (query: i32 [2, n_queries, 1, n_sequences]
+// holding (sequence, index) per row) - no mask is read
+void ggml_cuda_flash_attn_ext_compact_candidates_by_index(
+        const ggml_tensor * cand, const ggml_tensor * cell_idx, const ggml_tensor * query, int32_t * indices, int32_t * counts,
+        int32_t n_queries, int32_t n_sequences, int32_t n_kv_max, cudaStream_t stream);
+
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
@@ -1106,6 +1113,9 @@ void launch_fattn(
     // one pointer serves both roles: the sparse cell lists, or the per-tile bound of the dense scan
     const int * KV_max_ptr = nullptr;
 
+    // the mask is one row of n_kv entries that every query reads at its listed cells
+    bool mask_is_one_row = false;
+
     // sparse: a query tile of ncols1 queries shares one index list, the union of the queries' visible columns
     int32_t n_kv_max = 0;
     if (use_sparse) {
@@ -1126,9 +1136,25 @@ void launch_fattn(
             GGML_ASSERT(ncols1 == 1 && "a candidate list is one list per query, which only the single-query tiling reads");
             GGML_ASSERT(cand->type == GGML_TYPE_I32);
             GGML_ASSERT(cand->ne[0] == n_kv_max_query);
-            GGML_ASSERT(cand->ne[1] == mask->ne[1] && cand->ne[3] == mask->ne[3]);
+            GGML_ASSERT(cand->ne[1] == Q->ne[1] && cand->ne[3] == Q->ne[3]);
+            GGML_ASSERT(mask->ne[3] == Q->ne[3] && "one list per (sequence, query)");
 
-            ggml_cuda_flash_attn_ext_compact_candidates(cand, mask, KV_max.ptr, counts, Q->ne[1], n_kv_max, main_stream);
+            if (const ggml_tensor * cell_idx = KQV->src[6]) {
+                // the cache's own bookkeeping decides visibility, so the mask is a single row of
+                // zeros the attention kernel gathers from - see ggml_flash_attn_ext_set_sparse_visibility
+                const ggml_tensor * query = KQV->src[7];
+                GGML_ASSERT(query != nullptr);
+                GGML_ASSERT(mask->ne[1] == 1 && "a mask read per cell only is one row");
+                GGML_ASSERT(cell_idx->type == GGML_TYPE_I32 && query->type == GGML_TYPE_I32);
+                GGML_ASSERT(cell_idx->ne[0] == mask->ne[0] && cell_idx->ne[3] == Q->ne[3]);
+                GGML_ASSERT(query->ne[0] == 2 && query->ne[1] == Q->ne[1] && query->ne[3] == Q->ne[3]);
+
+                ggml_cuda_flash_attn_ext_compact_candidates_by_index(cand, cell_idx, query, KV_max.ptr, counts,
+                        Q->ne[1], Q->ne[3], n_kv_max, main_stream);
+                mask_is_one_row = true;
+            } else {
+                ggml_cuda_flash_attn_ext_compact_candidates(cand, mask, KV_max.ptr, counts, Q->ne[1], n_kv_max, main_stream);
+            }
         } else {
             ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, counts, Q->ne[1], ncols1, n_kv_max, main_stream);
         }
@@ -1279,7 +1305,8 @@ void launch_fattn(
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        // a one-row mask is broadcast over the queries and sequences by a zero stride
+        mask && !mask_is_one_row ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask && !mask_is_one_row ? mask->nb[3] : 0
     );
     CUDA_CHECK(cudaGetLastError());
 

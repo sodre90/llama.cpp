@@ -2738,7 +2738,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
              int64_t   n_kv_max,
                float   kq_scale,
                  int   il,
-         ggml_tensor * sparse_cand) const {
+         ggml_tensor * sparse_cand,
+         ggml_tensor * sparse_cells,
+         ggml_tensor * sparse_query) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2785,6 +2787,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
         ggml_flash_attn_ext_set_sparse_candidates(cur, sparse_cand);
+        ggml_flash_attn_ext_set_sparse_visibility(cur, sparse_cells, sparse_query);
         ggml_prec_set_acc(cur, GGML_PREC_F32);
 
         if (v_mla) {
