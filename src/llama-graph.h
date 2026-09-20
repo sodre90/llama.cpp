@@ -1211,7 +1211,9 @@ struct llm_graph_context {
                 int64_t   n_kv_max,
                   float   kq_scale,
                     int   il,
-            ggml_tensor * sparse_cand = nullptr) const; // i32 [n_kv_max, n_tokens, 1, n_stream]
+            ggml_tensor * sparse_cand  = nullptr,       // i32 [n_kv_max, n_tokens, 1, n_stream]
+            ggml_tensor * sparse_cells = nullptr,       // i32 [n_kv, n_seq, 1, n_stream]: causal index per (cell, sequence)
+            ggml_tensor * sparse_query = nullptr) const; // i32 [2, n_tokens, 1, n_stream]: (sequence, causal index)
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

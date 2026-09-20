@@ -2581,6 +2581,14 @@ struct llama_model_qwen4exp : public llama_model_base {
         // layer shares the depth that decides it
         bool qsa_direct_indices = false;
 
+        // [TAG_QSA_DEVICE_VIS] the input set that carries the visibility tables of the direct
+        // path, their device copies, and the one-row mask the attention op reads; every layer
+        // shares them. Null when the path is off, so the attention mask is referenced instead
+        const llm_graph_input_qsa * qsa_vis       = nullptr;
+        ggml_tensor *               qsa_vis_cells = nullptr; // I32 [n_kv, n_seq_max, 1, n_stream]
+        ggml_tensor *               qsa_vis_query = nullptr; // I32 [2, n_tps, 1, n_stream]
+        ggml_tensor *               qsa_vis_mask  = nullptr; // F16 [n_kv, 1, 1, 1]
+
         // QSA: token indices this layer's queries may attend to, or nullptr for dense
         ggml_tensor * build_qsa_top_k(
   const llama_memory_hybrid_idx_context * mctx_hyb,

@@ -578,7 +578,7 @@ public:
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
         mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, causal_attn,
-                dirty_cells, dirty_pos, dirty_rows, blk_rows);
+                dirty_cells, dirty_pos, dirty_rows, blk_rows, &dev);
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -608,8 +608,25 @@ public:
         if (blk_pos != nullptr) {
             res &= blk_pos->ne[0]   == 4*n_blocks*n_stream;
         }
-        res &= bias->ne[0]      == (blk_bias ? n_blocks : n_kv);
-        res &= bias->ne[1]      == params.ubatch.n_tokens/n_stream;
+        if (bias != nullptr) {
+            res &= bias->ne[0]      == (blk_bias ? n_blocks : n_kv);
+            res &= bias->ne[1]      == params.ubatch.n_tokens/n_stream;
+        }
+
+        // [TAG_QSA_DEVICE_INPUTS] every table was sized from n_kv, n_blocks and the ubatch
+        const int64_t n_tps = params.ubatch.n_tokens/n_stream;
+        if (dev.blk_start != nullptr) {
+            res &= dev.blk_start->ne[0] == n_blocks && dev.blk_start->ne[2] == n_stream;
+            res &= dev.blk_spare->ne[0] == n_blocks && dev.blk_spare->ne[2] == n_stream;
+            res &= dev.tok_seq->ne[0]   == n_tps    && dev.tok_seq->ne[1]   == n_stream;
+            res &= dev.tok_q->ne[1]     == n_tps    && dev.tok_q->ne[2]     == n_stream;
+            res &= dev.tok_m->ne[1]     == n_tps    && dev.tok_m->ne[2]     == n_stream;
+        }
+        if (dev.cell_idx != nullptr) {
+            res &= dev.cell_idx->ne[0]  == n_kv     && dev.cell_idx->ne[3]  == n_stream;
+            res &= dev.q_meta->ne[1]    == n_tps    && dev.q_meta->ne[3]    == n_stream;
+            res &= dev.zero_mask->ne[0] == n_kv;
+        }
 
         // [TAG_QSA_POOLED_CACHE] the dirty tables must hold this ubatch's (re)pool range;
         // steady decode needs at most one block, so the capacity is stable at 1 there
@@ -640,6 +657,11 @@ public:
     // only when the store is keyed on (seq, block): the reader gathers one row per block instead
     // of viewing a contiguous range, because a unified pool interleaves sequences' rows
     ggml_tensor * blk_rows    = nullptr; // I32 [n_blocks, n_stream]
+
+    // [TAG_QSA_DEVICE_INPUTS] the per-(block, query) bias and the per-(cell, query) mask both
+    // grow with the ubatch times the context; these per-block and per-cell tables do not, and
+    // the graph derives the former from them
+    llama_qsa_device_inputs dev;
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t ratio;
@@ -723,6 +745,27 @@ static bool qsa_sparse_fa_enabled() {
 static bool qsa_direct_indices_enabled() {
     static const bool enabled = []() {
         const char * requested = getenv("LLAMA_QSA_DIRECT_IDX");
+        return requested == nullptr || atoi(requested) != 0;
+    }();
+
+    return enabled;
+}
+
+// [TAG_QSA_DEVICE_INPUTS] LLAMA_QSA_DEVICE_BIAS=0 restores the CPU-filled [n_blocks, n_tokens]
+// bias input, LLAMA_QSA_DEVICE_VIS=0 the CPU-filled [n_kv, n_tokens] attention mask on the
+// direct-index path, so either can be measured against its table form from one build
+static bool qsa_device_bias_enabled() {
+    static const bool enabled = []() {
+        const char * requested = getenv("LLAMA_QSA_DEVICE_BIAS");
+        return requested == nullptr || atoi(requested) != 0;
+    }();
+
+    return enabled;
+}
+
+static bool qsa_device_visibility_enabled() {
+    static const bool enabled = []() {
+        const char * requested = getenv("LLAMA_QSA_DEVICE_VIS");
         return requested == nullptr || atoi(requested) != 0;
     }();
 
@@ -847,8 +890,57 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ggml_set_input(qsa->blk_cells);
         }
 
-        qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
-        ggml_set_input(qsa->bias);
+        // [TAG_QSA_DEVICE_INPUTS] scoring in token chunks is when the bias is large enough to
+        // matter, and a chunk is where the device can derive it; a decode ubatch keeps the direct
+        // upload, which is small and needs no extra kernels on the latency path
+        const bool device_bias = blk_bias && qsa_chunk_tokens(n_stream, n_tps) && qsa_device_bias_enabled();
+
+        if (device_bias) {
+            const int64_t n_seq_max = cparams.n_seq_max;
+
+            qsa->dev.blk_start = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_blocks, n_seq_max, n_stream);
+            qsa->dev.blk_spare = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_blocks, 1, n_stream);
+            qsa->dev.tok_seq   = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_tps, n_stream);
+            qsa->dev.tok_q     = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_tps, n_stream);
+            qsa->dev.tok_m     = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_tps, n_stream);
+
+            ggml_set_input(qsa->dev.blk_start);
+            ggml_set_input(qsa->dev.blk_spare);
+            ggml_set_input(qsa->dev.tok_seq);
+            ggml_set_input(qsa->dev.tok_q);
+            ggml_set_input(qsa->dev.tok_m);
+        } else {
+            qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+            ggml_set_input(qsa->bias);
+        }
+
+        // [TAG_QSA_DEVICE_VIS] the cell list names what to attend to and the mask only says which
+        // named cells are visible - a per-cell causal index carries that in 1/n_tokens of the
+        // space, and the attention mask is then never referenced, so it is never filled or uploaded
+        if (direct_idx && qsa_device_visibility_enabled() && hparams.swa_type == LLAMA_SWA_TYPE_NONE && qsa_vis == nullptr) {
+            const int64_t n_seq_max = cparams.n_seq_max;
+
+            qsa->dev.cell_idx  = ggml_new_tensor_4d(ctx0, GGML_TYPE_I32, n_kv, n_seq_max, 1, n_stream);
+            qsa->dev.q_meta    = ggml_new_tensor_4d(ctx0, GGML_TYPE_I32, 2, n_tps, 1, n_stream);
+            qsa->dev.zero_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_kv, 1, 1, 1);
+
+            ggml_set_input(qsa->dev.cell_idx);
+            ggml_set_input(qsa->dev.q_meta);
+            ggml_set_input(qsa->dev.zero_mask);
+
+            // one device copy each, shared by every layer and sliced per stream on the device
+            qsa_vis_cells = ggml_cont(ctx0, qsa->dev.cell_idx);
+            qsa_vis_query = ggml_cont(ctx0, qsa->dev.q_meta);
+            qsa_vis_mask  = qsa->dev.zero_mask;
+            qsa_vis       = qsa.get();
+        }
+
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            LLAMA_LOG_WARN("qsa: device bias %s, device visibility %s\n",
+                    qsa_device_bias_enabled() ? "on" : "off", qsa_device_visibility_enabled() ? "on" : "off");
+        }
 
         if (use_pooled) {
             const int64_t n_dirty_max = mctx_hyb->qsa_pooled_n_dirty_max(ubatch, (uint32_t) r);
@@ -1045,15 +1137,45 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
             // graph inputs belong to the CPU backend and the scheduler uploads every view of one
             // to the device as a separate copy: one device copy per layer, sliced on the device
-            ggml_tensor * bias_dev  = ggml_cont(ctx0, inp->bias);
             ggml_tensor * cells_dev = ggml_cont(ctx0, inp->blk_cells);
+
+            // [TAG_QSA_DEVICE_INPUTS] the bias of a chunk is sliced from the uploaded one, or
+            // derived on the device from the per-block start table and the per-token index
+            ggml_tensor * bias_dev = inp->bias != nullptr ? ggml_cont(ctx0, inp->bias) : nullptr;
+            ggml_tensor * seq_dev  = inp->bias == nullptr ? ggml_cont(ctx0, inp->dev.tok_seq) : nullptr;
+            ggml_tensor * q_dev    = inp->bias == nullptr ? ggml_cont(ctx0, inp->dev.tok_q)   : nullptr;
+            ggml_tensor * m_dev    = inp->bias == nullptr ? ggml_cont(ctx0, inp->dev.tok_m)   : nullptr;
+
+            auto chunk_bias = [&](int64_t t0, int64_t n_t) {
+                if (bias_dev != nullptr) {
+                    return ggml_view_3d(ctx0, bias_dev, n_blocks, n_t, n_stream,
+                            bias_dev->nb[1], bias_dev->nb[2], t0*bias_dev->nb[1]);
+                }
+
+                ggml_tensor * seq_t = ggml_view_2d(ctx0, seq_dev, n_t, n_stream, seq_dev->nb[1], t0*seq_dev->nb[0]);
+                ggml_tensor * q_t   = ggml_view_3d(ctx0, q_dev, 1, n_t, n_stream, q_dev->nb[1], q_dev->nb[2], t0*q_dev->nb[1]);
+                ggml_tensor * m_t   = ggml_view_3d(ctx0, m_dev, 1, n_t, n_stream, m_dev->nb[1], m_dev->nb[2], t0*m_dev->nb[1]);
+
+                // the first index of every block as seen by each query's sequence: [n_blocks, n_t, n_stream]
+                ggml_tensor * start = ggml_get_rows(ctx0, inp->dev.blk_start, seq_t);
+                ggml_tensor * ahead = ggml_sub(ctx0, start, q_t);
+
+                // the same three-way rule the CPU fill applies, on integer-valued floats: a block
+                // starting past the query is cut (finite, so it can never meet a -inf and produce
+                // a nan); one starting in the query's own incomplete block, or a spare block with
+                // a visible cell, is forced in; the rest compete on their score
+                ggml_tensor * future = ggml_clamp(ctx0, ahead, 0.0f, 1.0f);
+                ggml_tensor * tail   = ggml_clamp(ctx0, ggml_add(ctx0, ahead, m_t), 0.0f, 1.0f);
+                ggml_tensor * forced = ggml_add(ctx0, tail, inp->dev.blk_spare);
+
+                return ggml_add(ctx0, ggml_scale(ctx0, forced, 1e9f), ggml_scale(ctx0, future, -1e30f));
+            };
 
             for (int64_t t0 = 0; t0 < n_tps; t0 += chunk) {
                 const int64_t n_t = std::min(chunk, n_tps - t0);
 
                 ggml_tensor * q_t = qsa_token_range(ctx0, q, n_stream, n_tps, t0, n_t);
-                ggml_tensor * bias_t = ggml_view_3d(ctx0, bias_dev, n_blocks, n_t, n_stream,
-                        bias_dev->nb[1], bias_dev->nb[2], t0*bias_dev->nb[1]);
+                ggml_tensor * bias_t = chunk_bias(t0, n_t);
 
                 ggml_tensor * top_k_t = select_top_blocks(score_blocks(q_t, n_t), bias_t, cells_dev, n_t);
 
@@ -1218,11 +1340,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa_masked(
         GGML_ASSERT(qsa_direct_indices_apply(kq_mask->ne[0], top_k->ne[0]) &&
                 "the block map padded for the direct path but the mask says the backend will scan");
 
+        // [TAG_QSA_DEVICE_VIS] with the visibility tables the mask is one row of zeros that is
+        // never filled per token; without them the attention mask decides which named cells count
+        const bool device_vis = qsa_vis != nullptr;
+        ggml_tensor * mask_all = device_vis ? qsa_vis_mask : kq_mask;
+
         // [TAG_QSA_DIRECT_IDX] top_k already is the cell list flash attention wants, in the layout
         // it wants, so the mask goes in untouched and nothing has to be filled, scattered or added
         if (n_stream == 1) {
-            return build_attn_mha(q_cur, k_cache, v_cache, nullptr, kq_mask, nullptr, nullptr,
-                    n_kv_max, kq_scale, il, top_k);
+            return build_attn_mha(q_cur, k_cache, v_cache, nullptr, mask_all, nullptr, nullptr,
+                    n_kv_max, kq_scale, il, top_k,
+                    device_vis ? qsa_vis_cells : nullptr, device_vis ? qsa_vis_query : nullptr);
         }
 
         ggml_tensor * out_direct = nullptr;
@@ -1234,13 +1362,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa_masked(
                     k_cache->nb[1], k_cache->nb[2], k_cache->nb[3], s*k_cache->nb[3]);
             ggml_tensor * v_s = ggml_view_4d(ctx0, v_cache, v_cache->ne[0], v_cache->ne[1], v_cache->ne[2], 1,
                     v_cache->nb[1], v_cache->nb[2], v_cache->nb[3], s*v_cache->nb[3]);
-            ggml_tensor * mask_s = ggml_view_4d(ctx0, kq_mask, kq_mask->ne[0], kq_mask->ne[1], 1, 1,
-                    kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], s*kq_mask->nb[3]);
             ggml_tensor * idx_s = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], 1, 1,
                     top_k->nb[1], top_k->nb[2], top_k->nb[3], s*top_k->nb[3]);
 
+            ggml_tensor * mask_s  = mask_all;
+            ggml_tensor * cells_s = nullptr;
+            ggml_tensor * query_s = nullptr;
+
+            if (device_vis) {
+                cells_s = ggml_view_4d(ctx0, qsa_vis_cells, qsa_vis_cells->ne[0], qsa_vis_cells->ne[1], 1, 1,
+                        qsa_vis_cells->nb[1], qsa_vis_cells->nb[2], qsa_vis_cells->nb[3], s*qsa_vis_cells->nb[3]);
+                query_s = ggml_view_4d(ctx0, qsa_vis_query, qsa_vis_query->ne[0], qsa_vis_query->ne[1], 1, 1,
+                        qsa_vis_query->nb[1], qsa_vis_query->nb[2], qsa_vis_query->nb[3], s*qsa_vis_query->nb[3]);
+            } else {
+                mask_s = ggml_view_4d(ctx0, kq_mask, kq_mask->ne[0], kq_mask->ne[1], 1, 1,
+                        kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], s*kq_mask->nb[3]);
+            }
+
             ggml_tensor * out_s = build_attn_mha(q_s, k_s, v_s, nullptr, mask_s, nullptr, nullptr,
-                    n_kv_max, kq_scale, il, idx_s);
+                    n_kv_max, kq_scale, il, idx_s, cells_s, query_s);
 
             out_direct = out_direct ? ggml_concat(ctx0, out_direct, out_s, 1) : ggml_cont(ctx0, out_s);
             ggml_build_forward_expand(gf, out_direct);

@@ -108,10 +108,17 @@ static __global__ void flash_attn_mask_to_sparse_indices(
 // The list still has to be compacted: the kernel walks it in tiles of nbatch_fa and a tile whose
 // every entry is masked leaves the running softmax with no finite term at all, so masked
 // candidates cannot be left sitting among the live ones.
+// A candidate is visible when its mask entry is finite - or, when the caller hands over the cache's
+// per-cell causal index table, when the cell's index for the query's sequence is at most the
+// query's own. The table is [n_kv, n_seq] per batch sequence, so nothing of size [n_kv, n_queries]
+// has to exist for the scan; the mask is then a single row the attention kernel reads per cell.
+template <bool by_index>
 __launch_bounds__(256, 1)
 static __global__ void flash_attn_candidates_to_sparse_indices(
         const int32_t * cand_ptr, const half * mask_ptr, int32_t * indices_ptr, int32_t * counts_ptr,
-        const int n_cand, const int ne30, const int64_t s31, const int64_t s33, const int64_t sc1, const int64_t sc3) {
+        const int n_cand, const int ne30, const int64_t s31, const int64_t s33, const int64_t sc1, const int64_t sc3,
+        const int32_t * cell_idx_ptr, const int32_t * query_ptr, const int64_t sv1, const int64_t sv3,
+        const int64_t sq1, const int64_t sq3) {
     ggml_cuda_pdl_sync();
 
     constexpr int values_per_lane = 8;
@@ -121,9 +128,19 @@ static __global__ void flash_attn_candidates_to_sparse_indices(
     const int sequence = blockIdx.y;
     const int query    = blockIdx.x;
 
-    const half    * mask    = mask_ptr + sequence*s33 + query*s31;
     const int32_t * cand    = cand_ptr + sequence*sc3 + query*sc1;
     int32_t       * indices = indices_ptr + (int64_t(sequence)*gridDim.x + query)*n_cand;
+
+    const half    * mask     = nullptr;
+    const int32_t * cell_idx = nullptr;
+    int32_t         q_idx    = 0;
+    if constexpr (by_index) {
+        const int32_t * q_meta = query_ptr + sequence*sq3 + query*sq1;
+        cell_idx = cell_idx_ptr + sequence*sv3 + q_meta[0]*sv1;
+        q_idx    = q_meta[1];
+    } else {
+        mask = mask_ptr + sequence*s33 + query*s31;
+    }
 
     __shared__ int warp_offsets[256/WARP_SIZE];
     __shared__ int row_count;
@@ -143,7 +160,13 @@ static __global__ void flash_attn_candidates_to_sparse_indices(
             const int i = i0 + (warp*values_per_lane + item)*WARP_SIZE + lane;
             const int32_t idx = i < n_cand ? cand[i] : -1;
             // an out-of-range candidate is a bug in the caller, but dropping it beats faulting
-            const bool selected = idx >= 0 && idx < ne30 && isfinite(__half2float(mask[idx]));
+            const bool in_range = idx >= 0 && idx < ne30;
+            bool selected;
+            if constexpr (by_index) {
+                selected = in_range && cell_idx[idx] <= q_idx;
+            } else {
+                selected = in_range && isfinite(__half2float(mask[idx]));
+            }
             value_warp   [item] = idx;
             selected_warp[item] = __ballot_sync(0xFFFFFFFF, selected);
             warp_count += __popc(selected_warp[item]);
@@ -212,9 +235,34 @@ void ggml_cuda_flash_attn_ext_compact_candidates(
     const dim3 blocks_num(n_queries, mask->ne[3], 1);
     const dim3 block_dim(256, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
-    ggml_cuda_kernel_launch(flash_attn_candidates_to_sparse_indices, launch_params,
+    ggml_cuda_kernel_launch(flash_attn_candidates_to_sparse_indices<false>, launch_params,
         (const int32_t *) cand->data, (const half *) mask->data, indices, counts,
-        n_kv_max, int(mask->ne[0]), s31, s33, sc1, sc3);
+        n_kv_max, int(mask->ne[0]), s31, s33, sc1, sc3,
+        (const int32_t *) nullptr, (const int32_t *) nullptr, int64_t(0), int64_t(0), int64_t(0), int64_t(0));
+    CUDA_CHECK(cudaGetLastError());
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+}
+
+void ggml_cuda_flash_attn_ext_compact_candidates_by_index(
+        const ggml_tensor * cand, const ggml_tensor * cell_idx, const ggml_tensor * query, int32_t * indices, int32_t * counts,
+        int32_t n_queries, int32_t n_sequences, int32_t n_kv_max, cudaStream_t stream) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(cand, cell_idx, query, indices, counts, n_queries, n_sequences, n_kv_max, stream);
+    GGML_ABORT("sparse flash attention is only supported on NVIDIA CUDA");
+#else
+    const int64_t sc1 = cand->nb[1] / sizeof(int32_t);
+    const int64_t sc3 = cand->nb[3] / sizeof(int32_t);
+    const int64_t sv1 = cell_idx->nb[1] / sizeof(int32_t);
+    const int64_t sv3 = cell_idx->nb[3] / sizeof(int32_t);
+    const int64_t sq1 = query->nb[1] / sizeof(int32_t);
+    const int64_t sq3 = query->nb[3] / sizeof(int32_t);
+    const dim3 blocks_num(n_queries, n_sequences, 1);
+    const dim3 block_dim(256, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
+    ggml_cuda_kernel_launch(flash_attn_candidates_to_sparse_indices<true>, launch_params,
+        (const int32_t *) cand->data, (const half *) nullptr, indices, counts,
+        n_kv_max, int(cell_idx->ne[0]), int64_t(0), int64_t(0), sc1, sc3,
+        (const int32_t *) cell_idx->data, (const int32_t *) query->data, sv1, sv3, sq1, sq3);
     CUDA_CHECK(cudaGetLastError());
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
@@ -257,9 +305,13 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
 
+    // a visibility table (src[6]) reduces the mask to one row every query reads at its own cells
+    const bool mask_rows_ok = mask != nullptr &&
+        (dst->src[6] != nullptr ? mask->ne[1] == 1 : mask->ne[1] >= Q->ne[1]);
+
     const bool shape_ok = GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
-        mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
-        mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1;
+        mask_rows_ok && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
+        mask->ne[0] == K->ne[1] && mask->ne[2] == 1;
 
     // a candidate list names one list per query, which only the single-query tiling reads; the
     // graph side mirrors this depth rule (qsa_direct_indices_apply), so it must not depend on Q->ne[1]

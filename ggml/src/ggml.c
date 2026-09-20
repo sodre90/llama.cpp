@@ -5605,11 +5605,42 @@ void ggml_flash_attn_ext_set_sparse_candidates(
     GGML_ASSERT(ggml_is_contiguous(indices));
     GGML_ASSERT(indices->ne[0] == ggml_get_op_params_i32(a, 4) && "row length must be n_kv_max");
     GGML_ASSERT(a->src[3] != NULL && "the mask still decides which named cells count");
-    GGML_ASSERT(indices->ne[1] == a->src[3]->ne[1]);
+    GGML_ASSERT(indices->ne[1] == a->src[0]->ne[1]);
     GGML_ASSERT(indices->ne[2] == 1);
-    GGML_ASSERT(indices->ne[3] == a->src[3]->ne[3]);
+    GGML_ASSERT(indices->ne[3] == a->src[0]->ne[3]);
 
     a->src[5] = indices;
+}
+
+void ggml_flash_attn_ext_set_sparse_visibility(
+        struct ggml_tensor * a,
+        struct ggml_tensor * cell_idx,
+        struct ggml_tensor * query) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    if (!cell_idx) {
+        GGML_ASSERT(!query);
+        a->src[6] = NULL;
+        a->src[7] = NULL;
+        return;
+    }
+
+    GGML_ASSERT(a->src[5] != NULL && "the visibility rule filters a candidate list");
+    GGML_ASSERT(a->src[3] != NULL && a->src[3]->ne[1] == 1 && "a mask that is read per cell only is one row");
+
+    GGML_ASSERT(cell_idx->type == GGML_TYPE_I32);
+    GGML_ASSERT(cell_idx->ne[0] == a->src[3]->ne[0]);
+    GGML_ASSERT(cell_idx->ne[2] == 1);
+    GGML_ASSERT(cell_idx->ne[3] == a->src[0]->ne[3]);
+
+    GGML_ASSERT(query->type == GGML_TYPE_I32);
+    GGML_ASSERT(query->ne[0] == 2);
+    GGML_ASSERT(query->ne[1] == a->src[0]->ne[1]);
+    GGML_ASSERT(query->ne[2] == 1);
+    GGML_ASSERT(query->ne[3] == a->src[0]->ne[3]);
+
+    a->src[6] = cell_idx;
+    a->src[7] = query;
 }
 
 void ggml_flash_attn_ext_add_sinks(
