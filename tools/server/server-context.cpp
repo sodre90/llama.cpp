@@ -1010,6 +1010,10 @@ private:
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
+    int decode_priority_burst = 0;       // env: LLAMA_SERVER_DECODE_PRIORITY
+    int n_decode_steps_since_prompt = 0; // counter for decode steps while a prompt is pending
+
+    size_t i_slot_start = 0; // rotates so a low slot id cannot monopolize the n_batch prompt budget
 
     int n_empty_consecutive = 0;
 
@@ -1470,6 +1474,21 @@ private:
 
             if (slots_n_diff) {
                 SRV_WRN("LLAMA_SERVER_SLOTS_N_DIFF = %d\n", slots_n_diff);
+            }
+        }
+
+        {
+            const char * LLAMA_SERVER_DECODE_PRIORITY = getenv("LLAMA_SERVER_DECODE_PRIORITY");
+            if (LLAMA_SERVER_DECODE_PRIORITY) {
+                decode_priority_burst = atoi(LLAMA_SERVER_DECODE_PRIORITY);
+            } else if (params_base.n_parallel > 1 && params_base.cont_batching) {
+                decode_priority_burst = 16;
+            } else {
+                decode_priority_burst = 0;
+            }
+
+            if (decode_priority_burst > 0) {
+                SRV_INF("decode-priority interleaving enabled: %d decode steps per prefill chunk (LLAMA_SERVER_DECODE_PRIORITY)\n", decode_priority_burst);
             }
         }
 
@@ -2942,6 +2961,25 @@ private:
         }
     }
 
+    // the prompt batching loop fills up to n_batch and stops, so a fixed order lets the first slot
+    // take the whole budget every step while later slots starve; advance the start slot each step
+    std::vector<server_slot *> slots_in_round_robin_order() {
+        std::vector<server_slot *> res;
+
+        if (slots.empty()) {
+            return res;
+        }
+
+        res.reserve(slots.size());
+        for (size_t i = 0; i < slots.size(); ++i) {
+            res.push_back(&slots[(i_slot_start + i) % slots.size()]);
+        }
+
+        i_slot_start = (i_slot_start + 1) % slots.size();
+
+        return res;
+    }
+
     void iterate(std::vector<server_slot *> & slots, std::function<void(server_slot &)> callback) {
         for (auto & slot : slots) {
             try {
@@ -3317,10 +3355,38 @@ private:
         auto & alora_disabled_id = batch.alora_disabled_id;
 
         // next, batch any pending prompts without exceeding n_batch
-        if (params_base.cont_batching || batch.size() == 0) {
+        bool allow_prompt_batch = params_base.cont_batching || batch.size() == 0;
+        if (allow_prompt_batch && batch.size() > 0 && decode_priority_burst > 0) {
+            bool has_pending_prompts = false;
+            for (const auto & slot : slots) {
+                if (slot.is_processing() && (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED)) {
+                    has_pending_prompts = true;
+                    break;
+                }
+            }
+            if (has_pending_prompts) {
+                if (n_decode_steps_since_prompt < decode_priority_burst) {
+                    n_decode_steps_since_prompt++;
+                    allow_prompt_batch = false;
+                    SRV_DBG("decode-priority: step %d/%d, holding prompt batch\n",
+                            n_decode_steps_since_prompt, decode_priority_burst);
+                } else {
+                    n_decode_steps_since_prompt = 0;
+                    SRV_DBG("decode-priority: burst limit reached (%d), allowing prompt batch\n", decode_priority_burst);
+                }
+            } else {
+                n_decode_steps_since_prompt = 0;
+            }
+        } else if (batch.size() == 0) {
+            n_decode_steps_since_prompt = 0;
+        }
+
+        if (allow_prompt_batch) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
-            iterate(slots, [&](server_slot & slot) {
+            auto slots_ordered = slots_in_round_robin_order();
+
+            iterate(slots_ordered, [&](server_slot & slot) {
                 if (!add_ok || batch.size() >= n_batch) {
                     return; // batch is full, skip remaining slots
                 }
