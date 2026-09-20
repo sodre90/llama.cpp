@@ -741,16 +741,37 @@ static bool qsa_direct_indices_apply(int64_t n_kv, int64_t width) {
 // predicates, and a recorded belief that decode never reaches the sparse path turned out to
 // contradict the mask shape. Report each distinct combination once so the journal settles it on
 // the real workload. WARN because INFO never reaches the journal from libllama.
-static void qsa_report_path(int64_t n_tps, int64_t n_kv, bool gathered) {
-    static bool reported[4] = { false, false, false, false };
+enum qsa_path {
+    // K/V for the named cells are copied out, so the backend converts and reads only those
+    QSA_PATH_GATHERED = 0,
+    // the cells are named to the backend instead of copied, which skips the attention over the
+    // rest - but a quantized cache is still converted to f16 in full, because the op can see it all
+    QSA_PATH_CELL_LIST,
+    // no selection reaches the backend: it reads every cell of the cache and lets the mask decide
+    QSA_PATH_DENSE,
+    QSA_PATH_COUNT,
+};
 
-    const int key = (gathered ? 2 : 0) | (n_tps > 1 ? 1 : 0);
+static void qsa_report_path(int64_t n_tps, int64_t n_kv, qsa_path path) {
+    // keyed on the exact token count, capped: the load-time reserve pass runs at n_parallel tokens
+    // per stream, so collapsing every n_tps > 1 into one key would let it consume the slot that a
+    // real two-slot decode needs
+    constexpr int64_t n_tps_max = 8;
+
+    static const char * const names[QSA_PATH_COUNT] = {
+        "gathered (cells copied out)",
+        "cell list (backend skips unnamed cells, still converts the cache)",
+        "dense (whole cache)",
+    };
+
+    static bool reported[QSA_PATH_COUNT*(n_tps_max + 1)] = { false };
+
+    const int key = path*(n_tps_max + 1) + (int) std::min(n_tps, n_tps_max);
 
     if (!reported[key]) {
         reported[key] = true;
 
-        LLAMA_LOG_WARN("qsa: path n_tps=%" PRId64 " n_kv=%" PRId64 " -> %s\n",
-                n_tps, n_kv, gathered ? "gathered (sparse cell list)" : "masked (dense over n_kv)");
+        LLAMA_LOG_WARN("qsa: path n_tps=%" PRId64 " n_kv=%" PRId64 " -> %s\n", n_tps, n_kv, names[path]);
     }
 }
 
@@ -1074,28 +1095,48 @@ static bool qsa_gather_enabled() {
     return enabled;
 }
 
-// One gathered K/V can serve the whole batch only when every query named the same cells, which
-// means one token per stream; with more, each token has its own top_k. It also has to be a real
-// shrink, or the copy costs more than the masked read it replaces. A transposed V cache is laid
-// out by dimension rather than by cell, so its cells are not gatherable rows.
-static bool qsa_gather_pays_off(const ggml_tensor * top_k, const ggml_tensor * k_cache, const ggml_tensor * v_cache) {
-    const bool one_selection_per_stream = top_k->ne[1] == 1;
-    const bool shrinks_the_read         = 2*top_k->ne[0] <= k_cache->ne[2];
-    const bool v_transposed             = v_cache->nb[1] > v_cache->nb[2];
+// [TAG_QSA_GATHER_BATCH] Tokens select different cells, so each one needs its own gathered K/V.
+// They get it by becoming their own flash-attention batch entry rather than their own graph:
+// n_tps tokens of n_stream streams turn into n_tps*n_stream batches of one token each, which is
+// the layout ggml_flash_attn_ext already broadcasts K/V over. LLAMA_QSA_GATHER_MAX_TOKENS=1
+// restores the single-token rule this path shipped with.
+static int64_t qsa_gather_max_tokens() {
+    static const int64_t limit = []() {
+        const char * requested = getenv("LLAMA_QSA_GATHER_MAX_TOKENS");
 
-    return qsa_gather_enabled() && one_selection_per_stream && shrinks_the_read && !v_transposed;
+        return requested == nullptr ? (int64_t) 16 : (int64_t) atoi(requested);
+    }();
+
+    return limit;
+}
+
+// The gather has to stay a real shrink, and it now grows with the batch: n_tps tokens copy n_tps
+// times top_k's worth of cells, against a masked read of the cache that costs the same whatever
+// the batch is. The token cap is the second half of that - a prefill ubatch would ask for a
+// thousand copies long before the byte test noticed. A transposed V cache is laid out by
+// dimension rather than by cell, so its cells are not gatherable rows.
+static bool qsa_gather_pays_off(const ggml_tensor * top_k, const ggml_tensor * k_cache, const ggml_tensor * v_cache) {
+    const int64_t n_tps = top_k->ne[1];
+
+    const bool batch_stays_small = n_tps <= qsa_gather_max_tokens();
+    const bool shrinks_the_read  = 2*top_k->ne[0]*n_tps <= k_cache->ne[2];
+    const bool v_transposed      = v_cache->nb[1] > v_cache->nb[2];
+
+    return qsa_gather_enabled() && batch_stays_small && shrinks_the_read && !v_transposed;
 }
 
 // Head and head-dim are contiguous within one cell, so they merge into a single row and get_rows
-// can index the cell dimension directly.
-static ggml_tensor * qsa_gather_cells(ggml_context * ctx0, ggml_tensor * cache, ggml_tensor * cell_idx) {
+// can index the cell dimension directly. One index row holds every token of one stream, laid out
+// token-major, so splitting the gathered rows at `width` puts each token on its own batch entry.
+static ggml_tensor * qsa_gather_cells(ggml_context * ctx0, ggml_tensor * cache, ggml_tensor * cell_idx, int64_t width) {
     ggml_tensor * cells = ggml_view_3d(ctx0, cache,
             cache->ne[0]*cache->ne[1], cache->ne[2], cache->ne[3],
             cache->nb[2], cache->nb[3], 0);
 
     ggml_tensor * selected = ggml_get_rows(ctx0, cells, cell_idx);
 
-    return ggml_reshape_4d(ctx0, selected, cache->ne[0], cache->ne[1], cell_idx->ne[0], cache->ne[3]);
+    return ggml_reshape_4d(ctx0, selected, cache->ne[0], cache->ne[1], width,
+            (cell_idx->ne[0]/width)*cache->ne[3]);
 }
 
 // Dense GQA self-attention restricted to the cells that top_k names.
@@ -1144,7 +1185,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     const bool gathered = qsa_gather_pays_off(top_k, k_cache, v_cache);
 
-    qsa_report_path(kq_mask->ne[1], kq_mask->ne[0], gathered);
+    const qsa_path selection = qsa_direct_indices ? QSA_PATH_CELL_LIST : QSA_PATH_DENSE;
+
+    qsa_report_path(kq_mask->ne[1], kq_mask->ne[0], gathered ? QSA_PATH_GATHERED : selection);
 
     ggml_tensor * cur = gathered
         ? build_attn_qsa_gathered(q_cur, k_cache, v_cache, kq_mask, top_k, kq_scale, il)
@@ -1271,25 +1314,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa_gathered(
         float         kq_scale,
         int           il) {
     const int64_t width     = top_k->ne[0];
+    const int64_t n_tps     = top_k->ne[1];
     const int64_t n_stream  = top_k->ne[3];
 
-    // [n_top_k, 1, 1, n_stream] -> [n_top_k, n_stream, 1]: get_rows takes one index row per stream
-    ggml_tensor * cell_idx = ggml_reshape_3d(ctx0, top_k, width, n_stream, 1);
+    // [TAG_QSA_GATHER_BATCH] get_rows indexes the cell axis of a [.., n_kv, n_stream] view, so its
+    // index tensor carries n_stream rows and nothing else: every token of a stream shares one row,
+    // [n_top_k, n_tps, 1, n_stream] -> [n_top_k*n_tps, n_stream, 1]. The gathered rows then split
+    // back apart at n_top_k, which is what puts token t of stream s at batch entry s*n_tps + t -
+    // the same order the query batch already uses.
+    ggml_tensor * cell_idx = ggml_reshape_3d(ctx0, top_k, width*n_tps, n_stream, 1);
 
-    ggml_tensor * k_sel = qsa_gather_cells(ctx0, k_cache, cell_idx);
-    ggml_tensor * v_sel = qsa_gather_cells(ctx0, v_cache, cell_idx);
+    ggml_tensor * k_sel = qsa_gather_cells(ctx0, k_cache, cell_idx, width);
+    ggml_tensor * v_sel = qsa_gather_cells(ctx0, v_cache, cell_idx, width);
 
     // top_k still names masked cells when the cache holds fewer live cells than its budget, so the
-    // mask travels through the same gather. [n_kv, 1, 1, n_stream] -> [1, n_kv, 1, n_stream] puts
-    // the cells on the axis get_rows indexes.
+    // mask travels through the same gather. [n_kv, n_tps, 1, n_stream] -> [1, n_kv, n_tps, n_stream]
+    // puts the cells on the axis get_rows indexes and leaves a row per token to index it with.
     ggml_tensor * mask_cells = ggml_view_4d(ctx0, kq_mask,
-            1, kq_mask->ne[0], 1, kq_mask->ne[3],
-            kq_mask->nb[0], kq_mask->nb[0]*kq_mask->ne[0], kq_mask->nb[3], 0);
+            1, kq_mask->ne[0], n_tps, n_stream,
+            kq_mask->nb[0], kq_mask->nb[1], kq_mask->nb[3], 0);
 
     ggml_tensor * mask_sel = ggml_get_rows(ctx0, mask_cells,
-            ggml_reshape_4d(ctx0, top_k, width, 1, n_stream, 1));
+            ggml_reshape_4d(ctx0, top_k, width, n_tps, n_stream, 1));
 
-    mask_sel = ggml_cast(ctx0, ggml_reshape_4d(ctx0, mask_sel, width, 1, 1, n_stream), GGML_TYPE_F16);
+    mask_sel = ggml_cast(ctx0, ggml_reshape_4d(ctx0, mask_sel, width, 1, 1, n_tps*n_stream), GGML_TYPE_F16);
 
     return build_attn_mha(q_cur, k_sel, v_sel, nullptr, mask_sel, nullptr, nullptr, 0, kq_scale, il);
 }
