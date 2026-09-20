@@ -605,7 +605,8 @@ void llama_memory_hybrid_idx::set_input_qsa(
     std::vector<int32_t>  bid_cell;
     std::vector<int32_t>  bid_slot0;
 
-    std::vector<int32_t> order;
+    // [TAG_QSA_MROPE_RANK] per-sequence cell order for sequences holding an image
+    std::vector<std::vector<int32_t>> seq_order(LLAMA_MAX_SEQ);
     std::vector<int32_t> rank;
 
     for (int64_t s = 0; s < n_ns; ++s) {
@@ -645,7 +646,12 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
         bool dup = false;
 
+        // the sequences whose cells repeat an index within a block: an mrope image
+        llama_kv_cells::seq_set_t dup_seqs;
+
         bool ranked = false;
+
+        llama_kv_cells::seq_set_t ranked_seqs;
 
         auto group_cells = [&]() {
             // -1 means no usable block: an incomplete or short group cannot be pooled
@@ -661,6 +667,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
             oor = false;
             dup = false;
+            dup_seqs.reset();
 
             for (int64_t j = 0; j < n_kv; ++j) {
                 if (cells.is_empty(j)) {
@@ -698,7 +705,10 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
                 const uint64_t bit = uint64_t(1) << (idx%r);
 
-                dup |= (grp_slots[g] & bit) != 0;
+                if ((grp_slots[g] & bit) != 0) {
+                    dup = true;
+                    dup_seqs |= cells.seq_get_all((uint32_t) j);
+                }
 
                 cell_grp[j]   = g;
                 grp_slots[g] |= bit;
@@ -711,35 +721,67 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
         group_cells();
 
-        // mrope repeats one position across an image, so rank cells instead of using the position
-        if (dup && ubatch->is_pos_2d() && one_seq) {
-            order.clear();
-            order.reserve(n_kv);
+        // [TAG_QSA_MROPE_RANK] mrope repeats one position across an image, so rank cells instead of
+        // using the position. Ranks are per sequence: a unified cache holds every slot's cells at
+        // once, and a global order would count a neighbour's cells into this sequence's blocks.
+        // Before this the ranking required the pool to hold a single sequence, so an image under
+        // --parallel fell through to the position bucket: ~2000 cells of one image landed in one
+        // block, never completed, and every query paid ~500 forced spare blocks per image - which
+        // exhausted the top-k budget on image patches and left the text unread.
+        // A sequence without an image keeps rank == position (its positions run from 0 without
+        // gaps), so only the sequences carrying an image are ordered.
+        if (dup && ubatch->is_pos_2d()) {
+            rank.assign(n_kv, -1);
 
-            for (int64_t j = 0; j < n_kv; ++j) {
-                if (!cells.is_empty(j)) {
-                    order.push_back((int32_t) j);
+            ranked_seqs = dup_seqs;
+
+            for (int sq = 0; sq < LLAMA_MAX_SEQ; ++sq) {
+                if (!ranked_seqs.test(sq)) {
+                    continue;
+                }
+
+                auto & order = seq_order[sq];
+                order.clear();
+
+                for (const auto & [p, c] : cells.seq_pos_cells(sq)) {
+                    order.push_back((int32_t) c);
+                }
+
+                // same total order the mrope causal mask uses: pos, then ext.y, then ext.x. The
+                // cells arrive ordered by position, so only the image patches sharing one
+                // position are left to sort
+                for (size_t b = 0; b < order.size();) {
+                    const llama_pos p = cells.pos_get(order[b]);
+
+                    size_t e = b + 1;
+                    while (e < order.size() && cells.pos_get(order[e]) == p) {
+                        ++e;
+                    }
+
+                    if (e - b > 1) {
+                        std::sort(order.begin() + b, order.begin() + e, [&cells](int32_t ca, int32_t cb) {
+                            const auto & ea = cells.ext_get(ca);
+
+                            return cells.ext_get(cb).is_2d_gt(ea.x, ea.y);
+                        });
+                    }
+
+                    b = e;
+                }
+
+                // a cell shared between sequences (seq_cp) is a common prefix of both, so its rank
+                // agrees under either; the lowest sequence assigns it
+                for (int64_t k = 0; k < (int64_t) order.size(); ++k) {
+                    if (rank[order[k]] < 0) {
+                        rank[order[k]] = (int32_t) k;
+                    }
                 }
             }
 
-            // same total order the mrope causal mask uses: pos, then ext.y, then ext.x
-            std::sort(order.begin(), order.end(), [&cells](int32_t a, int32_t b) {
-                const llama_pos pa = cells.pos_get(a);
-                const llama_pos pb = cells.pos_get(b);
-
-                if (pa != pb) {
-                    return pa < pb;
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (rank[j] < 0 && !cells.is_empty(j)) {
+                    rank[j] = cells.pos_get(j);
                 }
-
-                const auto & ea = cells.ext_get(a);
-
-                return cells.ext_get(b).is_2d_gt(ea.x, ea.y);
-            });
-
-            rank.assign(n_kv, -1);
-
-            for (int64_t k = 0; k < (int64_t) order.size(); ++k) {
-                rank[order[k]] = (int32_t) k;
             }
 
             ranked = true;
@@ -982,10 +1024,12 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
             int64_t q = ubatch->pos[i];
 
-            if (ranked) {
+            if (ranked && ranked_seqs.test(seq_id)) {
                 const llama_pos qt = ubatch->pos[i];
                 const llama_pos qy = ubatch->pos[i + n_tokens];
                 const llama_pos qx = ubatch->pos[i + n_tokens*2];
+
+                const auto & order = seq_order[seq_id];
 
                 int64_t lo = 0;
                 int64_t hi = (int64_t) order.size();
@@ -1795,25 +1839,6 @@ uint32_t llama_memory_hybrid_idx_context::qsa_pooled_n_dirty_max(const llama_uba
             }
         }
 
-        // mrope repeats one position across an image, so set_input_qsa ranks the cells instead of
-        // using their positions: blocks then cut the live-cell line, which an image advances far
-        // faster than the position line. bound both, or the tables undersize on any image ubatch.
-        //
-        // set_input_qsa only ranks when one sequence is present, so mirror that test exactly. Whether
-        // the stream is shared is a property of the stream, not of a sequence in it, so test it once.
-        bool stream_shared = false;
-        {
-            const auto & cells = mem->get_mem_idx()->get_cells(seqs.front());
-
-            int n_seq_present = 0;
-            for (int sq = 0; sq < LLAMA_MAX_SEQ && n_seq_present < 2; ++sq) {
-                if (cells.seq_pos_min(sq) >= 0) {
-                    n_seq_present++;
-                }
-            }
-            stream_shared = n_seq_present > 1;
-        }
-
         int64_t stream_dirty = 0;
 
         for (const llama_seq_id seq : seqs) {
@@ -1826,10 +1851,12 @@ uint32_t llama_memory_hybrid_idx_context::qsa_pooled_n_dirty_max(const llama_uba
 
             const auto & cells = mem->get_mem_idx()->get_cells(seq);
 
-            // a shared stream cuts positions, and get_used() would then be the whole pool -
-            // this sequence's own position span is the bound that belongs to it
-            const int64_t n_live = stream_shared ? (int64_t) cells.seq_pos_max(seq) + 1
-                                                 : (int64_t) cells.get_used();
+            // [TAG_QSA_MROPE_RANK] set_input_qsa buckets a sequence by position, or by rank once an
+            // mrope image repeats a position: an image advances the cell count far faster than
+            // the position span, so bound by the larger of the two. get_used() would count the
+            // whole unified pool, so the bound is taken from this sequence's own cells
+            const int64_t n_live = std::max<int64_t>((int64_t) cells.seq_pos_max(seq) + 1,
+                                                     (int64_t) cells.seq_pos_cells(seq).size());
 
             const int64_t n_complete = std::max<int64_t>((int64_t) (q_max + 1)/ratio, n_live/ratio);
             const int64_t w          = std::min(mem->pooled_valid(seq), n_complete);
