@@ -1191,8 +1191,64 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
     return false;
 }
 
+// [TAG_GALLOC_LAYOUT_IDENTITY] the layout is reused position by position, so it is only valid
+// when every src still names the tensor at the same position as the graph that reserved it. A
+// rebuilt graph with the same counts but a different order (a scheduler input copy discovered in
+// a different place) gives a tensor the slot and lifetime of another and corrupts it silently.
+static bool ggml_gallocr_layout_matches(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    ggml_hash_set_reset(&galloc->hash_set);
+    memset(galloc->hash_values, 0, sizeof(struct hash_node) * galloc->hash_set.size);
+
+    for (int i = 0; i < graph->n_nodes; i++) {
+        const struct tensor_alloc * ta = &galloc->node_allocs[i].dst;
+        if (ta->buffer_id < 0) {
+            continue;
+        }
+        struct hash_node * hn = ggml_gallocr_hash_get(galloc, graph->nodes[i]);
+        hn->buffer_id = ta->buffer_id;
+        hn->addr      = ta->addr;
+        hn->allocated = true;
+    }
+    for (int i = 0; i < graph->n_leafs; i++) {
+        const struct tensor_alloc * ta = &galloc->leaf_allocs[i].leaf;
+        if (ta->buffer_id < 0) {
+            continue;
+        }
+        struct hash_node * hn = ggml_gallocr_hash_get(galloc, graph->leafs[i]);
+        hn->buffer_id = ta->buffer_id;
+        hn->addr      = ta->addr;
+        hn->allocated = true;
+    }
+
+    static int n_logged = 0;
+    for (int i = 0; i < graph->n_nodes; i++) {
+        struct ggml_tensor * node = graph->nodes[i];
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            struct ggml_tensor * src = node->src[j];
+            const struct tensor_alloc * ta = &galloc->node_allocs[i].src[j];
+            if (src == NULL || ta->buffer_id < 0 || src->data != NULL || src->view_src != NULL) {
+                continue;
+            }
+            const struct hash_node * hn = ggml_gallocr_hash_get(galloc, src);
+            if (hn->allocated && hn->buffer_id == ta->buffer_id &&
+                    hn->addr.chunk == ta->addr.chunk && hn->addr.offset == ta->addr.offset) {
+                continue;
+            }
+            if (n_logged < 8) {
+                n_logged++;
+                GGML_LOG_WARN("%s: src %d (%s) of node %d (%s) is not the tensor the reserved layout placed there (own slot buf %d chunk %d off %zu vs recorded buf %d chunk %d off %zu); reallocating\n",
+                        __func__, j, src->name, i, node->name,
+                        hn->allocated ? hn->buffer_id : -1, hn->allocated ? hn->addr.chunk : -1, hn->allocated ? hn->addr.offset : (size_t) 0,
+                        ta->buffer_id, ta->addr.chunk, ta->addr.offset);
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
 bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
-    if (ggml_gallocr_needs_realloc(galloc, graph)) {
+    if (ggml_gallocr_needs_realloc(galloc, graph) || !ggml_gallocr_layout_matches(galloc, graph)) {
         if (galloc->n_buffers == 1) {
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: reallocating buffers automatically\n", __func__);

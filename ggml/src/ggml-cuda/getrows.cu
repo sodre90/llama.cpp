@@ -521,6 +521,13 @@ static void ggml_cuda_check_get_rows_indices(const ggml_tensor * dst, cudaStream
         return;
     }
 
+    // a synchronize is illegal while a CUDA graph is being captured
+    cudaStreamCaptureStatus capture_status;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+    if (capture_status != cudaStreamCaptureStatusNone) {
+        return;
+    }
+
     std::vector<int32_t> idx(n_idx);
     CUDA_CHECK(cudaMemcpyAsync(idx.data(), src1->data, n_idx*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));

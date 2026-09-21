@@ -642,6 +642,58 @@ static void test_reallocation() {
     }
 }
 
+// [TAG_GALLOC_LAYOUT_IDENTITY] a rebuilt graph with the same node and leaf counts but the
+// two inputs listed in the other order must not inherit the layout position by position:
+// the short-lived input's slot would be handed to the long-lived one and reused underneath it
+static void test_layout_identity_on_reordered_inputs() {
+    dummy_backend    backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_gallocr_ptr galloc;
+
+    auto build = [](ggml_context * ctx, ggml_cgraph * graph, bool long_lived_input_first, ggml_tensor ** out_tensors) {
+        ggml_tensor * short_lived = make_input_with_size(ctx, 8);
+        ggml_tensor * long_lived  = make_input_with_size(ctx, 8);
+        ggml_tensor * t0  = ggml_scale(ctx, short_lived, 2.0f);
+        ggml_tensor * t1  = ggml_scale(ctx, t0, 2.0f);
+        ggml_tensor * out = ggml_add(ctx, t1, long_lived);
+        assign_names(ctx);
+        ggml_set_output(out);
+        if (long_lived_input_first) {
+            ggml_build_forward_expand(graph, long_lived);
+        }
+        ggml_build_forward_expand(graph, out);
+        out_tensors[0] = short_lived;
+        out_tensors[1] = long_lived;
+        out_tensors[2] = t1;
+        out_tensors[3] = out;
+    };
+
+    int n_nodes_first = 0;
+    int n_leafs_first = 0;
+    {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * t[4];
+        build(ctx, graph, false, t);
+        galloc = ggml_gallocr_ptr(ggml_gallocr_new(&backend.buffer_type));
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        check_all_allocated(graph);
+        n_nodes_first = graph->n_nodes;
+        n_leafs_first = graph->n_leafs;
+    }
+    {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * t[4];
+        build(ctx, graph, true, t);
+        GGML_ASSERT(graph->n_nodes == n_nodes_first && graph->n_leafs == n_leafs_first);
+        GGML_ASSERT(graph->leafs[0] == t[1] && graph->leafs[1] == t[0]);
+
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        check_all_allocated(graph);
+        // t1 is computed while long_lived is still needed by out: they must not share memory
+        GGML_ASSERT(t[2]->data != t[1]->data);
+        GGML_ASSERT(t[0]->data != t[1]->data);
+    }
+}
+
 static void test_backend_graph_optimize(ggml_backend_t /*backend*/, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
     GGML_ASSERT(graph->n_nodes == 3);
     params->add_alloc_dep(params->user_data, graph->nodes[0], graph->nodes[2]);
@@ -1120,6 +1172,7 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
+    run("test_layout_identity_on_reordered_inputs", test_layout_identity_on_reordered_inputs);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     run("test_buft_alloc_buffer_n_single_buffer", test_buft_alloc_buffer_n_single_buffer);
     run("test_buft_alloc_buffer_n_multi_buffer", test_buft_alloc_buffer_n_multi_buffer);
