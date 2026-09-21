@@ -1263,6 +1263,42 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
+// [TAG_SCHED_WEIGHT_INPUTS_LAST] a split's input copies are allocated together at its start, in
+// discovery order. A graph-wide table that every later split reads (a few hundred KiB) discovered
+// after a weight staging copy of hundreds of MiB lands above it, and once the staging copy is
+// freed that table pins the last free block for the rest of the graph: every later tensor that
+// no hole can take grows the buffer from there (measured: 0.3 + 0.5 MiB at 599 MiB held the
+// 577 MiB flash-attention reserve at 603 MiB while the live set below ended at 255 MiB).
+// Weight staging copies last puts the long-lived tables under the transient staging.
+// GGML_SCHED_KEEP_INPUT_ORDER=1 restores the discovery order.
+//
+// The key must not depend on tensor shapes: ggml_gallocr_alloc_graph reuses the previous layout
+// position by position whenever the node and leaf counts match, so the copies of a rebuilt graph
+// have to line up with the copies of the graph that reserved it. Ordering by ggml_nbytes swapped
+// two copies when the batch composition changed (3 -> 2 sequences at 70-90k tokens): one copy
+// inherited the slot and lifetime of the other, was overwritten mid-split, and the pooled-key
+// gather read a float as a row index (ten Xid 31 aborts on 2026-09-21).
+static bool ggml_backend_sched_keep_input_order(void) {
+    static int keep = -1;
+    if (keep < 0) {
+        keep = getenv("GGML_SCHED_KEEP_INPUT_ORDER") != NULL ? 1 : 0;
+    }
+    return keep == 1;
+}
+
+static bool ggml_backend_sched_input_is_weight(const ggml_tensor * t) {
+    return t->buffer != NULL && ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+}
+
+static void ggml_backend_sched_order_split_inputs_weights_last(struct ggml_backend_sched_split * split) {
+    if (ggml_backend_sched_keep_input_order() || split->n_inputs < 2) {
+        return;
+    }
+    std::stable_sort(split->inputs, split->inputs + split->n_inputs, [](const ggml_tensor * a, const ggml_tensor * b) {
+        return !ggml_backend_sched_input_is_weight(a) && ggml_backend_sched_input_is_weight(b);
+    });
+}
+
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
     sched->n_splits = 0;
@@ -1710,6 +1746,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     for (int i = 0; i < sched->n_splits; i++) {
         struct ggml_backend_sched_split * split = &sched->splits[i];
+
+        ggml_backend_sched_order_split_inputs_weights_last(split);
 
         // add inputs to the graph copy so that they are allocated by ggml-alloc at the start of the split
         for (int j = 0; j < split->n_inputs; j++) {
