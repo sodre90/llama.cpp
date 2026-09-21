@@ -30,6 +30,7 @@
 
 struct llama_model;
 struct ggml_tensor;
+typedef struct ggml_backend * ggml_backend_t;
 
 // the cache chain is built (and routing observed) only for ubatches this small:
 // decode of up to this many concurrent sequences. Larger ubatches are prefill,
@@ -65,8 +66,15 @@ const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * up_exps
 
 // ggml_backend_sched_expert_rows_fn over the cache: lets the scheduler's prefill upload of a
 // host-resident up/gate/down weight fill the resident experts from their slots instead of over the
-// host link. The table it hands out only changes in llama_moe_cache_step(), between graphs.
+// host link. Entries of experts the running ubatch routes to only change in llama_moe_cache_step(),
+// between graphs; llama_moe_cache_warm_from_staging() may retire unused experts mid-graph.
 bool llama_moe_cache_expert_rows(const ggml_tensor * weight, const ggml_tensor ** rows, const int32_t ** expert_slot, int32_t * n_slots, void * user_data);
+
+// ggml_backend_sched_expert_staged_fn over the cache: copies experts a prefill ubatch has already
+// staged on the device into free and probation slots (LLAMA_MOE_CACHE_WARM_MAX per layer per
+// ubatch, 0 = off). The new mapping is published by the next llama_moe_cache_step().
+void llama_moe_cache_warm_from_staging(const ggml_tensor * weight, const ggml_tensor * staged,
+        const int32_t * ids, int64_t ne0, int64_t ne1, size_t s0, size_t s1, ggml_backend_t backend, void * user_data);
 
 // apply throttled LRU updates; call between graph executions only
 void llama_moe_cache_step();

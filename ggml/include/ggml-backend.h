@@ -379,6 +379,15 @@ extern "C" {
     typedef bool (*ggml_backend_sched_expert_rows_fn)(const struct ggml_tensor * weight, const struct ggml_tensor ** rows, const int32_t ** expert_slot, int32_t * n_slots, void * user_data);
     GGML_API void                 ggml_backend_sched_set_expert_rows_callback(ggml_backend_sched_t sched, ggml_backend_sched_expert_rows_fn fn, void * user_data);
 
+    // Called once the used experts of a host-resident MUL_MAT_ID weight have been queued into `staged`
+    // (the split's device copy of `weight`) on `backend`'s stream, with the routing `ids` of the ubatch
+    // ([n_expert_used, n_tokens], element strides s0/s1). Lets an expert cache pull rows out of the
+    // staged copy device-to-device instead of re-reading them over the host link. Copies issued from
+    // the callback must be queued on `backend` so they run before the next split reuses `staged`.
+    typedef void (*ggml_backend_sched_expert_staged_fn)(const struct ggml_tensor * weight, const struct ggml_tensor * staged,
+        const int32_t * ids, int64_t ne0, int64_t ne1, size_t s0, size_t s1, ggml_backend_t backend, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_expert_staged_callback(ggml_backend_sched_t sched, ggml_backend_sched_expert_staged_fn fn, void * user_data);
+
     //
     // Meta backend
     //
