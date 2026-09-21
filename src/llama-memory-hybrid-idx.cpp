@@ -21,6 +21,28 @@
 // llama_memory_hybrid_idx
 //
 
+// [TAG_QSA_POOLED_CACHE] the pooled rows are written whole by set_rows and read back by get_rows
+// (or as a mul_mat operand), never accumulated, so their storage type is free to choose: the
+// raw keys they summarise are already q8_0. LLAMA_QSA_POOLED_TYPE=f32|f16|q8_0 (default q8_0).
+static ggml_type qsa_pooled_store_type(uint32_t idx_dim) {
+    const char * env = getenv("LLAMA_QSA_POOLED_TYPE");
+    const std::string want = env ? env : "q8_0";
+    ggml_type type = GGML_TYPE_Q8_0;
+    if (want == "f32") {
+        type = GGML_TYPE_F32;
+    } else if (want == "f16") {
+        type = GGML_TYPE_F16;
+    } else if (want != "q8_0") {
+        LLAMA_LOG_WARN("%s: unknown LLAMA_QSA_POOLED_TYPE '%s', using q8_0\n", __func__, want.c_str());
+    }
+    if (idx_dim % ggml_blck_size(type) != 0) {
+        LLAMA_LOG_WARN("%s: indexer head size %u is not a multiple of the %s block, storing pooled keys as f16\n",
+                __func__, idx_dim, ggml_type_name(type));
+        type = GGML_TYPE_F16;
+    }
+    return type;
+}
+
 llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const llama_model & model,
                             /* attn */
@@ -85,6 +107,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
 
         const uint32_t idx_dim        = model.hparams.indexer_head_size;
         const uint32_t n_stream_total = mem_idx->get_n_stream();
+        const ggml_type pooled_type   = qsa_pooled_store_type(idx_dim);
 
         if (ratio > 0 && idx_dim > 0 && n_stream_total > 0) {
             const uint32_t per_seq_limit = (kv_unified_per_slot > 0 && kv_unified_per_slot < kv_size)
@@ -140,7 +163,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
                     pooled_ctxs.emplace_back(ggml_init(ip));
                 }
 
-                ggml_tensor * t = ggml_new_tensor_3d(pooled_ctxs[ci].get(), GGML_TYPE_F32, idx_dim, pooled_rows, n_stream_total);
+                ggml_tensor * t = ggml_new_tensor_3d(pooled_ctxs[ci].get(), pooled_type, idx_dim, pooled_rows, n_stream_total);
                 ggml_format_name(t, "idx_pooled_l%u", il);
                 pooled_k[(int32_t) il] = t;
                 per_buf_tensors[ci].push_back(t);
@@ -156,9 +179,9 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             }
 
             if (!pooled_k.empty()) {
-                LLAMA_LOG_INFO("%s: pooled indexer key cache, %zu layers x %u rows x %u streams on %zu buffers, %.2f MiB\n",
+                LLAMA_LOG_WARN("%s: pooled indexer key cache, %zu layers x %u rows x %u streams on %zu buffers, %s, %.2f MiB\n",
                         __func__, pooled_k.size(), pooled_rows, n_stream_total, pooled_bufs.size(),
-                        total_bytes/1024.0/1024.0);
+                        ggml_type_name(pooled_type), total_bytes/1024.0/1024.0);
             }
         }
     }
