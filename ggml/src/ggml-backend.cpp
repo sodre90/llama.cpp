@@ -1023,6 +1023,10 @@ struct ggml_backend_sched {
     ggml_backend_sched_expert_rows_fn expert_rows_fn;
     void * expert_rows_user_data;
     bool expert_rows_d2d;
+
+    // told about every staged used-experts upload (see ggml_backend_sched_set_expert_staged_callback)
+    ggml_backend_sched_expert_staged_fn expert_staged_fn;
+    void * expert_staged_user_data;
     bool expert_copy_stats;
 
     // GGML_SCHED_SPLIT_STATS=1: per-split wall time (input copies and syncs vs compute launch),
@@ -2385,6 +2389,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->expert_rows_fn        = NULL;
     sched->expert_rows_user_data = NULL;
+    sched->expert_staged_fn = NULL;
+    sched->expert_staged_user_data = NULL;
     const char * GGML_SCHED_EXPERT_CACHE_D2D = getenv("GGML_SCHED_EXPERT_CACHE_D2D");
     sched->expert_rows_d2d = GGML_SCHED_EXPERT_CACHE_D2D ? atoi(GGML_SCHED_EXPERT_CACHE_D2D) != 0 : true;
     const char * GGML_SCHED_EXPERT_COPY_STATS = getenv("GGML_SCHED_EXPERT_COPY_STATS");
@@ -2458,6 +2464,12 @@ void ggml_backend_sched_set_expert_rows_callback(ggml_backend_sched_t sched, ggm
     if (sched == NULL) { return; }
     sched->expert_rows_fn        = fn;
     sched->expert_rows_user_data = user_data;
+}
+
+void ggml_backend_sched_set_expert_staged_callback(ggml_backend_sched_t sched, ggml_backend_sched_expert_staged_fn fn, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->expert_staged_fn = fn;
+    sched->expert_staged_user_data = user_data;
 }
 
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {

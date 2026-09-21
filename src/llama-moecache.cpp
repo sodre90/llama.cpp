@@ -42,6 +42,19 @@ struct layer_state {
 
     std::vector<bool>     slot_in_flight; // slot has an upload pending
 
+    // [TAG_MOE_CACHE_WARM_FILL] experts a prefill ubatch already streamed to the device and that
+    // are being copied into free or probation slots device-to-device; published at the next step
+    // once all three of up/gate/down have been copied (each sets its bit in `copied`)
+    struct warm_entry {
+        int32_t expert;
+        int32_t slot;
+        int     copied;
+    };
+    std::vector<warm_entry> warm_plan;   // the ubatch being staged now
+    std::vector<warm_entry> warm_done;   // fully copied by an earlier ubatch of this step, awaiting publish
+    int                     warm_seen = 0; // up/gate/down bits already staged for warm_plan
+    std::vector<uint16_t>   warm_demand;   // scratch: expert id -> tokens routed to it
+
     int32_t n_slots       = 0; // this layer's slot count (mirrors pub.n_slots)
     int32_t max_protected = 0; // SLRU protected cap for this layer
 
@@ -49,6 +62,7 @@ struct layer_state {
     uint64_t n_miss   = 0;
     uint64_t n_insert = 0;
     uint64_t n_evict  = 0;
+    uint64_t n_warm   = 0; // slots filled from a prefill's staged copy
 
     uint64_t last_log_hits   = 0;
     uint64_t last_log_misses = 0;
@@ -66,6 +80,7 @@ struct moe_cache {
     int32_t max_inserts   = 2;
     int32_t protected_pct = 75; // SLRU protected segment share, LLAMA_MOE_CACHE_PROTECTED_PCT
     bool    rank_by_demand = true; // LLAMA_MOE_CACHE_INSERT_ORDER=recency restores last-observed-first
+    int32_t warm_max      = 0;  // LLAMA_MOE_CACHE_WARM_MAX: slots per layer a prefill may fill from its staged copy, 0 = off
 
     uint64_t clock   = 0;
     uint64_t n_steps = 0;
@@ -178,6 +193,18 @@ void set_table_entry(llama_moe_cache_layer & pub, int32_t expert, int32_t slot_o
     const int32_t v = slot_or_dummy;
     ggml_backend_tensor_set(pub.dev_table,  &v, (size_t) expert*sizeof(int32_t), sizeof(int32_t));
     ggml_backend_tensor_set(pub.host_table, &v, (size_t) expert*sizeof(int32_t), sizeof(int32_t));
+}
+
+void set_host_table_entry(llama_moe_cache_layer & pub, int32_t expert, int32_t slot_or_dummy) {
+    const int32_t v = slot_or_dummy;
+    ggml_backend_tensor_set(pub.host_table, &v, (size_t) expert*sizeof(int32_t), sizeof(int32_t));
+}
+
+// while graphs may be in flight: the device table changes in stream order, after the graph that
+// may still gather through it and before the one built from the host table (one pageable H2D,
+// which CUDA fences against the stream, per layer)
+void mirror_table_in_stream(llama_moe_cache_layer & pub, ggml_backend_t backend) {
+    ggml_backend_tensor_set_async(backend, pub.dev_table, pub.host_table->data, 0, ggml_nbytes(pub.host_table));
 }
 
 void promote_to_protected(layer_state & ls, int32_t slot, int32_t n_slots, int32_t max_protected, uint64_t clock) {
@@ -302,6 +329,112 @@ void age_demand(layer_state & ls, bool keep_one_step) {
     ls.pending.swap(kept);
 }
 
+// the ubatch's staging is over: fully copied entries wait for the next step to be published,
+// a partial one gives its slot back (its table entry is still the dummy)
+void close_warm_plan(layer_state & ls) {
+    for (const auto & w : ls.warm_plan) {
+        if (w.copied == 7) {
+            ls.warm_done.push_back(w);
+        } else {
+            ls.expert_slot[w.expert]  = -1;
+            ls.slot_in_flight[w.slot] = false;
+            if (w.copied != 0) {
+                LLAMA_LOG_WARN("moe-cache: layer %d expert %d warm-fill incomplete (copied mask %d), slot %d released\n",
+                        ls.pub.il, w.expert, w.copied, w.slot);
+            }
+        }
+    }
+    ls.warm_plan.clear();
+    ls.warm_seen = 0;
+}
+
+// between graphs: the copies ran on the compute stream ahead of the next graph, publish them
+void settle_warm_plans(moe_cache & mc) {
+    for (auto & ls : mc.layers) {
+        close_warm_plan(ls);
+        for (const auto & w : ls.warm_done) {
+            ls.slot_expert[w.slot]    = w.expert;
+            ls.expert_slot[w.expert]  = w.slot;
+            ls.slot_last_use[w.slot]  = ++mc.clock;
+            ls.slot_in_flight[w.slot] = false;
+            ls.n_warm++;
+            set_table_entry(ls.pub, w.expert, w.slot);
+        }
+        ls.warm_done.clear();
+    }
+}
+
+// victims: empty slots, then probation slots holding an expert this ubatch does not route to,
+// least recently used first; protected and in-flight slots are never taken
+void plan_warm_fill(moe_cache & mc, layer_state & ls, const int32_t * ids, int64_t ne0, int64_t ne1, size_t s0, size_t s1, ggml_backend_t backend) {
+    const int64_t n_expert = (int64_t) ls.warm_demand.size();
+    std::fill(ls.warm_demand.begin(), ls.warm_demand.end(), 0);
+    for (int64_t i1 = 0; i1 < ne1; ++i1) {
+        for (int64_t i0 = 0; i0 < ne0; ++i0) {
+            const int32_t id = ids[i1*s1 + i0*s0];
+            if (id >= 0 && id < n_expert && ls.warm_demand[id] < UINT16_MAX) {
+                ls.warm_demand[id]++;
+            }
+        }
+    }
+
+    std::vector<int32_t> wanted;
+    for (int32_t id = 0; id < n_expert; ++id) {
+        if (ls.warm_demand[id] > 0 && ls.expert_slot[id] == -1) {
+            wanted.push_back(id);
+        }
+    }
+    std::stable_sort(wanted.begin(), wanted.end(), [&ls](int32_t a, int32_t b) { return ls.warm_demand[a] > ls.warm_demand[b]; });
+    if ((int32_t) wanted.size() > mc.warm_max) {
+        wanted.resize(mc.warm_max);
+    }
+
+    std::vector<int32_t> victims;
+    for (int32_t s = 0; s < ls.n_slots && victims.size() < wanted.size(); ++s) {
+        if (ls.slot_expert[s] < 0 && !ls.slot_in_flight[s]) {
+            victims.push_back(s);
+        }
+    }
+    if (victims.size() < wanted.size()) {
+        std::vector<int32_t> probation;
+        for (int32_t s = 0; s < ls.n_slots; ++s) {
+            const int32_t e = ls.slot_expert[s];
+            if (e >= 0 && !ls.slot_protected[s] && !ls.slot_in_flight[s] && ls.warm_demand[e] == 0) {
+                probation.push_back(s);
+            }
+        }
+        std::stable_sort(probation.begin(), probation.end(), [&ls](int32_t a, int32_t b) { return ls.slot_last_use[a] < ls.slot_last_use[b]; });
+        for (int32_t s : probation) {
+            if (victims.size() >= wanted.size()) {
+                break;
+            }
+            victims.push_back(s);
+        }
+    }
+
+    ls.warm_plan.clear();
+    bool evicted = false;
+    for (size_t i = 0; i < victims.size(); ++i) {
+        const int32_t slot   = victims[i];
+        const int32_t id     = wanted[i];
+        const int32_t victim = ls.slot_expert[slot];
+        if (victim >= 0) {
+            ls.expert_slot[victim] = -1;
+            ls.slot_expert[slot]   = -1;
+            set_host_table_entry(ls.pub, victim, ls.n_slots);
+            ls.n_evict++;
+            evicted = true;
+        }
+        ls.slot_protected[slot] = false;
+        ls.slot_in_flight[slot] = true;
+        ls.expert_slot[id]      = -2;
+        ls.warm_plan.push_back({id, slot, 0});
+    }
+    if (evicted) {
+        mirror_table_in_stream(ls.pub, backend);
+    }
+}
+
 struct layer_window_rate {
     int    il;
     double hit_pct;
@@ -314,6 +447,7 @@ void log_window_stats(moe_cache & mc) {
     uint64_t m   = 0;
     uint64_t ins = 0;
     uint64_t ev  = 0;
+    uint64_t wm  = 0;
     std::vector<layer_window_rate> rates;
     rates.reserve(mc.layers.size());
     for (auto & ls : mc.layers) {
@@ -321,6 +455,7 @@ void log_window_stats(moe_cache & mc) {
         m   += ls.n_miss;
         ins += ls.n_insert;
         ev  += ls.n_evict;
+        wm  += ls.n_warm;
 
         const uint64_t lh = ls.n_hit  - ls.last_log_hits;
         const uint64_t lm = ls.n_miss - ls.last_log_misses;
@@ -338,8 +473,8 @@ void log_window_stats(moe_cache & mc) {
     const double total_rate = (h + m > 0) ? (100.0 * h / (h + m)) : 0.0;
     const double win_rate   = (dh + dm > 0) ? (100.0 * dh / (dh + dm)) : 0.0;
 
-    LLAMA_LOG_WARN("moe-cache: steps=%" PRIu64 " win_hit=%.1f%% (%" PRIu64 "/%" PRIu64 ") total_hit=%.1f%% (%" PRIu64 "/%" PRIu64 ") ins=%" PRIu64 " evict=%" PRIu64 " prot=%d%%\n",
-            mc.n_steps, win_rate, dh, dh + dm, total_rate, h, h + m, ins, ev, mc.protected_pct);
+    LLAMA_LOG_WARN("moe-cache: steps=%" PRIu64 " win_hit=%.1f%% (%" PRIu64 "/%" PRIu64 ") total_hit=%.1f%% (%" PRIu64 "/%" PRIu64 ") ins=%" PRIu64 " warm=%" PRIu64 " evict=%" PRIu64 " prot=%d%%\n",
+            mc.n_steps, win_rate, dh, dh + dm, total_rate, h, h + m, ins, wm, ev, mc.protected_pct);
 
     if (rates.empty()) {
         return;
@@ -387,6 +522,9 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
         }
         if (const char * env = getenv("LLAMA_MOE_CACHE_INSERT_ORDER")) {
             mc->rank_by_demand = strcmp(env, "recency") != 0;
+        }
+        if (const char * env = getenv("LLAMA_MOE_CACHE_WARM_MAX")) {
+            mc->warm_max = std::max(0, atoi(env));
         }
         const std::map<int, int32_t> layer_slots_override = parse_layer_slots(getenv("LLAMA_MOE_CACHE_LAYER_SLOTS"));
 
@@ -510,6 +648,7 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
             ls.slot_in_flight.assign(ls.n_slots, false);
             ls.demand_cur.assign(n_expert, 0);
             ls.demand_prev.assign(n_expert, 0);
+            ls.warm_demand.assign(n_expert, 0);
             slots_total += ls.n_slots;
 
             std::vector<int32_t> dummy(n_expert, ls.n_slots);
@@ -556,6 +695,7 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
         LLAMA_LOG_INFO("%s: MoE expert cache enabled: %zu layers, %" PRId64 " slots total (%d per layer%s), %d inserts/step ordered by %s, %d%% protected, %.1f MiB device memory\n",
                 __func__, mc->layers.size(), slots_total, n_slots, layer_slots_override.empty() ? "" : ", LLAMA_MOE_CACHE_LAYER_SLOTS applied",
                 mc->max_inserts, mc->rank_by_demand ? "demand" : "recency", mc->protected_pct, vram/1024.0/1024.0);
+        LLAMA_LOG_INFO("%s: prefill warm-fill: %s\n", __func__, mc->warm_max > 0 ? (std::to_string(mc->warm_max) + " slots/layer/ubatch").c_str() : "off");
         if (!layer_slots_override.empty()) {
             std::string per_layer;
             for (const auto & ls : mc->layers) {
@@ -637,6 +777,59 @@ size_t llama_moe_cache_device_bytes() {
     return bytes;
 }
 
+void llama_moe_cache_warm_from_staging(const ggml_tensor * weight, const ggml_tensor * staged,
+        const int32_t * ids, int64_t ne0, int64_t ne1, size_t s0, size_t s1, ggml_backend_t backend, void * /*user_data*/) {
+    moe_cache * mc = g_cache;
+    if (!mc || mc->warm_max <= 0 || !staged || !staged->data) {
+        return;
+    }
+    auto it = mc->by_src.find(weight);
+    if (it == mc->by_src.end()) {
+        return;
+    }
+    layer_state & ls = mc->layers[it->second.layer_idx];
+    ggml_tensor * rows = ls.pub.*(it->second.rows);
+    if (!rows || !rows->data || rows->type != staged->type || rows->nb[2] != staged->nb[2]) {
+        return;
+    }
+    const size_t expert_size = staged->nb[2];
+
+    const int bit = it->second.rows == &llama_moe_cache_layer::up_c ? 1 : it->second.rows == &llama_moe_cache_layer::gate_c ? 2 : 4;
+
+    std::lock_guard<std::mutex> lock(mc->mtx);
+    // a repeated member means the next ubatch of this step is being staged
+    if (ls.warm_seen & bit) {
+        close_warm_plan(ls);
+    }
+    if (ls.warm_seen == 0) {
+        plan_warm_fill(*mc, ls, ids, ne0, ne1, s0, s1, backend);
+    }
+    ls.warm_seen |= bit;
+    if (ls.warm_plan.empty()) {
+        return;
+    }
+
+    // the plan may be older than this staged copy (a member skipped the staging path); a row is
+    // only taken from a copy that this ubatch actually streamed it into
+    std::vector<bool> staged_here(ls.warm_demand.size(), false);
+    for (int64_t i1 = 0; i1 < ne1; ++i1) {
+        for (int64_t i0 = 0; i0 < ne0; ++i0) {
+            const int32_t id = ids[i1*s1 + i0*s0];
+            if (id >= 0 && (size_t) id < staged_here.size()) {
+                staged_here[id] = true;
+            }
+        }
+    }
+    for (auto & w : ls.warm_plan) {
+        if (!staged_here[w.expert]) {
+            continue;
+        }
+        if (ggml_backend_tensor_copy_range_async(backend, staged, (size_t) w.expert*expert_size, rows, (size_t) w.slot*expert_size, expert_size)) {
+            w.copied |= bit;
+        }
+    }
+}
+
 void llama_moe_cache_step() {
     moe_cache * mc = g_cache;
     if (!mc) {
@@ -659,6 +852,7 @@ void llama_moe_cache_step() {
     }
 
     std::lock_guard<std::mutex> lock(mc->mtx);
+    settle_warm_plans(*mc);
     mc->n_steps++;
 
     // 2) schedule new uploads: evict at a sync point (clear the victim's table

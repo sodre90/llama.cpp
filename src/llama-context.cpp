@@ -791,6 +791,7 @@ void llama_context::sched_reserve() {
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_prefetch_experts_slots(sched.get(), cparams.prefetch_experts_slots);
     ggml_backend_sched_set_expert_rows_callback(sched.get(), llama_moe_cache_expert_rows, nullptr);
+    ggml_backend_sched_set_expert_staged_callback(sched.get(), llama_moe_cache_warm_from_staging, nullptr);
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -833,6 +834,7 @@ void llama_context::sched_reserve() {
                 ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
                 ggml_backend_sched_set_prefetch_experts_slots(sched.get(), cparams.prefetch_experts_slots);
                 ggml_backend_sched_set_expert_rows_callback(sched.get(), llama_moe_cache_expert_rows, nullptr);
+                ggml_backend_sched_set_expert_staged_callback(sched.get(), llama_moe_cache_warm_from_staging, nullptr);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -2945,6 +2947,10 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
         first = last + 1;
     }
+
+    // [TAG_SCHED_EXPERT_STAGED] the split's copy now holds every used expert; warm slots from staged
+    llama_moe_cache_warm_from_staging(src, dst, st.ids_data.data(), ids->ne[0], ids->ne[1],
+        ids->nb[0]/sizeof(int32_t), ids->nb[1]/sizeof(int32_t), backend, nullptr);
 
     return true;
 }
