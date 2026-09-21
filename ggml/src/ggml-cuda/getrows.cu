@@ -2,6 +2,10 @@
 #include "dequantize.cuh"
 #include "convert.cuh"
 
+#include <cinttypes>
+#include <cstring>
+#include <vector>
+
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
@@ -499,6 +503,60 @@ void get_rows_cuda(
     }
 }
 
+// [TAG_CUDA_CHECK_GET_ROWS] GGML_CUDA_CHECK_GET_ROWS=1 reads every I32 row index back to the host
+// before the gather and clamps any index outside [0, ne01) to 0, logging the first offenders. The
+// gather kernel has no bounds check, so a garbage index is otherwise an asynchronous illegal
+// memory access that names the node but not the value.
+static bool ggml_cuda_check_get_rows_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_CHECK_GET_ROWS") != nullptr;
+    return enabled;
+}
+
+static void ggml_cuda_check_get_rows_indices(const ggml_tensor * dst, cudaStream_t stream) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    const int64_t n_idx = ggml_nelements(src1);
+    if (n_idx > (1 << 22) || !ggml_is_contiguous(src1)) {
+        return;
+    }
+
+    std::vector<int32_t> idx(n_idx);
+    CUDA_CHECK(cudaMemcpyAsync(idx.data(), src1->data, n_idx*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    const int32_t n_rows = (int32_t) src0->ne[1];
+    int64_t n_bad = 0;
+    int64_t i_first_bad = -1;
+    int64_t i_last_bad  = -1;
+    for (int64_t i = 0; i < n_idx; ++i) {
+        if (idx[i] < 0 || idx[i] >= n_rows) {
+            if (n_bad < 8) {
+                // the same bits as f32: a small float means an F32 tensor aliases the index memory
+                float as_f32;
+                memcpy(&as_f32, &idx[i], sizeof(as_f32));
+                GGML_LOG_ERROR("cuda-check-get-rows: %s <- %s[%" PRId64 "] = %d (0x%08x, as f32 %g) outside [0, %d)\n",
+                        dst->name, src1->name, i, idx[i], (uint32_t) idx[i], as_f32, n_rows);
+            }
+            if (i_first_bad < 0) {
+                i_first_bad = i;
+            }
+            i_last_bad = i;
+            idx[i] = 0;
+            n_bad++;
+        }
+    }
+    if (n_bad == 0) {
+        return;
+    }
+    GGML_LOG_ERROR("cuda-check-get-rows: %s: %" PRId64 " of %" PRId64 " indices out of range (first %" PRId64 ", last %" PRId64 "), src0 %s %s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 "] data=%p, src1 %s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 "] data=%p; clamped to row 0\n",
+            dst->name, n_bad, n_idx, i_first_bad, i_last_bad,
+            src0->name, ggml_type_name(src0->type), src0->ne[0], src0->ne[1], src0->ne[2], src0->data,
+            src1->name, src1->ne[0], src1->ne[1], src1->ne[2], src1->data);
+    CUDA_CHECK(cudaMemcpyAsync(src1->data, idx.data(), n_idx*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
 void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -513,6 +571,10 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));
     GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));
     GGML_ASSERT(dst->nb[0]  == ggml_type_size(dst->type));
+
+    if (ggml_cuda_check_get_rows_enabled()) {
+        ggml_cuda_check_get_rows_indices(dst, stream);
+    }
 
     get_rows_cuda(src0->data, src0->type, (const int32_t *) src1->data, dst->data, dst->type,
         ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
