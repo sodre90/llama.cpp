@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
 #include <iterator>
 #include <stdexcept>
@@ -1061,6 +1062,30 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 } else {
                     dst_b_rows[b] = (int32_t) dustbin;
                 }
+            }
+
+            // [TAG_QSA_BLK_ROWS_CHECK] the device gather has no bounds check: a row outside the
+            // store is an asynchronous illegal memory access that names the node but not the
+            // value. Log and send the block to the dustbin instead.
+            const int64_t n_rows_valid = (int64_t) get_pooled_rows();
+            int64_t n_bad = 0;
+            for (int64_t b = 0; b < n_blocks; ++b) {
+                if (dst_b_rows[b] >= 0 && dst_b_rows[b] < n_rows_valid) {
+                    continue;
+                }
+                if (n_bad < 8) {
+                    LLAMA_LOG_WARN("%s: blk_rows[%" PRId64 "] = %d outside [0, %" PRId64 ") (stream %" PRId64 ", n_bid %d, n_blocks %" PRId64 ", blk_seq %d, cell %d, blk %" PRId64 ", seq set %s)\n",
+                            __func__, b, dst_b_rows[b], n_rows_valid, s, n_bid, n_blocks,
+                            b < n_bid ? blk_seq[b] : -1,
+                            b < n_bid ? bid_cell[b] : -1,
+                            b < n_bid ? bid_idx[b]/r : (int64_t) -1,
+                            b < n_bid ? cells.seq_get_all((uint32_t) bid_cell[b]).to_string().c_str() : "-");
+                }
+                dst_b_rows[b] = (int32_t) dustbin;
+                n_bad++;
+            }
+            if (n_bad > 0) {
+                LLAMA_LOG_WARN("%s: %" PRId64 " of %" PRId64 " blk_rows out of range, sent to the dustbin\n", __func__, n_bad, n_blocks);
             }
         }
 
