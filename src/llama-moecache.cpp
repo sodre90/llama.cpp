@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -38,6 +39,9 @@ struct layer_state {
     uint64_t n_miss   = 0;
     uint64_t n_insert = 0;
     uint64_t n_evict  = 0;
+
+    uint64_t last_log_hits   = 0;
+    uint64_t last_log_misses = 0;
 };
 
 struct upload_job {
@@ -48,9 +52,10 @@ struct upload_job {
 };
 
 struct moe_cache {
-    int32_t n_slots     = 0;
-    int32_t max_inserts = 2;
-
+    int32_t n_slots       = 0;
+    int32_t max_inserts   = 2;
+    int32_t protected_pct = 75; // SLRU protected segment share, LLAMA_MOE_CACHE_PROTECTED_PCT
+    int32_t max_protected = 0;
 
     uint64_t clock   = 0;
     uint64_t n_steps = 0;
@@ -96,7 +101,7 @@ int parse_layer_from_name(const char * name) {
     return atoi(name + 4);
 }
 
-void promote_to_protected(layer_state & ls, int32_t slot, int32_t n_slots, uint64_t clock);
+void promote_to_protected(layer_state & ls, int32_t slot, int32_t n_slots, int32_t max_protected, uint64_t clock);
 int32_t find_eviction_victim(const layer_state & ls, int32_t n_slots);
 
 void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
@@ -132,7 +137,7 @@ void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
             const int32_t slot = ls->expert_slot[id];
             if (slot >= 0) {
                 ls->n_hit++;
-                promote_to_protected(*ls, slot, mc->n_slots, ++mc->clock);
+                promote_to_protected(*ls, slot, mc->n_slots, mc->max_protected, ++mc->clock);
             } else {
                 ls->n_miss++;
                 if (slot == -2) {
@@ -166,7 +171,7 @@ void set_table_entry(llama_moe_cache_layer & pub, int32_t expert, int32_t slot_o
     ggml_backend_tensor_set(pub.host_table, &v, (size_t) expert*sizeof(int32_t), sizeof(int32_t));
 }
 
-void promote_to_protected(layer_state & ls, int32_t slot, int32_t n_slots, uint64_t clock) {
+void promote_to_protected(layer_state & ls, int32_t slot, int32_t n_slots, int32_t max_protected, uint64_t clock) {
     ls.slot_last_use[slot] = clock;
     if (ls.slot_protected[slot]) {
         return;
@@ -181,7 +186,6 @@ void promote_to_protected(layer_state & ls, int32_t slot, int32_t n_slots, uint6
         }
     }
 
-    const int max_protected = (n_slots * 3) / 4;
     if (n_protected <= max_protected) {
         return;
     }
@@ -231,6 +235,69 @@ int32_t find_eviction_victim(const layer_state & ls, int32_t n_slots) {
     return victim;
 }
 
+
+struct layer_window_rate {
+    int    il;
+    double hit_pct;
+};
+
+// window = the steps since the previous log line; the per-layer spread tells whether
+// a uniform slot count per layer is wasting slots on layers that cannot use them
+void log_window_stats(moe_cache & mc) {
+    uint64_t h   = 0;
+    uint64_t m   = 0;
+    uint64_t ins = 0;
+    uint64_t ev  = 0;
+    std::vector<layer_window_rate> rates;
+    rates.reserve(mc.layers.size());
+    for (auto & ls : mc.layers) {
+        h   += ls.n_hit;
+        m   += ls.n_miss;
+        ins += ls.n_insert;
+        ev  += ls.n_evict;
+
+        const uint64_t lh = ls.n_hit  - ls.last_log_hits;
+        const uint64_t lm = ls.n_miss - ls.last_log_misses;
+        ls.last_log_hits   = ls.n_hit;
+        ls.last_log_misses = ls.n_miss;
+        if (lh + lm > 0) {
+            rates.push_back({ls.pub.il, 100.0 * lh / (lh + lm)});
+        }
+    }
+    const uint64_t dh = h - mc.last_log_hits;
+    const uint64_t dm = m - mc.last_log_misses;
+    mc.last_log_hits   = h;
+    mc.last_log_misses = m;
+
+    const double total_rate = (h + m > 0) ? (100.0 * h / (h + m)) : 0.0;
+    const double win_rate   = (dh + dm > 0) ? (100.0 * dh / (dh + dm)) : 0.0;
+
+    LLAMA_LOG_WARN("moe-cache: steps=%" PRIu64 " win_hit=%.1f%% (%" PRIu64 "/%" PRIu64 ") total_hit=%.1f%% (%" PRIu64 "/%" PRIu64 ") ins=%" PRIu64 " evict=%" PRIu64 " prot=%d%%\n",
+            mc.n_steps, win_rate, dh, dh + dm, total_rate, h, h + m, ins, ev, mc.protected_pct);
+
+    if (rates.empty()) {
+        return;
+    }
+    std::sort(rates.begin(), rates.end(), [](const layer_window_rate & a, const layer_window_rate & b) {
+        return a.hit_pct < b.hit_pct;
+    });
+    const layer_window_rate & mid = rates[rates.size() / 2];
+    const size_t n_listed = std::min<size_t>(3, rates.size());
+    auto append_rate = [](std::string & out, const layer_window_rate & r) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%s%d:%.0f", out.empty() ? "" : ",", r.il, r.hit_pct);
+        out += buf;
+    };
+    std::string worst;
+    std::string best;
+    for (size_t k = 0; k < n_listed; ++k) {
+        append_rate(worst, rates[k]);
+        append_rate(best,  rates[rates.size() - 1 - k]);
+    }
+    LLAMA_LOG_WARN("moe-cache: layer win_hit median=%.1f%% (blk %d) worst=[%s] best=[%s] (blk:pct)\n",
+            mid.hit_pct, mid.il, worst.c_str(), best.c_str());
+}
+
 } // namespace
 
 void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t max_inserts) {
@@ -249,6 +316,10 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
         if (max_inserts > 0) {
             mc->max_inserts = max_inserts;
         }
+        if (const char * env = getenv("LLAMA_MOE_CACHE_PROTECTED_PCT")) {
+            mc->protected_pct = std::clamp(atoi(env), 0, 100);
+        }
+        mc->max_protected = (n_slots * mc->protected_pct) / 100;
 
         // collect the host-resident expert layers, grouped by the device buffer
         // type of that layer's router (the cache lives next to the router)
@@ -407,8 +478,8 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
         g_cache = mc;
         g_init_done = true;
 
-        LLAMA_LOG_INFO("%s: MoE expert cache enabled: %zu layers x %d slots, %d inserts/step, %.1f MiB device memory\n",
-                __func__, mc->layers.size(), n_slots, mc->max_inserts, vram/1024.0/1024.0);
+        LLAMA_LOG_INFO("%s: MoE expert cache enabled: %zu layers x %d slots, %d inserts/step, %d%% protected (%d slots), %.1f MiB device memory\n",
+                __func__, mc->layers.size(), n_slots, mc->max_inserts, mc->protected_pct, mc->max_protected, vram/1024.0/1024.0);
     }();
 }
 
@@ -545,25 +616,6 @@ void llama_moe_cache_step() {
     mc->wcv.notify_one();
 
     if (mc->n_steps % 128 == 0) {
-        uint64_t h = 0;
-        uint64_t m = 0;
-        uint64_t ins = 0;
-        uint64_t ev = 0;
-        for (const auto & ls : mc->layers) {
-            h   += ls.n_hit;
-            m   += ls.n_miss;
-            ins += ls.n_insert;
-            ev  += ls.n_evict;
-        }
-        const uint64_t dh = h - mc->last_log_hits;
-        const uint64_t dm = m - mc->last_log_misses;
-        mc->last_log_hits   = h;
-        mc->last_log_misses = m;
-
-        const double total_rate = (h + m > 0) ? (100.0 * h / (h + m)) : 0.0;
-        const double win_rate   = (dh + dm > 0) ? (100.0 * dh / (dh + dm)) : 0.0;
-
-        LLAMA_LOG_WARN("moe-cache: steps=%" PRIu64 " win_hit=%.1f%% (%" PRIu64 "/%" PRIu64 ") total_hit=%.1f%% (%" PRIu64 "/%" PRIu64 ") ins=%" PRIu64 " evict=%" PRIu64 "\n",
-                mc->n_steps, win_rate, dh, dh + dm, total_rate, h, h + m, ins, ev);
+        log_window_stats(*mc);
     }
 }
