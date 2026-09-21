@@ -105,8 +105,45 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
     GGML_LOG_ERROR(GGML_CUDA_NAME " error: %s\n", msg);
     GGML_LOG_ERROR("  current device: %d, in function %s at %s:%d\n", id, func, file, line);
     GGML_LOG_ERROR("  %s\n", stmt);
+    ggml_cuda_addrmap_dump();
     // abort with GGML_ABORT to get a stack trace
     GGML_ABORT(GGML_CUDA_NAME " error");
+}
+
+// [TAG_CUDA_DEBUG_SYNC] GGML_CUDA_DEBUG_SYNC=1 synchronizes the device after every node (and every
+// fused group) so an asynchronous fault is charged to the node that launched it, which is then
+// printed with its sources before the usual error path. CUDA graphs are bypassed while it is on.
+static bool ggml_cuda_debug_sync_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_DEBUG_SYNC") != nullptr;
+    return enabled;
+}
+
+static void ggml_cuda_debug_print_tensor(const char * role, const ggml_tensor * t) {
+    if (t == nullptr) {
+        return;
+    }
+    GGML_LOG_ERROR("cuda-debug-sync:   %-5s %-32s %-16s %-8s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] nb=[%zu,%zu,%zu,%zu] data=%p buffer=%s\n",
+            role, t->name, ggml_op_desc(t), ggml_type_name(t->type),
+            t->ne[0], t->ne[1], t->ne[2], t->ne[3], t->nb[0], t->nb[1], t->nb[2], t->nb[3],
+            t->data, t->buffer != nullptr ? ggml_backend_buffer_name(t->buffer) : "none");
+}
+
+static void ggml_cuda_debug_sync_after(const ggml_cgraph * cgraph, int i_first, int i_last) {
+    const cudaError_t err = cudaDeviceSynchronize();
+    if (err == cudaSuccess) {
+        return;
+    }
+    GGML_LOG_ERROR("cuda-debug-sync: %s after node(s) %d..%d of %d\n", cudaGetErrorString(err), i_first, i_last, cgraph->n_nodes);
+    for (int i = i_first; i <= i_last; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        ggml_cuda_debug_print_tensor("node", node);
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            char role[8];
+            snprintf(role, sizeof(role), "src%d", j);
+            ggml_cuda_debug_print_tensor(role, node->src[j]);
+        }
+    }
+    CUDA_CHECK(err);
 }
 
 // map a (possibly virtual) device id to the physical CUDA device that backs it
@@ -436,6 +473,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         for (int i = 0; i < MAX_BUFFERS; ++i) {
             ggml_cuda_buffer & b = buffer_pool[i];
             if (b.ptr != nullptr) {
+                ggml_cuda_addrmap_free(b.ptr);
                 CUDA_CHECK(cudaFree(b.ptr));
                 pool_size -= b.size;
                 b.ptr  = nullptr;
@@ -520,6 +558,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         }
         GGML_LOG_DEBUG(GGML_CUDA_NAME " buffer pool full, increase MAX_CUDA_BUFFERS\n");
         ggml_cuda_set_device(device);
+        ggml_cuda_addrmap_free(ptr);
         CUDA_CHECK(cudaFree(ptr));
         pool_size -= size;
     }
@@ -590,6 +629,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             // map at the end of the pool
             CUdeviceptr start_ptr = (CUdeviceptr)((char *)(pool_addr) + pool_size);
             CU_CHECK(cuMemMap(start_ptr, reserve_size, 0, handle, 0));
+            ggml_cuda_addrmap_alloc("pool-vmm", (const void *) start_ptr, reserve_size);
 #if defined(GGML_USE_HIP)
             mappings.push_back({start_ptr, reserve_size});
 #endif
@@ -709,6 +749,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
                 CUBLAS_CHECK(cublasDestroy(cublas_handles[i][j]));
             }
             if (cublas_workspaces[i][j] != nullptr) {
+                ggml_cuda_addrmap_free(cublas_workspaces[i][j]);
                 CUDA_CHECK(cudaFree(cublas_workspaces[i][j]));
             }
         }
@@ -729,6 +770,7 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
+        ggml_cuda_addrmap_free(dev_ptr);
         CUDA_CHECK(cudaFree(dev_ptr));
     }
 };
@@ -890,6 +932,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
         return nullptr;
     }
 
+    ggml_cuda_addrmap_alloc("buffer", dev_ptr, size);
     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
 
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
@@ -1268,6 +1311,7 @@ static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
 }
 
 static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml_cuda_addrmap_free(buffer->context);
     CUDA_CHECK(cudaFreeHost(buffer->context));
 }
 
@@ -1286,6 +1330,7 @@ static void * ggml_cuda_host_malloc(size_t size) {
         return nullptr;
     }
 
+    ggml_cuda_addrmap_alloc("host-pinned", ptr, size);
     return ptr;
 }
 
@@ -4484,6 +4529,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    if (ggml_cuda_debug_sync_enabled()) {
+                        ggml_cuda_debug_sync_after(cgraph, i, i + nodes_to_skip);
+                    }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -4515,6 +4563,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                if (ggml_cuda_debug_sync_enabled()) {
+                    ggml_cuda_debug_sync_after(cgraph, i, i);
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -4619,6 +4671,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 #endif // USE_CUDA_GRAPH
+
+    if (ggml_cuda_debug_sync_enabled()) {
+        use_cuda_graph             = false;
+        cuda_graph_update_required = false;
+    }
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture

@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-cuda.h"
+#include "addrmap.cuh"
 
 #include <cstdint>
 #include <cstdlib>
@@ -1540,6 +1541,7 @@ struct ggml_backend_cuda_context {
                 cublas_workspace_sizes[device] = (cc >= GGML_CUDA_CC_HOPPER) ? 32 * 1024 * 1024 : 4 * 1024 * 1024;
             }
             CUDA_CHECK(cudaMalloc(&cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
+            ggml_cuda_addrmap_alloc("cublas-ws", cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]);
             CUBLAS_CHECK(cublasSetWorkspace(cublas_handles[device][curr_stream_no], cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
 #endif
         }
