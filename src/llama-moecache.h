@@ -25,6 +25,7 @@
 //
 // Enabled via llama_context_params.n_moe_cache_slots (CLI: --moe-expert-cache).
 
+#include <cstddef>
 #include <cstdint>
 
 struct llama_model;
@@ -69,3 +70,6 @@ bool llama_moe_cache_expert_rows(const ggml_tensor * weight, const ggml_tensor *
 
 // apply throttled LRU updates; call between graph executions only
 void llama_moe_cache_step();
+
+// bytes of the expert slot buffers on the devices (the host-side tables are not counted)
+size_t llama_moe_cache_device_bytes();
