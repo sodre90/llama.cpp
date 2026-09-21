@@ -4,6 +4,7 @@
 #include "ggml-impl.h"
 
 #include <assert.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -130,7 +131,128 @@ struct ggml_dyn_tallocr {
         struct buffer_address addr;
     } allocated_tensors[1024];
 #endif
+
+    // [TAG_ALLOC_GROWTH_TRACE] GGML_ALLOC_GROWTH_TRACE=1 reports, at warning level, every growth of a
+    // chunk past 256 MiB together with the tensors live at that moment: what pins the floor
+    // under the tensor that grew the buffer
+    struct growth_trace * trace;
 };
+
+#define GROWTH_TRACE_MAX_LIVE 8192
+#define GROWTH_TRACE_MIN_SIZE_DEFAULT_MIB 256
+#define GROWTH_TRACE_MIN_LIVE (8u << 20)
+#define GROWTH_TRACE_MAX_REPORTS 400
+
+struct growth_trace_entry {
+    const struct ggml_tensor * tensor;
+    struct buffer_address      addr;
+    size_t                     size;
+};
+
+struct growth_trace {
+    struct growth_trace_entry live[GROWTH_TRACE_MAX_LIVE];
+    int  n_live;
+    int  n_reports;
+    bool overflowed;
+};
+
+// GGML_ALLOC_GROWTH_TRACE=<MiB> reports growths past that size (256 MiB when the value is not a number)
+static size_t growth_trace_min_size(void) {
+    static size_t min_size = 0;
+    if (min_size == 0) {
+        const char * env = getenv("GGML_ALLOC_GROWTH_TRACE");
+        const int mib = env ? atoi(env) : 0;
+        min_size = (size_t) (mib > 1 ? mib : GROWTH_TRACE_MIN_SIZE_DEFAULT_MIB) << 20;
+    }
+    return min_size;
+}
+
+static bool growth_trace_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("GGML_ALLOC_GROWTH_TRACE") != NULL ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static void growth_trace_add(struct growth_trace * t, struct buffer_address addr, size_t size, const struct ggml_tensor * tensor) {
+    if (t->overflowed) {
+        return;
+    }
+    if (t->n_live == GROWTH_TRACE_MAX_LIVE) {
+        t->overflowed = true;
+        GGML_LOG_WARN("growth trace: more than %d live tensors, trace disabled\n", GROWTH_TRACE_MAX_LIVE);
+        return;
+    }
+    t->live[t->n_live++] = (struct growth_trace_entry) { tensor, addr, size };
+}
+
+static void growth_trace_remove(struct growth_trace * t, struct buffer_address addr) {
+    for (int i = 0; i < t->n_live; i++) {
+        if (t->live[i].addr.chunk == addr.chunk && t->live[i].addr.offset == addr.offset) {
+            t->live[i] = t->live[--t->n_live];
+            return;
+        }
+    }
+}
+
+static int growth_trace_entry_less(const void * a, const void * b) {
+    const struct growth_trace_entry * ea = (const struct growth_trace_entry *) a;
+    const struct growth_trace_entry * eb = (const struct growth_trace_entry *) b;
+    return ggml_buffer_address_less(ea->addr, eb->addr) ? -1 : ggml_buffer_address_less(eb->addr, ea->addr) ? 1 : 0;
+}
+
+static void growth_trace_print_entry(const struct growth_trace_entry * e, const char * tag) {
+    GGML_LOG_WARN("growth trace:   %s off %8.1f MiB  end %8.1f MiB  size %7.1f MiB  %s %s [%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+        tag, e->addr.offset / 1048576.0, (e->addr.offset + e->size) / 1048576.0, e->size / 1048576.0,
+        e->tensor->name, ggml_op_name(e->tensor->op), e->tensor->ne[0], e->tensor->ne[1], e->tensor->ne[2], e->tensor->ne[3]);
+}
+
+// the highest-ending live tensor of ANY size in the chunk, excluding the one just placed: the
+// last free block starts at its end, so it is what pins a large tensor that no hole can take
+static void growth_trace_print_highest_live(const struct growth_trace * t, struct buffer_address addr) {
+    const struct growth_trace_entry * highest = NULL;
+    for (int i = 0; i < t->n_live; i++) {
+        const struct growth_trace_entry * e = &t->live[i];
+        if (e->addr.chunk != addr.chunk || e->addr.offset == addr.offset) {
+            continue;
+        }
+        if (highest == NULL || e->addr.offset + e->size > highest->addr.offset + highest->size) {
+            highest = e;
+        }
+    }
+    if (highest) {
+        growth_trace_print_entry(highest, "highest live");
+    }
+}
+
+static void growth_trace_print_free_blocks(const struct tallocr_chunk * chunk) {
+    for (int i = 0; i < chunk->n_free_blocks; i++) {
+        const struct free_block * b = &chunk->free_blocks[i];
+        GGML_LOG_WARN("growth trace:   free block %d: off %8.1f MiB  end %8.1f MiB  size %7.1f MiB\n",
+            i, b->offset / 1048576.0, (b->offset + b->size) / 1048576.0, b->size / 1048576.0);
+    }
+}
+
+static void growth_trace_report(struct growth_trace * t, const struct tallocr_chunk * chunk, struct buffer_address addr, size_t size, size_t cur_max, const struct ggml_tensor * tensor) {
+    if (t->overflowed || cur_max < growth_trace_min_size() || t->n_reports >= GROWTH_TRACE_MAX_REPORTS) {
+        return;
+    }
+    t->n_reports++;
+    qsort(t->live, t->n_live, sizeof(t->live[0]), growth_trace_entry_less);
+    GGML_LOG_WARN("growth trace: chunk %d grows to %.1f MiB for %s %s (%.1f MiB at %.1f MiB); live tensors >= %u MiB:\n",
+        addr.chunk, cur_max / 1048576.0, tensor->name, ggml_op_name(tensor->op), size / 1048576.0, addr.offset / 1048576.0,
+        GROWTH_TRACE_MIN_LIVE >> 20);
+    for (int i = 0; i < t->n_live; i++) {
+        const struct growth_trace_entry * e = &t->live[i];
+        if (e->addr.chunk != addr.chunk || e->size < GROWTH_TRACE_MIN_LIVE) {
+            continue;
+        }
+        growth_trace_print_entry(e, "");
+    }
+    growth_trace_print_highest_live(t, addr);
+    growth_trace_print_free_blocks(chunk);
+}
 
 static void ggml_dyn_tallocr_insert_block(struct tallocr_chunk * chunk, size_t offset, size_t size) {
     GGML_ASSERT(chunk->n_free_blocks < MAX_FREE_BLOCKS && "out of free blocks");
@@ -270,6 +392,14 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
 
     AT_PRINTF("block %d, offset %zu, chunk %d\n", best_fit_block, addr.offset, addr.chunk);
 
+    if (alloc->trace) {
+        growth_trace_add(alloc->trace, addr, size, tensor);
+        const bool grows_by_a_step = addr.offset + size >= chunk->max_size + (4u << 20);
+        if (size > 0 && addr.offset + size > chunk->max_size && (grows_by_a_step || size >= (32u << 20))) {
+            growth_trace_report(alloc->trace, chunk, addr, size, addr.offset + size, tensor);
+        }
+    }
+
 #ifdef GGML_ALLOCATOR_DEBUG
     add_allocated_tensor(alloc, addr, tensor);
     size_t cur_max = addr.offset + size;
@@ -356,6 +486,10 @@ static void ggml_dyn_tallocr_reset(struct ggml_dyn_tallocr * alloc) {
     }
     alloc->n_chunks = 0;
 
+    if (alloc->trace) {
+        alloc->trace->n_live = 0;
+    }
+
 #ifdef GGML_ALLOCATOR_DEBUG
     for (int i = 0; i < 1024; i++) {
         alloc->allocated_tensors[i].tensor = NULL;
@@ -374,7 +508,12 @@ static struct ggml_dyn_tallocr * ggml_dyn_tallocr_new(size_t alignment, size_t m
 #ifdef GGML_ALLOCATOR_DEBUG
         /*.allocated_tensors = */ {{0}},
 #endif
+        /*.trace          = */ NULL,
     };
+
+    if (growth_trace_enabled()) {
+        alloc->trace = (struct growth_trace *) calloc(1, sizeof(struct growth_trace));
+    }
 
     ggml_dyn_tallocr_reset(alloc);
 
@@ -385,6 +524,7 @@ static void ggml_dyn_tallocr_free(struct ggml_dyn_tallocr * alloc) {
     for (int i = 0; i < alloc->n_chunks; ++i) {
         free(alloc->chunks[i]);
     }
+    free(alloc->trace);
     free(alloc);
 }
 
@@ -706,6 +846,9 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
 #ifdef GGML_ALLOCATOR_DEBUG
     remove_allocated_tensor(alloc, hn->addr, node);
 #endif
+    if (alloc->trace) {
+        growth_trace_remove(alloc->trace, hn->addr);
+    }
 
     ggml_dyn_tallocr_free_bytes(alloc, hn->addr, size);
     hn->allocated = false;

@@ -162,6 +162,25 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             }
         }
     }
+
+    // [TAG_SCHED_ALLOC_DUMP] the memory breakdown reports one "context" total per buffer type;
+    // this names its parts
+    if (getenv("LLAMA_SCHED_ALLOC_DUMP") != nullptr) {
+        auto total_of = [](const std::map<ggml_backend_buffer_type_t, size_t> & mb) {
+            size_t total = 0;
+            for (const auto & buft_size : mb) {
+                total += buft_size.second;
+            }
+            return total;
+        };
+        size_t pooled_bytes = 0;
+        for (const auto & buf : pooled_bufs) {
+            pooled_bytes += ggml_backend_buffer_get_size(buf.get());
+        }
+        LLAMA_LOG_WARN("%s: context parts: attention kv %zu MiB, recurrent %zu MiB, indexer %zu MiB, pooled keys %zu MiB\n", __func__,
+                total_of(get_mem_attn()->memory_breakdown()) >> 20, total_of(get_mem_recr()->memory_breakdown()) >> 20,
+                mem_idx ? total_of(mem_idx->memory_breakdown()) >> 20 : (size_t) 0, pooled_bytes >> 20);
+    }
 }
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
@@ -378,6 +397,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
         for (const auto & buft_size : mem_idx->memory_breakdown()) {
             mb[buft_size.first] += buft_size.second;
         }
+    }
+
+    for (const auto & buf : pooled_bufs) {
+        mb[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
     }
 
     return mb;

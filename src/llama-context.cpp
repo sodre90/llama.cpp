@@ -105,6 +105,75 @@ static void report_highest_compute_allocations(ggml_cgraph * gf, uint32_t n_toke
         LLAMA_LOG_WARN("%s:   off %8.1f MiB  end %8.1f MiB  size %7.1f MiB  %s\n", __func__,
             a.offset / 1048576.0, a.end / 1048576.0, a.size / 1048576.0, a.desc.c_str());
     }
+
+    // every distinct (offset, size) slot of the buffer, with how many tensors take turns in it:
+    // the complete layout, so the bytes between the listed bands are explained too
+    struct slot {
+        size_t      offset;
+        size_t      size;
+        size_t      n;
+        std::string first;
+    };
+    std::vector<slot> slots;
+    std::sort(allocations.begin(), allocations.end(), [](const allocation & a, const allocation & b) {
+        return a.offset != b.offset ? a.offset < b.offset : a.size < b.size;
+    });
+    for (const auto & a : allocations) {
+        if (!slots.empty() && slots.back().offset == a.offset && slots.back().size == a.size) {
+            slots.back().n++;
+            continue;
+        }
+        slots.push_back({a.offset, a.size, 1, a.desc});
+    }
+    LLAMA_LOG_WARN("%s: %s: %zu distinct (offset, size) slots of allocations >= 8 MiB, by offset\n", __func__, label, slots.size());
+    for (const auto & s : slots) {
+        LLAMA_LOG_WARN("%s:   off %8.1f MiB  end %8.1f MiB  size %7.1f MiB  x%-3zu %s\n", __func__,
+            s.offset / 1048576.0, (s.offset + s.size) / 1048576.0, s.size / 1048576.0, s.n, s.first.c_str());
+    }
+}
+
+// [TAG_SCHED_ALLOC_DUMP] the device budget next to the layout: what the model, the memory (KV,
+// indexer, pooled keys), the compute buffers and the MoE expert cache take on each device, and
+// what the driver reports beyond that (CUDA context, pools, cuBLAS workspaces, mmproj)
+static void report_device_budget(const llama_context & lctx, const char * label) {
+    static int n_reported = 0;
+    if (n_reported >= 2 || getenv("LLAMA_SCHED_ALLOC_DUMP") == nullptr) {
+        return;
+    }
+    n_reported++;
+
+    const auto & model = lctx.get_model();
+    const llama_memory_breakdown breakdown = lctx.memory_breakdown();
+    const size_t moe_cache_bytes = llama_moe_cache_device_bytes(); // all devices; exact with one GPU
+
+    for (const llama_device & ldev : model.devices) {
+        ggml_backend_dev_t dev = ldev.dev;
+        size_t free = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+
+        size_t model_bytes = 0;
+        size_t context_bytes = 0;
+        size_t compute_bytes = 0;
+        for (const auto & [buft, mb] : breakdown) {
+            // the pinned host buffer type reports the device too; its bytes are in system memory
+            if (ggml_backend_buft_get_device(buft) != dev || ggml_backend_buft_is_host(buft)) {
+                continue;
+            }
+            model_bytes   += mb.model;
+            context_bytes += mb.context;
+            compute_bytes += mb.compute;
+        }
+        const size_t accounted = model_bytes + context_bytes + compute_bytes + moe_cache_bytes;
+        LLAMA_LOG_WARN("%s: %s: %s: total %zu MiB, used %zu MiB, free %zu MiB = model %zu + context %zu + compute %zu + moe cache %zu + other %zd MiB\n",
+            __func__, label, ggml_backend_dev_name(dev), total >> 20, (total - free) >> 20, free >> 20,
+            model_bytes >> 20, context_bytes >> 20, compute_bytes >> 20, moe_cache_bytes >> 20,
+            (ptrdiff_t) ((total - free) >> 20) - (ptrdiff_t) (accounted >> 20));
+    }
+    for (const auto & [buft, mb] : breakdown) {
+        LLAMA_LOG_WARN("%s:   %s: model %zu MiB, context %zu MiB, compute %zu MiB\n", __func__,
+            ggml_backend_buft_name(buft), mb.model >> 20, mb.context >> 20, mb.compute >> 20);
+    }
 }
 
 struct llm_fused_op_probe {
@@ -1579,6 +1648,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active = res;
 
         report_highest_compute_allocations(gf, ubatch.n_tokens, "runtime ubatch");
+        if (ubatch.n_tokens >= 256) {
+            report_device_budget(*this, "first prompt-sized runtime ubatch");
+        }
     }
 
     // set the input data for the input tensors
@@ -2720,6 +2792,7 @@ ggml_cgraph * llama_context::graph_reserve(
         this->n_outputs = save_n_outputs;
         if (ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             report_highest_compute_allocations(gf, n_tokens, "reserve pp graph");
+            report_device_budget(*this, "after reserve");
         }
         ggml_backend_sched_reset(sched.get());
     }

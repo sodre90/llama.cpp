@@ -463,6 +463,18 @@ bool llama_moe_cache_expert_rows(const ggml_tensor * weight, const ggml_tensor *
     return *rows != nullptr;
 }
 
+size_t llama_moe_cache_device_bytes() {
+    const moe_cache * mc = g_cache;
+    if (!mc) {
+        return 0;
+    }
+    size_t bytes = 0;
+    for (const auto & ls : mc->layers) {
+        bytes += ggml_nbytes(ls.pub.up_c) + ggml_nbytes(ls.pub.gate_c) + ggml_nbytes(ls.pub.down_c);
+    }
+    return bytes;
+}
+
 void llama_moe_cache_step() {
     moe_cache * mc = g_cache;
     if (!mc) {
