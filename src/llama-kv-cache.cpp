@@ -58,6 +58,15 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
     }
 }
 
+static ggml_backend_buffer_type_t dev_mapped_buffer_type(ggml_backend_dev_t dev) {
+    using mapped_buffer_type_fn = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t);
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    auto * fn = reg ? (mapped_buffer_type_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_mapped_buffer_type") : nullptr;
+
+    return fn ? fn(dev) : nullptr;
+}
+
 //
 // llama_kv_cache
 //
@@ -79,7 +88,8 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-             const char *   name_tag) :
+             const char *   name_tag,
+                     bool   device_mapped_host) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -216,6 +226,16 @@ llama_kv_cache::llama_kv_cache(
         if (offload) {
             auto * dev = model.dev_layer(il);
             buft = ggml_backend_dev_buffer_type(dev);
+
+            if (device_mapped_host) {
+                ggml_backend_buffer_type_t mapped = dev_mapped_buffer_type(dev);
+                if (mapped != nullptr) {
+                    buft = mapped;
+                } else {
+                    LLAMA_LOG_WARN("%s: layer %3d: %s has no mapped host buffer type, keeping the cache in device memory\n",
+                            __func__, il, ggml_backend_dev_name(dev));
+                }
+            }
 
             dev_name = ggml_backend_dev_name(dev);
         }

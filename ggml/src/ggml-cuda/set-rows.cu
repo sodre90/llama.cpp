@@ -3,36 +3,14 @@
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
-// Generic quantized set_rows kernel template
-template <typename idx_t, typename block_type, int qk, void (*quantize_func)(const float *, block_type *)>
-static __global__ void k_set_rows_quant(const float * __restrict__ src0,
-                                        const idx_t * __restrict__ src1,
-                                        block_type * __restrict__ dst,
-                                        const int64_t ne_total,
-                                        const int64_t ne10,
-                                        const int64_t ne11,
-                                        const int64_t ne12,
-                                        const int64_t ne13,
-                                        const int64_t s01,
-                                        const int64_t s02,
-                                        const int64_t s03,
-                                        const int64_t s10,
-                                        const int64_t s11,
-                                        const int64_t s12,
-                                        const int64_t s1,
-                                        const int64_t s2,
-                                        const int64_t s3,
-                                        const uint3   ne00,
-                                        const uint3   ne01,
-                                        const uint3   ne02,
-                                        const uint3   ne11_fd,
-                                        const uint3   ne12_fd) {
-    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
-
-    if (i >= ne_total) {
-        return;
-    }
-
+template <typename idx_t, typename block_type, int qk>
+static __device__ __forceinline__ block_type * set_rows_quant_locate(
+        const int64_t i, const float * __restrict__ src0, const idx_t * __restrict__ src1, block_type * __restrict__ dst,
+        const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t s10, const int64_t s11, const int64_t s12,
+        const int64_t s1, const int64_t s2, const int64_t s3,
+        const uint3 ne00, const uint3 ne01, const uint3 ne02, const uint3 ne11_fd, const uint3 ne12_fd,
+        const float * & src_block) {
     const int64_t i_base = i * qk;
     uint32_t      tmp    = (uint32_t) i_base;
     uint2         div_mod;
@@ -59,10 +37,69 @@ static __global__ void k_set_rows_quant(const float * __restrict__ src0,
     const float * src0_row = src0 + i01*s01 + i02*s02 + i03*s03;
     block_type * dst_row_ptr = dst + (dst_row*s1 + i02*s2 + i03*s3) / sizeof(block_type);
 
-    const float * src_block = src0_row + i00;
-    block_type * dst_block = dst_row_ptr + i00 / qk;
+    src_block = src0_row + i00;
+    return dst_row_ptr + i00 / qk;
+}
 
-    quantize_func(src_block, dst_block);
+// Generic quantized set_rows kernel template.
+// dst_in_host_memory: a thread writing its whole block leaves each warp store scattered over
+// sizeof(block_type)*32 bytes, which the device L2 absorbs but PCIe turns into one small write per
+// thread. There the blocks are quantized into shared memory and neighbouring threads copy out
+// neighbouring bytes instead; the bytes written are identical.
+template <typename idx_t, typename block_type, int qk, void (*quantize_func)(const float *, block_type *), bool dst_in_host_memory>
+static __global__ void k_set_rows_quant(const float * __restrict__ src0,
+                                        const idx_t * __restrict__ src1,
+                                        block_type * __restrict__ dst,
+                                        const int64_t ne_total,
+                                        const int64_t ne10,
+                                        const int64_t ne11,
+                                        const int64_t ne12,
+                                        const int64_t ne13,
+                                        const int64_t s01,
+                                        const int64_t s02,
+                                        const int64_t s03,
+                                        const int64_t s10,
+                                        const int64_t s11,
+                                        const int64_t s12,
+                                        const int64_t s1,
+                                        const int64_t s2,
+                                        const int64_t s3,
+                                        const uint3   ne00,
+                                        const uint3   ne01,
+                                        const uint3   ne02,
+                                        const uint3   ne11_fd,
+                                        const uint3   ne12_fd) {
+    const int64_t first = int64_t(blockDim.x) * blockIdx.x;
+    const int64_t i     = first + threadIdx.x;
+
+    if constexpr (dst_in_host_memory) {
+        __shared__ block_type   staged[CUDA_SET_ROWS_BLOCK_SIZE];
+        __shared__ block_type * staged_dst[CUDA_SET_ROWS_BLOCK_SIZE];
+
+        if (i < ne_total) {
+            const float * src_block;
+            staged_dst[threadIdx.x] = set_rows_quant_locate<idx_t, block_type, qk>(i, src0, src1, dst, s01, s02, s03,
+                s10, s11, s12, s1, s2, s3, ne00, ne01, ne02, ne11_fd, ne12_fd, src_block);
+            quantize_func(src_block, &staged[threadIdx.x]);
+        }
+        __syncthreads();
+
+        const int    n_staged   = (int) min(ne_total - first, (int64_t) blockDim.x);
+        const char * staged_src = (const char *) staged;
+        for (int k = threadIdx.x; k < n_staged * (int) sizeof(block_type); k += blockDim.x) {
+            const int ib = k / (int) sizeof(block_type);
+            ((char *) staged_dst[ib])[k - ib * (int) sizeof(block_type)] = staged_src[k];
+        }
+    } else {
+        if (i >= ne_total) {
+            return;
+        }
+
+        const float * src_block;
+        block_type * dst_block = set_rows_quant_locate<idx_t, block_type, qk>(i, src0, src1, dst, s01, s02, s03,
+            s10, s11, s12, s1, s2, s3, ne00, ne01, ne02, ne11_fd, ne12_fd, src_block);
+        quantize_func(src_block, dst_block);
+    }
 
     GGML_UNUSED(ne10);
     GGML_UNUSED(ne11);
@@ -79,6 +116,7 @@ static void set_rows_cuda_quant(
         const size_t nb01, const size_t nb02, const size_t nb03,
         const size_t nb10, const size_t nb11, const size_t nb12,
         const size_t nb1, const size_t nb2, const size_t nb3,
+        const bool dst_in_host_memory,
         cudaStream_t stream) {
 
     GGML_ASSERT(ne00 % qk == 0);
@@ -104,9 +142,15 @@ static void set_rows_cuda_quant(
         const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
         const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
 
-        k_set_rows_quant<idx_t, block_type, qk, quantize_func><<<grid_size, block_size, 0, stream>>>(
-            src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, s01, s02, s03, s10, s11, s12, s1, s2, s3, ne00_fd,
-            ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+        if (dst_in_host_memory) {
+            k_set_rows_quant<idx_t, block_type, qk, quantize_func, true><<<grid_size, block_size, 0, stream>>>(
+                src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, s01, s02, s03, s10, s11, s12, s1, s2, s3, ne00_fd,
+                ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+        } else {
+            k_set_rows_quant<idx_t, block_type, qk, quantize_func, false><<<grid_size, block_size, 0, stream>>>(
+                src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, s01, s02, s03, s10, s11, s12, s1, s2, s3, ne00_fd,
+                ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+        }
     }
 }
 
@@ -226,6 +270,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 
     cudaStream_t stream = ctx.stream();
 
+    const bool dst_in_host_memory = dst->buffer != nullptr && ggml_backend_buffer_is_host(dst->buffer);
 
     if (dst->type == GGML_TYPE_F32) {
         set_rows_cuda(
@@ -265,6 +310,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
+            dst_in_host_memory,
             stream
         );
     } else if (dst->type == GGML_TYPE_Q4_1) {
@@ -275,6 +321,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
+            dst_in_host_memory,
             stream
         );
     } else if (dst->type == GGML_TYPE_Q5_0) {
@@ -285,6 +332,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
+            dst_in_host_memory,
             stream
         );
     } else if (dst->type == GGML_TYPE_Q5_1) {
@@ -295,6 +343,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
+            dst_in_host_memory,
             stream
         );
     } else if (dst->type == GGML_TYPE_Q8_0) {
@@ -305,6 +354,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
+            dst_in_host_memory,
             stream
         );
     } else if (dst->type == GGML_TYPE_IQ4_NL) {
@@ -315,6 +365,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
+            dst_in_host_memory,
             stream
         );
     } else {

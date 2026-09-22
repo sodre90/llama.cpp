@@ -114,7 +114,10 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+        // offloaded layers keep their tensors in pinned host memory that the device reads in place,
+        // where the device backend offers such a buffer type
+                         bool   device_mapped_host = false);
 
     ~llama_kv_cache() = default;
 
