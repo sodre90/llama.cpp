@@ -44,6 +44,21 @@ static ggml_type qsa_pooled_store_type(uint32_t idx_dim) {
     return type;
 }
 
+// [TAG_QSA_POOLED_CACHE] with the pooled cache on, a raw indexer key is written once and read back
+// only while its block is dirty, so the raw cache can live in host memory the device maps
+// (LLAMA_QSA_IDX_HOST=1). The full recompute reads every cell every ubatch and would stream the
+// whole cache over the bus, so LLAMA_QSA_NO_POOLED_CACHE wins.
+static bool qsa_idx_cache_on_host() {
+    if (getenv("LLAMA_QSA_IDX_HOST") == nullptr) {
+        return false;
+    }
+    if (getenv("LLAMA_QSA_NO_POOLED_CACHE") != nullptr) {
+        LLAMA_LOG_WARN("%s: LLAMA_QSA_IDX_HOST ignored: LLAMA_QSA_NO_POOLED_CACHE reads the whole indexer cache every ubatch\n", __func__);
+        return false;
+    }
+    return true;
+}
+
 llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const llama_model & model,
                             /* attn */
@@ -89,12 +104,15 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         hparams_idx.n_embd_head_k_mla_impl = model.hparams.indexer_head_size;
         hparams_idx.n_embd_head_v_mla_impl = model.hparams.indexer_head_size;
 
-        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
+        const bool on_host = offload && qsa_idx_cache_on_host();
+
+        LLAMA_LOG_WARN("%s: creating indexer KV cache, size = %u cells, %s\n", __func__, kv_size,
+                on_host ? "in mapped host memory" : "in device memory");
 
         return new llama_kv_cache(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
-            nullptr, filter_idx, nullptr, nullptr, "idx_");
+            nullptr, filter_idx, nullptr, nullptr, "idx_", on_host);
     }()) {
     // [TAG_QSA_POOLED_CACHE] one f32 row per position block per layer; multi-stream aware
     if (mem_idx) {
@@ -142,7 +160,11 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
                     continue;
                 }
 
-                const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(k->buffer);
+                // the layer's device memory, not the raw keys' buffer: those may be mapped host memory,
+                // and every score reads the whole pooled store
+                const ggml_backend_buffer_type_t buft = offload
+                    ? ggml_backend_dev_buffer_type(model.dev_layer(il))
+                    : ggml_backend_buffer_get_type(k->buffer);
 
                 size_t ci = SIZE_MAX;
                 for (size_t j = 0; j < bufts.size(); ++j) {
