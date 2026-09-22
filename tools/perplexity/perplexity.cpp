@@ -11,6 +11,7 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -36,6 +37,14 @@ struct results_log_softmax {
     float  logit;
     float  prob;
 };
+
+// [TAG_PPL_KV_SLACK] llama_memory_hybrid_idx::init_batch refuses a batch that fills the KV pool
+// completely (qsa keeps one empty cell), and a perplexity chunk is exactly the pool size, so the
+// last batch of every chunk is refused unless the pool is given spare cells
+static int32_t kv_slack_cells_from_env() {
+    const char * env = getenv("LLAMA_PPL_KV_SLACK");
+    return env ? std::max(0, atoi(env)) : 0;
+}
 
 static std::vector<float> softmax(const std::vector<float>& logits) {
     std::vector<float> probs(logits.size());
@@ -503,7 +512,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     const int n_seq = std::max(1, n_batch / n_ctx);
 
     GGML_ASSERT(n_batch < n_ctx || n_batch % n_ctx == 0);
-    GGML_ASSERT(params.n_ctx == n_seq * n_ctx);
+    GGML_ASSERT(params.n_ctx >= n_seq * n_ctx);
 
     common_batch batch(ctx);
 
@@ -2009,10 +2018,14 @@ int llama_perplexity(int argc, char ** argv) {
         params.n_parallel = std::max(4, params.n_parallel);
         params.kv_unified = true;
     } else { // Perplexity & KL divergence
-        params.n_parallel = std::max(1, params.n_batch / n_ctx);
+        // [TAG_PPL_EXPLICIT_NP] an explicit -np above the chunks-per-batch count is kept: a KV layout that
+        // depends on n_seq_max (the per-sequence pooled indexer rows under --kv-unified) is only
+        // exercised when the context is created for that many sequences
+        params.n_parallel = std::max(params.n_parallel, params.n_batch / n_ctx);
     }
     params.n_ctx = params.n_parallel * n_ctx;
     params.n_batch = std::min(params.n_batch, params.n_ctx);
+    params.n_ctx += kv_slack_cells_from_env();
 
     if (params.ppl_stride > 0) {
         LOG_INF("Will perform strided perplexity calculation -> adjusting context size from %d to %d\n",
