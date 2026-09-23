@@ -50,6 +50,12 @@ static uint32_t kv_slack_cells_from_env() {
     return env ? (uint32_t) std::max(0, atoi(env)) : 0;
 }
 
+// --prefetch-experts-slots for llama-bench, which has no common_params to carry it
+static int prefetch_experts_slots_from_env() {
+    const char * env = getenv("LLAMA_BENCH_PREFETCH_EXPERTS_SLOTS");
+    return env ? std::max(0, atoi(env)) : 0;
+}
+
 // a private generator, not std::rand: ROCm 10's libLLVM calls srand() with a random seed at load, which
 // made every run draw a different prompt, and a model with a lazily paged embedding table then reads the
 // new rows from disk on each run
@@ -1331,6 +1337,7 @@ struct cmd_params_instance {
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
+        cparams.prefetch_experts_slots = prefetch_experts_slots_from_env();
 
         return cparams;
     }
