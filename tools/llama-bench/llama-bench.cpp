@@ -42,6 +42,13 @@ static uint64_t get_time_ns() {
     return std::chrono::nanoseconds(clock::now().time_since_epoch()).count();
 }
 
+// [TAG_BENCH_KV_SLACK] same cause as TAG_PPL_KV_SLACK: a pp test is exactly the pool size, so the
+// qsa pad-cell guard refuses its last batch unless the pool is given spare cells
+static uint32_t kv_slack_cells_from_env() {
+    const char * env = getenv("LLAMA_BENCH_KV_SLACK");
+    return env ? (uint32_t) std::max(0, atoi(env)) : 0;
+}
+
 static bool tensor_buft_override_equal(const llama_model_tensor_buft_override& a, const llama_model_tensor_buft_override& b) {
     if (a.pattern != b.pattern) {
         // cString comparison that may be null
@@ -1305,7 +1312,7 @@ struct cmd_params_instance {
     llama_context_params to_llama_cparams() const {
         llama_context_params cparams = llama_context_default_params();
 
-        cparams.n_ctx           = n_prompt + n_gen + n_depth;
+        cparams.n_ctx           = n_prompt + n_gen + n_depth + kv_slack_cells_from_env();
         cparams.n_batch         = n_batch;
         cparams.n_ubatch        = n_ubatch;
         cparams.type_k          = type_k;
