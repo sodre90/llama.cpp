@@ -12,6 +12,7 @@
 #include <iterator>
 #include <map>
 #include <numeric>
+#include <random>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -47,6 +48,14 @@ static uint64_t get_time_ns() {
 static uint32_t kv_slack_cells_from_env() {
     const char * env = getenv("LLAMA_BENCH_KV_SLACK");
     return env ? (uint32_t) std::max(0, atoi(env)) : 0;
+}
+
+// a private generator, not std::rand: ROCm 10's libLLVM calls srand() with a random seed at load, which
+// made every run draw a different prompt, and a model with a lazily paged embedding table then reads the
+// new rows from disk on each run
+static llama_token random_token(int32_t n_vocab) {
+    static std::mt19937 rng;
+    return (llama_token) (rng() % (uint32_t) n_vocab);
 }
 
 static bool tensor_buft_override_equal(const llama_model_tensor_buft_override& a, const llama_model_tensor_buft_override& b) {
@@ -2185,9 +2194,9 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
 
     while (n_processed < n_prompt) {
         int n_tokens = std::min(n_prompt - n_processed, n_batch);
-        tokens[0]    = n_processed == 0 && llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
+        tokens[0]    = n_processed == 0 && llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : random_token(n_vocab);
         for (int i = 1; i < n_tokens; i++) {
-            tokens[i] = std::rand() % n_vocab;
+            tokens[i] = random_token(n_vocab);
         }
         common_batch batch = common_batch_get_one(ctx, tokens.data(), n_tokens);
         int res = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
@@ -2209,7 +2218,7 @@ static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
     const llama_vocab * vocab   = llama_model_get_vocab(model);
     const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
 
-    llama_token token = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
+    llama_token token = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : random_token(n_vocab);
 
     common_batch batch(ctx);
     llama_pos pos = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1;
@@ -2223,7 +2232,7 @@ static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
             return false;
         }
         llama_synchronize(ctx);
-        token = std::rand() % n_vocab;
+        token = random_token(n_vocab);
     }
     return true;
 }
