@@ -3403,6 +3403,42 @@ struct test_bin_bcast : public test_case {
     }
 };
 
+// GGML_OP_ADD over the ne[1] slices of one tensor, built like qwen4exp's indexer key pooling and head sum:
+// each slice's VIEW lands between the ADDs in the graph
+struct test_add_slices : public test_case {
+    const std::array<int64_t, 4> ne;
+
+    bool run_whole_graph() override { return true; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_SLICES";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR1(ne);
+    }
+
+    test_add_slices(std::array<int64_t, 4> ne = {64, 4, 5, 2})
+        : ne(ne) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+
+        ggml_tensor * sum = nullptr;
+        for (int64_t i = 0; i < ne[1]; ++i) {
+            ggml_tensor * slice = ggml_view_3d(ctx, a, ne[0], ne[2], ne[3], a->nb[2], a->nb[3], i*a->nb[1]);
+            sum = sum ? ggml_add(ctx, sum, slice) : slice;
+        }
+
+        ggml_tensor * out = ggml_scale(ctx, sum, 1.0f/(float) ne[1]);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_ADD_ID
 struct test_add_id : public test_case {
     const ggml_type type_a;
@@ -10659,6 +10695,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {10, 5, 4, 3}, {1, 2, 2, 2}, 7));
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {16, 5, 4, 3}, {2, 2, 2, 2}, 8));
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {16, 5, 4, 3}, {1, 1, 1, 1}, 16));
+
+    test_cases.emplace_back(new test_add_slices({128, 4, 5, 2})); // indexer key pooling: idx_dim, r, blocks, streams
+    test_cases.emplace_back(new test_add_slices({37, 4, 3, 1}));  // indexer head sum: blocks, heads, tokens, streams
+    test_cases.emplace_back(new test_add_slices({64, 10, 2, 1})); // 9 adds: more than one fused launch takes
 
     test_cases.emplace_back(new test_scale());
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f));
