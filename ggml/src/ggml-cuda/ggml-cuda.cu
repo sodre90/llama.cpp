@@ -4033,37 +4033,38 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     // multi-(add or mul)
     if (node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {
-        int     n_fuse = 0;
+        int     idxs[8] = { i };
+        int     n_fuse  = 1;
         ggml_op ops[8];
         std::fill(ops, ops + 8, node->op);
 
-        for (; n_fuse <= 6; ++n_fuse) {
-            if (!ggml_can_fuse(cgraph, i + n_fuse, ops + n_fuse, 2)) {
+        // a chain over slices of one tensor has each slice's VIEW between its links; views run nothing
+        for (int j = i + 1; n_fuse < 8 && j < cgraph->n_nodes; ++j) {
+            if (cgraph->nodes[j]->op == GGML_OP_VIEW) {
+                continue;
+            }
+            idxs[n_fuse] = j;
+            const ggml_tensor * prev = cgraph->nodes[idxs[n_fuse - 1]];
+            if (!ggml_can_fuse_ext(cgraph, idxs + n_fuse - 1, ops, 2) || prev != cgraph->nodes[j]->src[0] ||
+                    !ggml_are_same_layout(prev->src[1], cgraph->nodes[j]->src[1])) {
                 break;
             }
-            if (cgraph->nodes[i + n_fuse] != cgraph->nodes[i + n_fuse + 1]->src[0]) {
-                break;
-            }
-            if (!ggml_are_same_layout(cgraph->nodes[i + n_fuse]->src[1], cgraph->nodes[i + n_fuse + 1]->src[1])) {
-                break;
-            }
+            n_fuse++;
         }
-
-        n_fuse++;
 
         if (n_fuse > 1) {
             ggml_tensor fused_node;
             memcpy(&fused_node, node, sizeof(ggml_tensor));
             for (int j = 0; j < n_fuse - 1; ++j) {
-                fused_node.src[j + 2] = cgraph->nodes[i + j + 1]->src[1];
+                fused_node.src[j + 2] = cgraph->nodes[idxs[j + 1]]->src[1];
             }
-            fused_node.data = cgraph->nodes[i + n_fuse - 1]->data;
+            fused_node.data = cgraph->nodes[idxs[n_fuse - 1]]->data;
             if (node->op == GGML_OP_ADD) {
                 ggml_cuda_op_fused_add(*cuda_ctx, &fused_node, n_fuse);
             } else {
                 ggml_cuda_op_fused_mul(*cuda_ctx, &fused_node, n_fuse);
             }
-            return n_fuse - 1;
+            return idxs[n_fuse - 1] - i;
         }
     }
 
