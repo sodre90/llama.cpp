@@ -78,6 +78,46 @@ __device__ void sqrt_softplus_warp_inplace(float (&vals)[experts_per_thread], co
     }
 }
 
+// The lane's best key, lowest slot on ties, as a pairwise tree: the left half always holds the lower slots, so the right
+// wins only when strictly greater - a left-to-right scan's result with a log2-deep dependency chain. Recursion rather
+// than a loop over scratch arrays: the compiler turns selects between array elements into runtime-indexed loads.
+template <bool has_payload, int first, int count, int experts_per_thread>
+__device__ __forceinline__ void lane_argmax(const float (&key)[experts_per_thread],
+                                            const float (&payload)[experts_per_thread],
+                                            float &     best_key,
+                                            float &     best_payload,
+                                            int &       best_slot) {
+    if constexpr (count == 1) {
+        best_key     = key[first];
+        best_payload = has_payload ? payload[first] : key[first];
+        best_slot    = first;
+    } else {
+        constexpr int left_count = (count + 1) / 2;
+        float         left_key, left_payload, right_key, right_payload;
+        int           left_slot, right_slot;
+        lane_argmax<has_payload, first, left_count>(key, payload, left_key, left_payload, left_slot);
+        lane_argmax<has_payload, first + left_count, count - left_count>(key, payload, right_key, right_payload,
+                                                                          right_slot);
+        const bool right = right_key > left_key;
+        best_key         = right ? right_key : left_key;
+        best_payload     = right ? right_payload : left_payload;
+        best_slot        = right ? right_slot : left_slot;
+    }
+}
+
+// Every lane holds the same winner after the butterfly; saying so lets the compiler index registers with it.
+static __device__ __forceinline__ int warp_uniform(const int x) {
+#ifdef GGML_USE_HIP
+    return __builtin_amdgcn_readfirstlane(x);
+#else
+    return x;
+#endif // GGML_USE_HIP
+}
+
+static __device__ __forceinline__ float warp_uniform(const float x) {
+    return __int_as_float(warp_uniform(__float_as_int(x)));
+}
+
 /*
     This kernel does the following:
     1. optionally softmax over the logits per token [n_experts, n_tokens]
@@ -186,76 +226,64 @@ __global__ void topk_moe_cuda(const float *         logits,
     }
 
     ggml_cuda_pdl_lc();
-    for (int k = 0; k < n_expert_used; k++) {
-        float max_val    = wt[0];
-        int   max_expert = threadIdx.x;
-
-        if constexpr (has_bias) {
-            float max_val_s = selection_wt[0];
-
-#pragma unroll
-            for (int i = 1; i < experts_per_thread; i++) {
-                const int expert = threadIdx.x + i * WARP_SIZE;
-                if ((n_experts % WARP_SIZE == 0 || expert < n_experts) && selection_wt[i] > max_val_s) {
-                    max_val    = wt[i];
-                    max_val_s  = selection_wt[i];
-                    max_expert = expert;
-                }
+    // selection k lands in lane k % WARP_SIZE of output_weights[k / WARP_SIZE], which is written once per chunk:
+    // written per selection, the runtime index costs a copy of the whole array every time
+    for (int chunk = 0; chunk * WARP_SIZE < n_expert_used; chunk++) {
+        float     output_weight = 0.f;
+        const int k_end         = min(n_expert_used, (chunk + 1) * WARP_SIZE);
+        for (int k = chunk * WARP_SIZE; k < k_end; k++) {
+            float max_val_s;
+            float max_val;
+            int   max_slot;
+            if constexpr (has_bias) {
+                lane_argmax<true, 0, experts_per_thread>(selection_wt, wt, max_val_s, max_val, max_slot);
+            } else {
+                lane_argmax<false, 0, experts_per_thread>(wt, wt, max_val_s, max_val, max_slot);
             }
+            int max_expert = threadIdx.x + max_slot * WARP_SIZE;
 
 #pragma unroll
             for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
-                const float val    = __shfl_xor_sync(0xFFFFFFFF, max_val, mask, WARP_SIZE);
                 const float val_s  = __shfl_xor_sync(0xFFFFFFFF, max_val_s, mask, WARP_SIZE);
+                const float val    = has_bias ? __shfl_xor_sync(0xFFFFFFFF, max_val, mask, WARP_SIZE) : val_s;
                 const int   expert = __shfl_xor_sync(0xFFFFFFFF, max_expert, mask, WARP_SIZE);
-                if (val_s > max_val_s || (val_s == max_val_s && expert < max_expert)) {
-                    max_val    = val;
-                    max_val_s  = val_s;
-                    max_expert = expert;
-                }
+                const bool  take   = (val_s > max_val_s) | ((val_s == max_val_s) & (expert < max_expert));
+                max_val_s          = take ? val_s : max_val_s;
+                max_val            = take ? val : max_val;
+                max_expert         = take ? expert : max_expert;
             }
+            max_val    = warp_uniform(max_val);
+            max_expert = warp_uniform(max_expert);
 
-            if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
-                selection_wt[max_expert / WARP_SIZE] = -INFINITY;
-            }
-        } else {
+            const bool winner_lane = (max_expert & (WARP_SIZE - 1)) == threadIdx.x;
+
+            // Static indices only: a runtime-indexed store would turn the selection keys into memory, and the
+            // compiler then rewrites the tree's selects between them as runtime-indexed loads.
+            const int removed_slot = winner_lane ? max_expert / WARP_SIZE : -1;
 #pragma unroll
-            for (int i = 1; i < experts_per_thread; i++) {
-                const int expert = threadIdx.x + i * WARP_SIZE;
-                if ((n_experts % WARP_SIZE == 0 || expert < n_experts) && wt[i] > max_val) {
-                    max_val    = wt[i];
-                    max_expert = expert;
+            for (int i = 0; i < experts_per_thread; i++) {
+                if constexpr (has_bias) {
+                    selection_wt[i] = i == removed_slot ? -INFINITY : selection_wt[i];
+                } else {
+                    wt[i] = i == removed_slot ? -INFINITY : wt[i];
                 }
             }
 
-#pragma unroll
-            for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
-                const float val    = __shfl_xor_sync(0xFFFFFFFF, max_val, mask, WARP_SIZE);
-                const int   expert = __shfl_xor_sync(0xFFFFFFFF, max_expert, mask, WARP_SIZE);
-                if (val > max_val || (val == max_val && expert < max_expert)) {
-                    max_val    = val;
-                    max_expert = expert;
+            if ((k & (WARP_SIZE - 1)) == threadIdx.x) {
+                output_weight = max_val;
+            }
+
+            if (winner_lane) {
+                ids[k] = max_expert;
+                if (ids_copy) {
+                    ids_copy[n_expert_used*row + k] = max_expert;
+                }
+                if (config.with_norm) {
+                    wt_sum += max_val;
                 }
             }
-
-            if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
-                wt[max_expert / WARP_SIZE] = -INFINITY;
-            }
         }
-
-        if ((k & (WARP_SIZE - 1)) == threadIdx.x) {
-            output_weights[k / WARP_SIZE] = max_val;
-        }
-
-        if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
-            ids[k] = max_expert;
-            if (ids_copy) {
-                ids_copy[n_expert_used*row + k] = max_expert;
-            }
-            if (config.with_norm) {
-                wt_sum += max_val;
-            }
-        }
+        output_weights[chunk] = output_weight;
     }
 
     if (config.with_norm) {
