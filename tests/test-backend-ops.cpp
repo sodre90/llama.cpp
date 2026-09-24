@@ -3536,6 +3536,48 @@ struct test_softcap : public test_case {
     }
 };
 
+// GGML_OP_SCALE + GGML_OP_UNARY(SILU|SIGMOID) [+ GGML_OP_SCALE]
+struct test_scale_unary : public test_case {
+    const ggml_unary_op op;
+    const std::array<int64_t, 4> ne;
+    const bool post_scale;
+    const bool reuse;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SCALE_UNARY";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(op, ne, post_scale, reuse);
+    }
+
+    test_scale_unary(ggml_unary_op op, std::array<int64_t, 4> ne = {10, 10, 10, 10}, bool post_scale = false, bool reuse = false)
+        : op(op), ne(ne), post_scale(post_scale), reuse(reuse) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+
+        ggml_tensor * scaled = ggml_scale_bias(ctx, a, 0.25f, 0.5f);
+        ggml_set_name(scaled, "scaled");
+
+        ggml_tensor * out = ggml_unary(ctx, scaled, op);
+        if (post_scale) {
+            out = ggml_scale_bias(ctx, out, 2.0f, -1.0f);
+        }
+        if (reuse) {
+            // a second read of the scaled input must block the fusion
+            out = ggml_add(ctx, out, scaled);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_SILU_BACK
 struct test_silu_back : public test_case {
     const ggml_type type;
@@ -9537,6 +9579,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         test_cases.emplace_back(new test_relu_sqr(type, { 128, 2, 2, 2 }));
         test_cases.emplace_back(new test_relu_sqr(type, { 5, 7, 11, 13 }));
+    }
+
+    // fused scale + unary [+ scale]
+    for (ggml_unary_op op : { GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID }) {
+        for (bool post_scale : { false, true }) {
+            for (bool reuse : { false, true }) {
+                test_cases.emplace_back(new test_scale_unary(op, { 320, 1, 1, 1 }, post_scale, reuse));
+                test_cases.emplace_back(new test_scale_unary(op, { 5, 7, 11, 13 }, post_scale, reuse));
+            }
+        }
     }
 
     // fused unary + mul (gated activations that are not expressed as GGML_OP_GLU)
