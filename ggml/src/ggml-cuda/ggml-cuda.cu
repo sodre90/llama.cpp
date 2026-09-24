@@ -3749,6 +3749,23 @@ static bool ggml_cuda_should_fuse_sigmoid_mul_add(const ggml_cgraph * cgraph, in
         (!overlaps(add, addend) || add->data == addend->data);
 }
 
+// the node index of a CPY of the fused top-k ids that follows them past views, such as the MoE expert cache's
+// routing readback, or -1
+static int ggml_cuda_topk_moe_ids_copy(const ggml_cgraph * cgraph, int node_idx, const ggml_tensor * ids) {
+    for (int j = node_idx; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(node)) {
+            continue;
+        }
+        if (node->op != GGML_OP_CPY || node->src[0] != ids || node->type != GGML_TYPE_I32 ||
+            !ggml_is_contiguous(node) || !ggml_are_same_shape(node, ids)) {
+            return -1;
+        }
+        return j;
+    }
+    return -1;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3861,8 +3878,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
-                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
-                    return ops.size() - 1;
+                    const int ids_copy_idx = ggml_cuda_topk_moe_ids_copy(cgraph, i + ops.size(), ids);
+                    ggml_tensor * ids_copy = ids_copy_idx >= 0 ? cgraph->nodes[ids_copy_idx] : nullptr;
+                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args, ids_copy);
+                    return ids_copy ? ids_copy_idx - i : (int) ops.size() - 1;
                 }
             } else if (!args.norm && !args.prob_bias) {
                 //special case gpt-oss, no norm, no bias.
@@ -3876,8 +3895,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids) &&
                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
-                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
-                    return ops.size() - 1;
+                    const int ids_copy_idx = ggml_cuda_topk_moe_ids_copy(cgraph, i + ops.size(), ids);
+                    ggml_tensor * ids_copy = ids_copy_idx >= 0 ? cgraph->nodes[ids_copy_idx] : nullptr;
+                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args, ids_copy);
+                    return ids_copy ? ids_copy_idx - i : (int) ops.size() - 1;
                 }
             }
         }

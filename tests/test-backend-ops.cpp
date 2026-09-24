@@ -7371,25 +7371,29 @@ struct test_topk_moe : public test_case {
     const bool bias_probs;
     const MoeGatingFunc gating_func;
     const float scale_w;
+    const bool copy_ids;
     ggml_tensor * weights {};
     ggml_tensor * selected_experts {};
+    ggml_tensor * ids_copy {};
 
     test_topk_moe(std::array<int64_t, 4> ne              = { 10, 5, 1, 1 },
                   int                    n_expert_used   = 1,
                   bool                   with_norm       = false,
                   bool                   bias_probs      = false,
                   MoeGatingFunc          gating_func     = GATING_FUNC_SOFTMAX,
-                  float                  scale_w         = 0.0f) :
+                  float                  scale_w         = 0.0f,
+                  bool                   copy_ids        = false) :
         ne(ne),
         n_expert_used(n_expert_used),
         with_norm(with_norm),
         bias_probs(bias_probs),
         gating_func(gating_func),
-        scale_w(scale_w) {
+        scale_w(scale_w),
+        copy_ids(copy_ids) {
         GGML_ASSERT(n_expert_used <= ne[0]);
     }
 
-    std::string vars() override { return VARS_TO_STR6(ne, n_expert_used, with_norm, bias_probs, gating_func, scale_w); }
+    std::string vars() override { return VARS_TO_STR7(ne, n_expert_used, with_norm, bias_probs, gating_func, scale_w, copy_ids); }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -7444,10 +7448,25 @@ struct test_topk_moe : public test_case {
         }
 
         ggml_set_name(weights, "weights");
+
+        if (copy_ids && mode == MODE_TEST) {
+            // as the MoE expert cache's routing readback: after the fused nodes, into a row of a larger tensor
+            ggml_build_forward_expand(gf, weights);
+            ggml_tensor * routing = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used*n_tokens + 7, 2);
+            ggml_set_name(routing, "routing");
+            ggml_tensor * row = ggml_view_2d(ctx, routing, n_expert_used, n_tokens, n_expert_used*ggml_element_size(routing), routing->nb[1]);
+            ids_copy = ggml_cpy(ctx, selected_experts, row);
+            ggml_set_name(ids_copy, "ids_copy");
+            return ids_copy;
+        }
         return weights;
     }
-    // Verify two outputs
-    std::vector<ggml_tensor *> fusion_test_nodes() override { return { selected_experts, weights }; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (ids_copy != nullptr) {
+            return { selected_experts, weights, ids_copy };
+        }
+        return { selected_experts, weights };
+    }
 
     // allow output in arbitrary order
     double err(const float * a, const float * b, size_t n) override {
@@ -11735,6 +11754,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // the MoE expert cache copies the ids out right after the fused top-k (qwen4exp: 512 experts, 10 used)
+    for (int64_t n_tokens : {1, 3}) {
+        test_cases.emplace_back(new test_topk_moe({512, n_tokens, 1, 1}, 10, true, false, GATING_FUNC_SOFTMAX, 0.0f, true));
+    }
+    test_cases.emplace_back(new test_topk_moe({32, 5, 1, 1}, 4, false, false, GATING_FUNC_SOFTMAX_WEIGHT, 0.0f, true));
 
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
     test_cases.emplace_back(new test_moe_reduce(63,  2, 17));
