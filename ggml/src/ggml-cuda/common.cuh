@@ -1575,6 +1575,18 @@ struct ggml_backend_cuda_context {
     }
 };
 
+// A MUL_MAT_ID over llama's MoE expert cache: src[0] holds the cached experts, src[3] maps expert id -> slot
+// (op_params[0] is the slot count) and op_params[2..3] carry the address of the full expert tensor in pinned host
+// memory, from which the experts without a slot are read in place.
+static const void * ggml_cuda_mmid_host_experts(const ggml_tensor * mm_id) {
+    if (mm_id == nullptr || mm_id->op != GGML_OP_MUL_MAT_ID || mm_id->src[3] == nullptr) {
+        return nullptr;
+    }
+    const void * host_experts;
+    memcpy(&host_experts, &mm_id->op_params[2], sizeof(host_experts));
+    return host_experts;
+}
+
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;
     const ggml_tensor * gate = nullptr;
@@ -1586,6 +1598,9 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * shared_up = nullptr;
     const ggml_tensor * shared_gate = nullptr;
     ggml_tensor * shared_dst = nullptr;
+    // the fused MUL_MAT(_ID) nodes, whose src[0] and gate are the weights above
+    const ggml_tensor * x_node = nullptr;
+    const ggml_tensor * gate_node = nullptr;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1599,6 +1614,11 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * shared_gate = nullptr;
     float * shared_dst = nullptr;
     uint32_t shared_stride_col_dst = 0;
+    // see ggml_cuda_mmid_host_experts; expert_slot == nullptr: every id indexes the weights directly
+    const void    * x_host         = nullptr;
+    const void    * gate_host      = nullptr;
+    const int32_t * expert_slot    = nullptr;
+    int32_t         n_expert_slots = 0;
 };
 
 struct ggml_cuda_kernel_launch_params {

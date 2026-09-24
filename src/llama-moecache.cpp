@@ -103,6 +103,10 @@ struct moe_cache {
     std::vector<ggml_context *>         ctxs;
     std::vector<ggml_backend_buffer_t>  bufs;
 
+    // see llama_moe_cache_layer::routing; nullptr unless the layers read host experts
+    ggml_tensor *        routing = nullptr;
+    std::vector<int32_t> routing_host;
+
     // async upload worker: slices are copied to the device off the decode
     // thread; the new table mapping is only published at a later step() once
     // the upload has completed, so a running graph never reads a torn slot
@@ -129,6 +133,29 @@ int parse_layer_from_name(const char * name) {
 void promote_to_protected(layer_state & ls, int32_t slot, int32_t n_slots, int32_t max_protected, uint64_t clock);
 int32_t find_eviction_victim(const layer_state & ls, int32_t n_slots);
 
+void observe_routed_id(moe_cache & mc, layer_state & ls, int32_t id) {
+    if (id < 0 || id >= (int32_t) ls.expert_slot.size()) {
+        return;
+    }
+
+    const int32_t slot = ls.expert_slot[id];
+    if (slot >= 0) {
+        ls.n_hit++;
+        promote_to_protected(ls, slot, ls.n_slots, ls.max_protected, ++mc.clock);
+    } else {
+        ls.n_miss++;
+        if (slot == -2) {
+            return;
+        }
+        if (ls.demand_cur[id] == 0 && ls.demand_prev[id] == 0) {
+            ls.pending.push_back(id);
+        }
+        if (ls.demand_cur[id] < UINT16_MAX) {
+            ls.demand_cur[id]++;
+        }
+    }
+}
+
 void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
     moe_cache * mc = (moe_cache *) ud;
 
@@ -154,28 +181,21 @@ void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
     std::lock_guard<std::mutex> lock(mc->mtx);
     for (int64_t t = 0; t < n_tokens; ++t) {
         for (int64_t i = 0; i < n_ids; ++i) {
-            const int32_t id = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + i*ids->nb[0]);
-            if (id < 0 || id >= (int32_t) ls->expert_slot.size()) {
-                continue;
-            }
-
-            const int32_t slot = ls->expert_slot[id];
-            if (slot >= 0) {
-                ls->n_hit++;
-                promote_to_protected(*ls, slot, ls->n_slots, ls->max_protected, ++mc->clock);
-            } else {
-                ls->n_miss++;
-                if (slot == -2) {
-                    continue;
-                }
-                if (ls->demand_cur[id] == 0 && ls->demand_prev[id] == 0) {
-                    ls->pending.push_back(id);
-                }
-                if (ls->demand_cur[id] < UINT16_MAX) {
-                    ls->demand_cur[id]++;
-                }
-            }
+            observe_routed_id(*mc, *ls, *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + i*ids->nb[0]));
         }
+    }
+}
+
+// the routing a reads_host_experts graph left on the device; call under mc.mtx with no graph in flight
+void observe_device_routing(moe_cache & mc) {
+    const int64_t n_ids = mc.routing->ne[0];
+    mc.routing_host.resize(ggml_nelements(mc.routing));
+    ggml_backend_tensor_get(mc.routing, mc.routing_host.data(), 0, ggml_nbytes(mc.routing));
+    ggml_backend_tensor_memset(mc.routing, 0xFF, 0, ggml_nbytes(mc.routing));
+
+    for (auto & ls : mc.layers) {
+        const int32_t * row = mc.routing_host.data() + ls.pub.routing_row*n_ids;
+        std::for_each(row, row + n_ids, [&](int32_t id) { observe_routed_id(mc, ls, id); });
     }
 }
 
@@ -499,6 +519,79 @@ void log_window_stats(moe_cache & mc) {
             mid.hit_pct, mid.il, worst.c_str(), best.c_str());
 }
 
+bool backend_has_feature(ggml_backend_reg_t reg, const char * name) {
+    auto * get_features = (ggml_backend_get_features_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_features");
+    if (!get_features) {
+        return false;
+    }
+    for (const ggml_backend_feature * f = get_features(reg); f->name; ++f) {
+        if (strcmp(f->name, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// the device can read the uncached experts in place when its backend supports that and every expert tensor sits
+// in that device's pinned host buffer (load-mode none or mlock, not mmap); LLAMA_MOE_CACHE_HOST_READS=0 opts out
+bool can_read_host_experts(const moe_cache & mc, std::string & why_not) {
+    if (const char * env = getenv("LLAMA_MOE_CACHE_HOST_READS"); env && atoi(env) == 0) {
+        why_not = "LLAMA_MOE_CACHE_HOST_READS=0";
+        return false;
+    }
+    const ggml_backend_buffer_type_t cache_buft = ggml_backend_buffer_get_type(mc.layers.front().pub.up_c->buffer);
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(cache_buft);
+    if (!dev || !backend_has_feature(ggml_backend_dev_backend_reg(dev), "MMID_HOST_EXPERTS")) {
+        why_not = std::string(ggml_backend_buft_name(cache_buft)) + " cannot read host experts";
+        return false;
+    }
+    const ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+    for (const auto & ls : mc.layers) {
+        if (ggml_backend_buffer_get_type(ls.pub.up_c->buffer) != cache_buft) {
+            why_not = "the cache spans devices";
+            return false;
+        }
+        for (const ggml_tensor * src : {ls.pub.up_src, ls.pub.gate_src, ls.pub.down_src}) {
+            if (ggml_backend_buffer_get_type(src->buffer) != host_buft) {
+                why_not = std::string(src->name) + " is in " + ggml_backend_buffer_name(src->buffer) + ", not pinned host memory";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool alloc_routing(moe_cache & mc, int64_t n_expert_used) {
+    ggml_init_params ip = {
+        /*.mem_size  =*/ ggml_tensor_overhead(),
+        /*.mem_buffer=*/ nullptr,
+        /*.no_alloc  =*/ true,
+    };
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) {
+        return false;
+    }
+    mc.ctxs.push_back(ctx);
+
+    ggml_tensor * routing = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used*LLAMA_MOE_CACHE_MAX_TOKENS, mc.layers.size());
+    ggml_set_name(routing, "moe_cache_routing");
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_buffer_get_type(mc.layers.front().pub.up_c->buffer));
+    if (!buf) {
+        return false;
+    }
+    ggml_backend_buffer_clear(buf, 0xFF);
+    mc.bufs.push_back(buf);
+    mc.routing = routing;
+
+    for (size_t li = 0; li < mc.layers.size(); ++li) {
+        auto & pub = mc.layers[li].pub;
+        pub.reads_host_experts = true;
+        pub.routing            = routing;
+        pub.routing_row        = (int32_t) li;
+    }
+    return true;
+}
+
 } // namespace
 
 void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t max_inserts) {
@@ -664,6 +757,15 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
                     ls.pub.il, ls.pub.up_src->name, ls.pub.up_src->nb[2]);
         }
 
+        std::string host_reads = "off: ";
+        if (std::string why_not; !can_read_host_experts(*mc, why_not)) {
+            host_reads += why_not;
+        } else if (!alloc_routing(*mc, model.hparams.n_expert_used_max())) {
+            host_reads += "no device memory for the routing readback";
+        } else {
+            host_reads = "on, uncached experts are read in place from pinned host memory";
+        }
+
         mc->worker = std::thread([mc]() {
             for (;;) {
                 upload_job j;
@@ -695,6 +797,7 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
         LLAMA_LOG_INFO("%s: MoE expert cache enabled: %zu layers, %" PRId64 " slots total (%d per layer%s), %d inserts/step ordered by %s, %d%% protected, %.1f MiB device memory\n",
                 __func__, mc->layers.size(), slots_total, n_slots, layer_slots_override.empty() ? "" : ", LLAMA_MOE_CACHE_LAYER_SLOTS applied",
                 mc->max_inserts, mc->rank_by_demand ? "demand" : "recency", mc->protected_pct, vram/1024.0/1024.0);
+        LLAMA_LOG_INFO("%s: device reads of uncached experts: %s\n", __func__, host_reads.c_str());
         LLAMA_LOG_INFO("%s: prefill warm-fill: %s\n", __func__, mc->warm_max > 0 ? (std::to_string(mc->warm_max) + " slots/layer/ubatch").c_str() : "off");
         if (!layer_slots_override.empty()) {
             std::string per_layer;
@@ -744,6 +847,17 @@ const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * up_exps
         return nullptr;
     }
     return &g_cache->layers[it->second].pub;
+}
+
+ggml_tensor * llama_moe_cache_mul_mat_id(ggml_context * ctx, const llama_moe_cache_layer & layer,
+        ggml_tensor * cache, const ggml_tensor * host_src, ggml_tensor * b, ggml_tensor * ids) {
+    GGML_ASSERT(layer.reads_host_experts);
+    ggml_tensor * cur = ggml_mul_mat_id(ctx, cache, b, ids);
+    // the layout ggml_cuda_mmid_host_experts reads
+    cur->src[3]       = layer.dev_table;
+    cur->op_params[0] = layer.n_slots;
+    memcpy(&cur->op_params[2], &host_src->data, sizeof(host_src->data));
+    return cur;
 }
 
 bool llama_moe_cache_expert_rows(const ggml_tensor * weight, const ggml_tensor ** rows, const int32_t ** expert_slot, int32_t * n_slots, void * /*user_data*/) {
@@ -830,10 +944,16 @@ void llama_moe_cache_warm_from_staging(const ggml_tensor * weight, const ggml_te
     }
 }
 
-void llama_moe_cache_step() {
+void llama_moe_cache_step(ggml_backend_sched_t sched) {
     moe_cache * mc = g_cache;
     if (!mc) {
         return;
+    }
+
+    if (mc->routing) {
+        ggml_backend_sched_synchronize(sched);
+        std::lock_guard<std::mutex> lk(mc->mtx);
+        observe_device_routing(*mc);
     }
 
     // 1) publish completed uploads (sync point: no graph is executing)
