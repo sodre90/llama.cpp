@@ -1456,6 +1456,16 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // q8_1 copy of the last src1 that mul_mat_vec_q quantized, so later nodes reading the same tensor skip the
+    // quantization; valid within one graph evaluation until a node writes over the tensor
+    struct q8_1_reuse_state {
+        void              * buf     = nullptr;
+        size_t              size    = 0;
+        bool                enabled = false;
+        const ggml_tensor * src     = nullptr;
+        size_t              nbytes  = 0;
+    } q8_1_reuse;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
