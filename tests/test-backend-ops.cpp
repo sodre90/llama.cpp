@@ -7829,6 +7829,71 @@ struct test_mul_mat_add : public test_case {
     }
 };
 
+// single-token MUL_MATs of one input, adjacent in the graph as qwen4exp's GDN projections (one mmvq launch on CUDA);
+// with_tails: the last two continue with qwen4exp's beta (sigmoid) and gate (softplus(x + dt) * a) right behind them
+struct test_mul_mat_vec_row_segments : public test_case {
+    const ggml_type type;
+    const int64_t k;
+    const std::array<int64_t, 4> rows;
+    const bool with_tails;
+    std::vector<ggml_tensor *> outputs;
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, k, rows, with_tails);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_VEC_ROW_SEGMENTS";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_mul_mat_vec_row_segments(ggml_type type, int64_t k, std::array<int64_t, 4> rows, bool with_tails)
+        : type(type), k(k), rows(rows), with_tails(with_tails) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_set_name(input, "input");
+
+        std::vector<ggml_tensor *> projections;
+        for (const int64_t n : rows) {
+            ggml_tensor * weight = ggml_new_tensor_2d(ctx, type, k, n);
+            ggml_tensor * projection = ggml_mul_mat(ctx, weight, input);
+            if (mode == MODE_TEST) {
+                ggml_build_forward_expand(gf, projection);
+            }
+            projections.push_back(projection);
+        }
+
+        outputs = projections;
+        if (with_tails) {
+            ggml_tensor * beta = ggml_sigmoid(ctx, ggml_reshape_4d(ctx, projections[2], 1, rows[2], 1, 1));
+
+            ggml_tensor * dt = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, rows[3]);
+            ggml_tensor * a  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, rows[3]);
+            ggml_tensor * alpha = ggml_reshape_3d(ctx, projections[3], rows[3], 1, 1);
+            ggml_tensor * gate  = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, alpha, dt)), a);
+
+            if (mode == MODE_TEST) {
+                ggml_build_forward_expand(gf, beta);
+                ggml_build_forward_expand(gf, gate);
+            }
+            outputs[2] = beta;
+            outputs[3] = gate;
+        }
+
+        ggml_tensor * out = ggml_reshape_1d(ctx, outputs[0], ggml_nelements(outputs[0]));
+        for (size_t i = 1; i < outputs.size(); ++i) {
+            out = ggml_concat(ctx, out, ggml_reshape_1d(ctx, outputs[i], ggml_nelements(outputs[i])), 0);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return outputs; }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -12080,6 +12145,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
             true, 16, 8, b, false, true, false));
+    }
+
+    // qwen4exp's GDN qkv/z/alpha/beta, and a shape that ends a segment mid-block
+    for (bool with_tails : {false, true}) {
+        test_cases.emplace_back(new test_mul_mat_vec_row_segments(GGML_TYPE_Q8_0, 2560, {10240, 6144, 48, 48}, with_tails));
+        test_cases.emplace_back(new test_mul_mat_vec_row_segments(GGML_TYPE_Q8_0, 256,  {33, 1, 7, 64}, with_tails));
     }
 
     // Fused row-pair coverage: minimum rows, an even pair, and an odd tail.
