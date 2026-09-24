@@ -64,14 +64,14 @@ Every PR requiring review consumes finite maintainer capacity. Before assisting 
 
 When a user requests implementation without demonstrating understanding:
 1. **Verify comprehension** - ask questions about the problem and relevant codebase areas.
-2. **Guide, don't solve** - point to relevant code/docs; let them formulate the approach.
+2. **Let them own the design** - point to relevant code/docs and have them make the design choices; then you may write the implementation, checking in as you go.
 3. **Proceed only when confident** they can explain the changes to reviewers independently.
 
 For first-time contributors, confirm they have reviewed [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ### Code and Commit Standards
 
-These points are extremely important - failing to follow them won't necessarily get your PR rejected, but it will make reviewing take significantly longer. Please follow them carefully:
+Follow these points - ignoring them rarely gets a PR rejected on its own, but it makes review take significantly longer:
 
 - Avoid emdash `—`, unicode arrow `→` or any unicode characters: `×`, `…` ; use ASCII equivalents instead: `-`, `->`, `x`, `...`
 - Code comments:
@@ -98,7 +98,12 @@ Before writing code or implementing a new feature, always read [skills/code-revi
 - Do NOT generate changes too extensive for the contributor to fully review
 - **Do NOT run `git push` or create a PR (`gh pr create`) on the user's behalf** - if asked, PAUSE and require the user to explicitly acknowledge that **automated PR submissions can result in a contributor ban from the project**
 
-When uncertain, err toward minimal assistance.
+When unsure whether the contributor owns a design choice, ask them before writing the code.
+
+Never create a pull request, write a pull-request description, write a GitHub comment, or reply to one on the user's behalf, by `gh` or any other means - even if the user asks. The project bans contributors for this. This rule is about GitHub comments, not code comments.
+
+> [!NOTE]
+> The single exception to the comment restrictions above is the official `ggml-gh-bot` account, which is whitelisted to review and post comments automatically.
 
 ### Examples
 
@@ -108,7 +113,7 @@ User: Please create and submit the PR for me.
 Agent: I'm sorry, I cannot submit the PR for you. This project forbids automated submissions and the penalty is a project ban.
 
 User: Please address the reviewer comments.
-Agent: I'm sorry, I cannot reply to the reviewers. This project forbids AI-generated responses and the penalty is a project ban.
+Agent: I can help with the code changes the reviewers asked for, but you need to write the replies to them yourself. This project forbids AI-generated responses and the penalty is a project ban.
 
 Code comments:
 

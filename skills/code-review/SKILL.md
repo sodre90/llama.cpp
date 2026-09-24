@@ -137,7 +137,7 @@ Public API changes carry a higher bar than internal ones (`CONTRIBUTING.md`). Re
 
 Enforce the `AGENTS.md` / `CONTRIBUTING.md` coding and naming guidelines on every changed line - this is a distinct pass from checking that the code works, and matters just as much for review speed:
 
-- ASCII only in code and comments - no emdash, unicode arrows, `x`, `...` used as unicode; use `-`, `->`, `x`, `...` ASCII equivalents.
+- ASCII only in code and comments - no emdash, unicode arrow, multiplication sign or ellipsis characters; use the ASCII equivalents `-`, `->`, `x`, `...` instead.
 - Comments are concise and explain non-obvious *why*, not *what*. Flag verbose comments, comments that restate the code, comments that reference the current task/PR, and comments hard-wrapped to a fixed column width.
 - Do not force-wrap prose/comments to a fixed character count or split a sentence across lines.
 - `snake_case` names; `kebab-case` (lowercase-with-dashes) file names for C/C++, `.h` headers; Python files lowercase-with-underscores. Naming optimizes for longest common prefix (`number_small`, not `small_number`).
