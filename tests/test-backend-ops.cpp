@@ -4650,6 +4650,65 @@ struct test_dsv4_hc_post_gated : public test_dsv4_hc {
     }
 };
 
+// the gated DSV4_HC_POST above feeding qwen4exp's grouped RMS_NORM -> MUL by a [n_embd, hc] gamma, optionally
+// followed by the Q8_0 matvec that reads the normalized streams
+struct test_dsv4_hc_post_rms_norm : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const bool    matvec;
+
+    ggml_tensor * post_node = nullptr;
+    ggml_tensor * norm_node = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_POST_RMS_NORM";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return matvec ? std::vector<ggml_tensor *>{ post_node, norm_node, out } : std::vector<ggml_tensor *>{ post_node, out };
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_tokens, matvec);
+    }
+
+    test_dsv4_hc_post_rms_norm(int64_t n_embd = 31, int64_t n_tokens = 17, bool matvec = false)
+        : n_embd(n_embd), n_tokens(n_tokens), matvec(matvec) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(residual, "residual");
+
+        ggml_tensor * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_set_name(gate, "gate");
+
+        ggml_tensor * gamma = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+        ggml_set_name(gamma, "gamma");
+
+        ggml_tensor * post = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, gate, 1.0f / hc)), 2.0f);
+        post_node = ggml_dsv4_hc_post(ctx, x, residual, post, nullptr);
+        ggml_set_name(post_node, "hc_post");
+
+        norm_node = ggml_mul(ctx, ggml_rms_norm(ctx, post_node, 1e-6f), gamma);
+        ggml_set_name(norm_node, "hc_norm");
+        out = norm_node;
+
+        if (matvec) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd*hc, 64);
+            ggml_set_name(w, "w");
+            out = ggml_mul_mat(ctx, w, ggml_reshape_2d(ctx, norm_node, n_embd*hc, n_tokens));
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
@@ -10138,6 +10197,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post_gated(2560, 1));
     test_cases.emplace_back(new test_dsv4_hc_post_gated(4096, 21));
     test_cases.emplace_back(new test_dsv4_hc_post_gated(2560, 1, true));
+    test_cases.emplace_back(new test_dsv4_hc_post_rms_norm(31, 17));
+    test_cases.emplace_back(new test_dsv4_hc_post_rms_norm(31, 1));
+    test_cases.emplace_back(new test_dsv4_hc_post_rms_norm(512, 1));
+    test_cases.emplace_back(new test_dsv4_hc_post_rms_norm(2560, 1));
+    test_cases.emplace_back(new test_dsv4_hc_post_rms_norm(4096, 1));
+    test_cases.emplace_back(new test_dsv4_hc_post_rms_norm(2560, 1, true));
     test_cases.emplace_back(new test_sigmoid_mul_add({2560, 1, 1, 1}));
     test_cases.emplace_back(new test_sigmoid_mul_add({2560, 3, 1, 1}, true));
     test_cases.emplace_back(new test_sigmoid_mul_add({10, 5, 4, 3}));
@@ -12400,6 +12465,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_topk_moe({512, 1, 1, 1}, n_expert_used, true, false, GATING_FUNC_SOFTMAX, 0.0f, true));
     }
     test_cases.emplace_back(new test_topk_moe({512, 3, 1, 1}, 10, true, false, GATING_FUNC_SOFTMAX, 0.0f, true));
+
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

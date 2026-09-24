@@ -3745,6 +3745,50 @@ static bool ggml_cuda_should_fuse_dsv4_hc_post_gate(const ggml_cgraph * cgraph, 
     return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int) ops.size(), out_nodes, 1);
 }
 
+// the gated DSV4_HC_POST above with an identity comb, whose output is the next hc mixer's RMS_NORM -> MUL by a
+// [n_embd, hc] gamma, as qwen4exp's build_hc_mix normalizes it
+static bool ggml_cuda_match_dsv4_hc_post_rms_norm(const ggml_cgraph * cgraph, int node_idx) {
+    const std::initializer_list<enum ggml_op> ops = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST,
+                                                      GGML_OP_RMS_NORM, GGML_OP_MUL };
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 3, node_idx + 5 }) ||
+        !ggml_check_edges(cgraph, node_idx, {{1, 0, 0}, {2, 0, 1}, {3, 2, 2}, {4, 0, 3}})) {
+        return false;
+    }
+
+    const ggml_tensor * logits = cgraph->nodes[node_idx]->src[0];
+    const ggml_tensor * post   = cgraph->nodes[node_idx + 3];
+    const ggml_tensor * norm   = cgraph->nodes[node_idx + 4];
+    const ggml_tensor * mul    = cgraph->nodes[node_idx + 5];
+    if (ggml_get_unary_op(cgraph->nodes[node_idx + 1]) != GGML_UNARY_OP_SIGMOID || logits->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(logits, cgraph->nodes[node_idx + 2]) || post->src[3] != nullptr) {
+        return false;
+    }
+    // single token only: the alloc deps move the other buffers, and qwen4exp's prefill logits change with that layout
+    if (post->ne[2] != 1 || (mul->src[0] != norm && mul->src[1] != norm)) {
+        return false;
+    }
+
+    const ggml_tensor * x        = post->src[0];
+    const ggml_tensor * residual = post->src[1];
+    const ggml_tensor * gamma    = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+    for (const ggml_tensor * t : { x, residual, gamma, post, mul }) {
+        if (t->type != GGML_TYPE_F32 || t->nb[0] != sizeof(float)) {
+            return false;
+        }
+    }
+    if (!ggml_is_contiguous(post) || !ggml_is_contiguous(mul) || !ggml_are_same_shape(post, mul) ||
+        gamma->ne[0] != post->ne[0] || gamma->ne[1] != post->ne[1] || gamma->ne[2] != 1 || gamma->ne[3] != 1) {
+        return false;
+    }
+    return true;
+}
+
+static bool ggml_cuda_should_fuse_dsv4_hc_post_rms_norm(const ggml_cgraph * cgraph, int node_idx) {
+    const int out_nodes[] = { node_idx + 3, node_idx + 5 };
+    return ggml_cuda_match_dsv4_hc_post_rms_norm(cgraph, node_idx) &&
+           ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, 6, out_nodes, 2);
+}
+
 // SIGMOID of one gate value per row -> MUL into the rows -> ADD of a same-shape tensor
 static bool ggml_cuda_should_fuse_sigmoid_mul_add(const ggml_cgraph * cgraph, int node_idx) {
     const std::initializer_list<enum ggml_op> ops = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
@@ -4954,6 +4998,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    if (ggml_cuda_should_fuse_dsv4_hc_post_rms_norm(cgraph, i)) {
+        ggml_cuda_op_dsv4_hc_post_gated_rms_norm(*cuda_ctx, cgraph->nodes[i + 3], node, cgraph->nodes[i + 2],
+                cgraph->nodes[i + 4], cgraph->nodes[i + 5]);
+        return 5;
+    }
+
     if (ggml_cuda_should_fuse_dsv4_hc_post_gate(cgraph, i)) {
         ggml_cuda_op_dsv4_hc_post_gated(*cuda_ctx, cgraph->nodes[i + 3], node, cgraph->nodes[i + 2]);
         return 3;
@@ -5537,6 +5587,20 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             ggml_tensor * last = cgraph->nodes[ggml_cuda_conv_output_end(cgraph, conv_idx)];
             params->add_alloc_dep(params->user_data, fold.concat->src[1], last);
             params->add_alloc_dep(params->user_data, fold.gather->src[1], last);
+        }
+
+        // the fused hc_post and norm reads x, the residual and the gate logits while it writes both outputs, so the
+        // norm's output must not take over their memory once hc_post is their last reader
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (!ggml_cuda_match_dsv4_hc_post_rms_norm(cgraph, i)) {
+                continue;
+            }
+            ggml_tensor * post = cgraph->nodes[i + 3];
+            ggml_tensor * mul  = cgraph->nodes[i + 5];
+            params->add_alloc_dep(params->user_data, post->src[0], mul);
+            params->add_alloc_dep(params->user_data, post->src[1], mul);
+            params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[0], mul);
+            i += 5;
         }
     }
 

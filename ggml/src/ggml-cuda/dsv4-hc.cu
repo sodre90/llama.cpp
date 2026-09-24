@@ -157,6 +157,69 @@ struct dsv4_hc_post_gate {
     float bias2;
 };
 
+static __device__ __forceinline__ float dsv4_hc_post_gate_weight(const dsv4_hc_post_gate gate, const float logit) {
+    return gate.scale2 * (1.0f / (1.0f + expf(-(gate.scale * logit + gate.bias)))) + gate.bias2;
+}
+
+// identity-comb gated hc_post of one stream of one token, then the RMS norm of that stream times its gamma; the norm
+// repeats rms_norm_f32<block_size, true>'s per-thread sums and block reduction, so both outputs match the unfused ops
+template <int block_size>
+static __global__ void dsv4_hc_post_rms_norm_f32(
+        const dsv4_hc_post_gate gate,
+        const float * x,
+        const float * residual,
+        const float * logits,
+        const float * gamma,
+        float * dst_post,
+        float * dst_norm,
+        block_q8_1 * dst_q8_1,
+        const int n_embd,
+        const int64_t sx1,
+        const int64_t sr1,
+        const int64_t sr2,
+        const int64_t sp0,
+        const int64_t sp1,
+        const int64_t sg1,
+        const float eps) {
+    ggml_cuda_pdl_lc();
+    const int hc     = gridDim.x;
+    const int stream = blockIdx.x;
+    const int token  = blockIdx.y;
+    const int tid    = threadIdx.x;
+
+    const int64_t dst_row = ((int64_t) token*hc + stream)*n_embd;
+    x        += token*sx1;
+    residual += stream*sr1 + token*sr2;
+    gamma    += stream*sg1;
+    dst_post += dst_row;
+    dst_norm += dst_row;
+
+    ggml_cuda_pdl_sync();
+    const float p = dsv4_hc_post_gate_weight(gate, logits[stream*sp0 + token*sp1]);
+
+    float tmp = 0.0f;
+    for (int col = tid; col < n_embd; col += block_size) {
+        float sum = x[col] * p;
+        sum += residual[col];
+        dst_post[col] = sum;
+        tmp += sum * sum;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / n_embd;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < n_embd; col += block_size) {
+        const float out = scale * dst_post[col] * gamma[col];
+        dst_norm[col] = out;
+        if (dst_q8_1) {
+            quantize_q8_1_element(out, dst_q8_1, dst_row + col);
+        }
+    }
+}
+
 template <bool has_comb, bool gated_post>
 static __global__ void dsv4_hc_post_f32(
         const dsv4_hc_post_gate gate,
@@ -197,7 +260,7 @@ static __global__ void dsv4_hc_post_f32(
 
     float p = post[idst*sp0 + it*sp1];
     if constexpr (gated_post) {
-        p = gate.scale2 * (1.0f / (1.0f + expf(-(gate.scale * p + gate.bias)))) + gate.bias2;
+        p = dsv4_hc_post_gate_weight(gate, p);
     }
 
     float sum = x[i0*sx0 + it*sx1] * p;
@@ -346,4 +409,48 @@ void ggml_cuda_op_dsv4_hc_post_gated(ggml_backend_cuda_context & ctx, ggml_tenso
     const float * scale2 = (const float *) scale2_node->op_params;
     const dsv4_hc_post_gate gate = { scale[0], scale[1], scale2[0], scale2[1] };
     dsv4_hc_post(ctx, dst, scale_node->src[0], &gate);
+}
+
+void ggml_cuda_op_dsv4_hc_post_gated_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const ggml_tensor * scale_node, const ggml_tensor * scale2_node, const ggml_tensor * norm_node, ggml_tensor * mul_node) {
+    const ggml_tensor * x        = dst->src[0];
+    const ggml_tensor * residual = dst->src[1];
+    const ggml_tensor * logits   = scale_node->src[0];
+    const ggml_tensor * gamma    = mul_node->src[0] == norm_node ? mul_node->src[1] : mul_node->src[0];
+
+    GGML_ASSERT(dst->src[3] == nullptr);
+    GGML_ASSERT(x->nb[0] == sizeof(float) && residual->nb[0] == sizeof(float) && gamma->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(mul_node));
+
+    const float * scale  = (const float *) scale_node->op_params;
+    const float * scale2 = (const float *) scale2_node->op_params;
+    const dsv4_hc_post_gate gate = { scale[0], scale[1], scale2[0], scale2[1] };
+
+    float eps;
+    memcpy(&eps, norm_node->op_params, sizeof(float));
+
+    const int     n_embd   = (int) x->ne[0];
+    const int64_t hc       = residual->ne[1];
+    const int64_t n_tokens = x->ne[1];
+
+    const dim3 grid_dims(hc, n_tokens, 1);
+    auto launch = [&](auto kernel, const int block_size) {
+        const dim3 block_dims(block_size, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 32*sizeof(float), ctx.stream());
+        ggml_cuda_kernel_launch(kernel, launch_params,
+                gate, (const float *) x->data, (const float *) residual->data, (const float *) logits->data,
+                (const float *) gamma->data, (float *) dst->data, (float *) mul_node->data, ctx.q8_1_prequantize_dst(mul_node),
+                n_embd,
+                x->nb[1] / sizeof(float),
+                residual->nb[1] / sizeof(float), residual->nb[2] / sizeof(float),
+                logits->nb[0] / sizeof(float), logits->nb[1] / sizeof(float),
+                gamma->nb[1] / sizeof(float),
+                eps);
+    };
+    // the block size rms_norm_mul_f32_cuda picks, which fixes the reduction order
+    if (n_embd < 1024) {
+        launch(dsv4_hc_post_rms_norm_f32<256>, 256);
+    } else {
+        launch(dsv4_hc_post_rms_norm_f32<1024>, 1024);
+    }
 }
