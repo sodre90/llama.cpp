@@ -105,6 +105,7 @@ static __global__ void dsv4_hc_pre_f32(
         const float * x,
         const float * weights,
         float * dst,
+        block_q8_1 * dst_q8_1,
         int64_t n_embd,
         int64_t hc,
         int64_t n_tokens,
@@ -142,7 +143,11 @@ static __global__ void dsv4_hc_pre_f32(
         sum += xv * wv;
     }
 
-    dst[i0*sd0 + it*sd1] = scale * sum;
+    const float out = scale * sum;
+    dst[i0*sd0 + it*sd1] = out;
+    if (dst_q8_1 != nullptr) {
+        quantize_q8_1_element(out, dst_q8_1, ir);
+    }
 }
 
 struct dsv4_hc_post_gate {
@@ -275,9 +280,11 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
+    block_q8_1 * dst_q8_1 = ctx.q8_1_prequantize_dst(dst);
+
     auto kernel = gated ? dsv4_hc_pre_f32<true> : dsv4_hc_pre_f32<false>;
     ggml_cuda_kernel_launch(kernel, launch_params,
-            (const float *) x->data, (const float *) weights->data, (float *) dst->data,
+            (const float *) x->data, (const float *) weights->data, (float *) dst->data, dst_q8_1,
             n_embd, hc, n_tokens,
             nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
             nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
