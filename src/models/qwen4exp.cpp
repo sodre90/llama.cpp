@@ -329,14 +329,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
     cb(xn, "hc_norm", il);
 
+    ggml_tensor * lo = build_lora_mm(w_down, xn);
     if (inject) {
         *inject = build_lora_mm(w_inject, xn);
         cb(*inject, "hc_inject", il);
-        // next to the down projection, so the GPU backend quantizes xn once for both
+        // adjacent graph nodes, so the GPU backend runs both projections of xn as one matvec launch
         ggml_build_forward_expand(gf, *inject);
+        ggml_build_forward_expand(gf, lo);
     }
 
-    ggml_tensor * lo = build_lora_mm(w_down, xn);
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
     ggml_tensor * gate = build_lora_mm(w_up, lo);
     cb(gate, "hc_gate", il);
@@ -544,11 +545,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
                 ggml_tensor * input,
                         int   il) {
-    const int64_t n_seqs       = ubatch.n_seqs;
-    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
-
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
-    qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
 
     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
@@ -1590,15 +1587,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     auto qkvz = build_qkvz(cur, il);
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
+    ggml_tensor * beta      = build_lora_mm(model.layers[il].ssm_beta,  cur, model.layers[il].ssm_beta_s);
+    ggml_tensor * alpha     = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
 
-    ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+    if (ubatch.n_tokens == 1) {
+        // adjacent graph nodes, so the CUDA backend runs these projections of the same token as one matvec launch
+        for (ggml_tensor * projection : { qkv_mixed, z, beta, alpha }) {
+            ggml_build_forward_expand(gf, projection);
+        }
+    }
+
+    qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
+
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);
 
-    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
@@ -1608,6 +1614,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
     ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
     cb(gate, "gate", il);
+
+    if (ubatch.n_tokens == 1) {
+        // right behind the projections, so the matvec launch also applies these elementwise tails
+        ggml_build_forward_expand(gf, beta);
+        ggml_build_forward_expand(gf, gate);
+    }
 
     gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
 

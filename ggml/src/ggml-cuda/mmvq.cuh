@@ -4,6 +4,9 @@
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 
+// weight types whose single-token MUL_MATs can share one launch (ggml_cuda_mm_fusion_args_host::row_segment_nodes)
+bool ggml_cuda_mmvq_row_segments_supported(enum ggml_type type);
+
 // Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,
 // based on the quantization type and GPU architecture (compute capability).
 int get_mmvq_mmid_max_batch(ggml_type type, int cc);

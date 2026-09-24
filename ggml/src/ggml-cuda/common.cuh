@@ -1666,6 +1666,23 @@ static const void * ggml_cuda_mmid_host_experts(const ggml_tensor * mm_id) {
     return host_experts;
 }
 
+#define MMVQ_MAX_ROW_SEGMENTS 4
+
+// what a row segment applies to its matvec result before storing it, as the graph's own elementwise nodes would
+enum mmvq_row_epilogue : int32_t {
+    MMVQ_ROW_EPILOGUE_NONE,
+    MMVQ_ROW_EPILOGUE_SIGMOID,             // sigmoid(x)
+    MMVQ_ROW_EPILOGUE_SOFTPLUS_BIAS_SCALE, // softplus(x + bias[row]) * scale[row]
+};
+
+struct ggml_cuda_mmvq_row_segment {
+    const ggml_tensor * mm       = nullptr;
+    ggml_tensor *       out      = nullptr; // mm itself, or the last epilogue node
+    mmvq_row_epilogue   epilogue = MMVQ_ROW_EPILOGUE_NONE;
+    const ggml_tensor * bias     = nullptr;
+    const ggml_tensor * scale    = nullptr;
+};
+
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;
     const ggml_tensor * gate = nullptr;
@@ -1680,6 +1697,9 @@ struct ggml_cuda_mm_fusion_args_host {
     // the fused MUL_MAT(_ID) nodes, whose src[0] and gate are the weights above
     const ggml_tensor * x_node = nullptr;
     const ggml_tensor * gate_node = nullptr;
+    // single-token MUL_MATs sharing src1 and the weight layout, computed in one launch (segment 0 is the launch's own)
+    ggml_cuda_mmvq_row_segment row_segments[MMVQ_MAX_ROW_SEGMENTS] = {};
+    int                        n_row_segments                      = 0;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;

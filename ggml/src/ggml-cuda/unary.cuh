@@ -100,6 +100,14 @@ void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * sca
 // add = addend + x * sigmoid(gate), one gate value per row of x
 void ggml_cuda_op_sigmoid_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * sigmoid_node, ggml_tensor * mul_node, ggml_tensor * add_node);
 
+__device__ __forceinline__ float ggml_cuda_op_sigmoid_single(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+__device__ __forceinline__ float ggml_cuda_op_softplus_single(float x) {
+    return (x > 20.0f) ? x : logf(1.0f + expf(x));
+}
+
 __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
     return x / (1.0f + expf(-x));
 }

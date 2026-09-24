@@ -3838,6 +3838,136 @@ static bool ggml_cuda_gdn_can_read_state_rows(const ggml_cgraph * cgraph, int no
     return false;
 }
 
+// a single-token MUL_MAT that ggml_cuda_mul_mat would hand to ggml_cuda_mul_mat_vec_q unfused
+static bool ggml_cuda_is_plain_mul_mat_vec_q(const ggml_tensor * node, const int cc, const int warp_size) {
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * src1 = node->src[1];
+    return node->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(node, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
+           ggml_cuda_mmvq_row_segments_supported(src0->type) && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+           src0->buffer && ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+           src1->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 && ggml_nrows(node) == 1 && ggml_is_contiguous(node) &&
+           !ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]) &&
+           !ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id =*/ false) &&
+           ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1]);
+}
+
+// the elementwise tail of a row segment, when the graph continues with it right after the matvecs:
+//   RESHAPE(mm) -> UNARY(SIGMOID)                                   = sigmoid(x)
+//   RESHAPE(mm) -> ADD(., bias) -> UNARY(SOFTPLUS) -> MUL(., scale) = softplus(x + bias) * scale
+// returns how many nodes from j it covers, 0 when none
+static int ggml_cuda_match_row_epilogue(const ggml_cgraph * cgraph, const int j, ggml_cuda_mm_fusion_args_host & fusion) {
+    const ggml_tensor * reshape = cgraph->nodes[j];
+    if (reshape->op != GGML_OP_RESHAPE) {
+        return 0;
+    }
+
+    ggml_cuda_mmvq_row_segment * segment = nullptr;
+    for (int s = 0; s < fusion.n_row_segments; ++s) {
+        if (fusion.row_segments[s].mm == reshape->src[0] && fusion.row_segments[s].epilogue == MMVQ_ROW_EPILOGUE_NONE) {
+            segment = &fusion.row_segments[s];
+        }
+    }
+    if (segment == nullptr) {
+        return 0;
+    }
+
+    const int64_t nrows = segment->mm->ne[0];
+    const auto is_row_vector = [nrows](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F32 && ggml_nelements(t) == nrows && ggml_is_contiguous(t);
+    };
+    const auto node_at = [cgraph](const int k) { return k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr; };
+
+    const ggml_tensor * sigmoid = node_at(j + 1);
+    if (sigmoid && sigmoid->op == GGML_OP_UNARY && ggml_get_unary_op(sigmoid) == GGML_UNARY_OP_SIGMOID &&
+            sigmoid->src[0] == reshape && is_row_vector(sigmoid)) {
+        segment->epilogue = MMVQ_ROW_EPILOGUE_SIGMOID;
+        segment->out      = cgraph->nodes[j + 1];
+        return 2;
+    }
+
+    const ggml_tensor * add      = node_at(j + 1);
+    const ggml_tensor * softplus = node_at(j + 2);
+    const ggml_tensor * mul      = node_at(j + 3);
+    if (!add || !softplus || !mul || add->op != GGML_OP_ADD || add->src[0] != reshape || !is_row_vector(add->src[1]) ||
+            softplus->op != GGML_OP_UNARY || ggml_get_unary_op(softplus) != GGML_UNARY_OP_SOFTPLUS || softplus->src[0] != add ||
+            mul->op != GGML_OP_MUL || (mul->src[0] != softplus && mul->src[1] != softplus) || !is_row_vector(mul)) {
+        return 0;
+    }
+    const ggml_tensor * scale = mul->src[0] == softplus ? mul->src[1] : mul->src[0];
+    if (!is_row_vector(add) || !is_row_vector(softplus) || !is_row_vector(scale)) {
+        return 0;
+    }
+    segment->epilogue = MMVQ_ROW_EPILOGUE_SOFTPLUS_BIAS_SCALE;
+    segment->bias     = add->src[1];
+    segment->scale    = scale;
+    segment->out      = cgraph->nodes[j + 3];
+    return 4;
+}
+
+static void ggml_cuda_row_segment_out_nodes(const ggml_cgraph * cgraph, const int i, const int count,
+        const ggml_cuda_mm_fusion_args_host & fusion, int * out_nodes) {
+    for (int s = 0; s < fusion.n_row_segments; ++s) {
+        out_nodes[s] = int(std::find(cgraph->nodes + i, cgraph->nodes + i + count, fusion.row_segments[s].out) - cgraph->nodes);
+    }
+}
+
+// adjacent single-token MUL_MATs from node i that share src1 and the weight layout, plus the elementwise tails
+// that follow them: one launch covers them all. Returns how many nodes that is, 0 when not worth a fusion.
+static int ggml_cuda_match_mul_mat_vec_q_row_segments(const ggml_cgraph * cgraph, const int i, ggml_cuda_mm_fusion_args_host & fusion) {
+    const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+
+    ggml_tensor * first = cgraph->nodes[i];
+    if (!ggml_cuda_is_plain_mul_mat_vec_q(first, cc, warp_size)) {
+        return 0;
+    }
+
+    int n = 1;
+    while (n < MMVQ_MAX_ROW_SEGMENTS && i + n < cgraph->n_nodes) {
+        const ggml_tensor * node = cgraph->nodes[i + n];
+        const bool same_layout = ggml_cuda_is_plain_mul_mat_vec_q(node, cc, warp_size) && node->src[1] == first->src[1] &&
+                                 node->src[0]->type == first->src[0]->type && node->src[0]->ne[0] == first->src[0]->ne[0] &&
+                                 node->src[0]->nb[1] == first->src[0]->nb[1];
+        // leave a gate/up pair to its GLU fusion
+        if (!same_layout || ggml_cuda_can_fuse(cgraph, i + n, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, {})) {
+            break;
+        }
+        n++;
+    }
+
+    fusion.n_row_segments = n;
+    for (int s = 0; s < n; ++s) {
+        fusion.row_segments[s].mm  = cgraph->nodes[i + s];
+        fusion.row_segments[s].out = cgraph->nodes[i + s];
+    }
+
+    int count = n;
+    while (i + count < cgraph->n_nodes) {
+        const int covered = ggml_cuda_match_row_epilogue(cgraph, i + count, fusion);
+        if (covered == 0) {
+            break;
+        }
+        count += covered;
+    }
+
+    if (count == 1 || count > 31) {
+        return 0;
+    }
+
+    int      idxs[32];
+    ggml_op  ops[32];
+    for (int k = 0; k < count; ++k) {
+        idxs[k] = i + k;
+        ops[k]  = cgraph->nodes[i + k]->op;
+    }
+    int out_nodes[MMVQ_MAX_ROW_SEGMENTS];
+    ggml_cuda_row_segment_out_nodes(cgraph, i, count, fusion, out_nodes);
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, out_nodes, n)) {
+        return 0;
+    }
+    return count;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4582,6 +4712,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    {
+        ggml_cuda_mm_fusion_args_host fusion_data{};
+        if (const int n_fused = ggml_cuda_match_mul_mat_vec_q_row_segments(cgraph, i, fusion_data); n_fused > 0) {
+            int out_nodes[MMVQ_MAX_ROW_SEGMENTS];
+            ggml_cuda_row_segment_out_nodes(cgraph, i, n_fused, fusion_data, out_nodes);
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_fused, out_nodes, fusion_data.n_row_segments)) {
+                fusion_data.x_node = node;
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], nullptr, node, &fusion_data);
+                return n_fused - 1;
+            }
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
         return 4;
@@ -5188,6 +5331,18 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     }
                 }
             }
+        }
+
+        // the matvecs' input is read by the whole launch, so the tails' outputs must not take over its memory
+        ggml_cuda_set_device(cuda_ctx->device);
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_cuda_mm_fusion_args_host fusion{};
+            const int n_fused = ggml_cuda_match_mul_mat_vec_q_row_segments(cgraph, i, fusion);
+            if (n_fused == 0) {
+                continue;
+            }
+            params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[1], cgraph->nodes[i + n_fused - 1]);
+            i += n_fused - 1;
         }
     }
 
