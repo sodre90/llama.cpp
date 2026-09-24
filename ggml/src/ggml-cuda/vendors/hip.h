@@ -31,7 +31,7 @@
 #define CU_CHECK(fn) {hipError_t err = fn; if(err != hipSuccess) { GGML_ABORT("HipVMM Failure: %s\n", hipGetErrorString(err)); }}
 #define __shfl_sync(mask, var, laneMask, width) __shfl(var, laneMask, width)
 #define __shfl_up_sync(mask, var, laneMask, width) __shfl_up(var, laneMask, width)
-#define __shfl_xor_sync(mask, var, laneMask, width) __shfl_xor(var, laneMask, width)
+#define __shfl_xor_sync(mask, var, laneMask, width) ggml_hip_shfl_xor(var, laneMask, width)
 #define __all_sync(mask, var) __all(var)
 #define __any_sync(mask, var) __any(var)
 #define cublasStrsmBatched hipblasStrsmBatched
@@ -243,6 +243,40 @@
 #if defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(RDNA1)
 #define RDNA // For the entire family
 #endif // defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(RDNA1)
+
+// __shfl_xor goes through ds_bpermute and waits on the LDS crossbar. On a wave32 RDNA wave a constant xor within a row
+// of 16 lanes is a DPP row_xmask move and xor 16 swaps the two rows with v_permlanex16, both at ALU latency and
+// moving the same values. They are volatile asm with fetch-inactive set: as builtins the compiler sank them into the
+// branch that consumes the result, where the partner lane may be masked off and the move returns the lane's own value
+// (topk_moe's bias path, the multi-token FLASH_ATTN_EXT kernels).
+#define GGML_HIP_DPP_ROW_XMASK(r, v, m) \
+    asm volatile("v_mov_b32_dpp %0, %1 row_xmask:" #m " row_mask:0xf bank_mask:0xf fi:1" : "=v"(r) : "v"(v))
+
+template <typename T>
+static __device__ __forceinline__ T ggml_hip_shfl_xor(T var, int lane_mask, int width) {
+#if defined(RDNA)
+    if constexpr (sizeof(T) == sizeof(int)) {
+        if (__builtin_amdgcn_wavefrontsize() == 32 && __builtin_constant_p(lane_mask) && __builtin_constant_p(width) &&
+                lane_mask > 0 && lane_mask < width) {
+            const int v = __builtin_bit_cast(int, var);
+            int r;
+            switch (lane_mask) {
+                case  1: GGML_HIP_DPP_ROW_XMASK(r, v, 1); break;
+                case  2: GGML_HIP_DPP_ROW_XMASK(r, v, 2); break;
+                case  4: GGML_HIP_DPP_ROW_XMASK(r, v, 4); break;
+                case  8: GGML_HIP_DPP_ROW_XMASK(r, v, 8); break;
+                case 16:
+                    asm volatile("v_permlanex16_b32 %0, %1, %2, %3 op_sel:[1,0]"
+                                 : "=v"(r) : "v"(v), "s"(0x76543210), "s"(0xfedcba98));
+                    break;
+                default: return __shfl_xor(var, lane_mask, width);
+            }
+            return __builtin_bit_cast(T, r);
+        }
+    }
+#endif // defined(RDNA)
+    return __shfl_xor(var, lane_mask, width);
+}
 
 #ifndef __has_builtin
     #define __has_builtin(x) 0
