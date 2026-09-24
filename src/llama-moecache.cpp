@@ -103,6 +103,16 @@ struct moe_cache {
     std::vector<ggml_context *>         ctxs;
     std::vector<ggml_backend_buffer_t>  bufs;
 
+    // every layer's host table is a row of host_tables; each device group's tables are views of one
+    // block whose rows are a contiguous run of host_tables, so a step publishes them in one copy each
+    struct table_block {
+        ggml_tensor * dev;
+        size_t        host_offset;
+    };
+    ggml_tensor *            host_tables = nullptr;
+    std::vector<table_block> table_blocks;
+    bool                     tables_dirty = false;
+
     // see llama_moe_cache_layer::routing; nullptr unless the layers read host experts
     ggml_tensor *        routing = nullptr;
     std::vector<int32_t> routing_host;
@@ -209,10 +219,21 @@ void upload_slice(ggml_tensor * dst_c, const ggml_tensor * src, int32_t expert, 
     ggml_backend_tensor_set(dst_c, (const char *) src->data + (size_t) expert*sz, (size_t) slot*dst_c->nb[2], sz);
 }
 
-void set_table_entry(llama_moe_cache_layer & pub, int32_t expert, int32_t slot_or_dummy) {
+// the device tables follow at the next flush_tables()
+void set_table_entry(moe_cache & mc, llama_moe_cache_layer & pub, int32_t expert, int32_t slot_or_dummy) {
     const int32_t v = slot_or_dummy;
-    ggml_backend_tensor_set(pub.dev_table,  &v, (size_t) expert*sizeof(int32_t), sizeof(int32_t));
     ggml_backend_tensor_set(pub.host_table, &v, (size_t) expert*sizeof(int32_t), sizeof(int32_t));
+    mc.tables_dirty = true;
+}
+
+void flush_tables(moe_cache & mc) {
+    if (!mc.tables_dirty) {
+        return;
+    }
+    for (const auto & b : mc.table_blocks) {
+        ggml_backend_tensor_set(b.dev, (const char *) mc.host_tables->data + b.host_offset, 0, ggml_nbytes(b.dev));
+    }
+    mc.tables_dirty = false;
 }
 
 void set_host_table_entry(llama_moe_cache_layer & pub, int32_t expert, int32_t slot_or_dummy) {
@@ -378,7 +399,7 @@ void settle_warm_plans(moe_cache & mc) {
             ls.slot_last_use[w.slot]  = ++mc.clock;
             ls.slot_in_flight[w.slot] = false;
             ls.n_warm++;
-            set_table_entry(ls.pub, w.expert, w.slot);
+            set_table_entry(mc, ls.pub, w.expert, w.slot);
         }
         ls.warm_done.clear();
     }
@@ -655,9 +676,12 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
             all.insert(all.end(), g.second.begin(), g.second.end());
         }
 
+        const int64_t n_expert = all.front().l->ffn_up_exps->ne[2];
+        size_t n_table_rows = 0;
+
         auto alloc_group = [&](ggml_backend_buffer_type_t buft, const std::vector<cand> & cands, bool tables_only) -> bool {
             ggml_init_params ip = {
-                /*.mem_size  =*/ ggml_tensor_overhead()*(cands.size()*4 + 8),
+                /*.mem_size  =*/ ggml_tensor_overhead()*(cands.size()*5 + 8),
                 /*.mem_buffer=*/ nullptr,
                 /*.no_alloc  =*/ true,
             };
@@ -667,7 +691,20 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
             }
             mc->ctxs.push_back(ctx);
 
+            ggml_tensor * tables = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert, cands.size());
+            if (tables_only) {
+                ggml_set_name(tables, "moe_cache_htbl");
+                mc->host_tables = tables;
+            } else {
+                ggml_set_name(tables, "moe_cache_tbl");
+                mc->table_blocks.push_back({tables, n_table_rows*tables->nb[1]});
+                n_table_rows += cands.size();
+            }
+
             for (const auto & c : cands) {
+                GGML_ASSERT(c.l->ffn_up_exps->ne[2] == n_expert);
+                ggml_tensor * table = ggml_view_2d(ctx, tables, 1, n_expert, sizeof(int32_t), (&c - cands.data())*tables->nb[1]);
+
                 layer_state * ls = nullptr;
                 for (auto & l : mc->layers) {
                     if (l.pub.il == c.il) { ls = &l; break; }
@@ -685,7 +722,7 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
                 }
 
                 if (tables_only) {
-                    ls->pub.host_table = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, ls->pub.up_src->ne[2]);
+                    ls->pub.host_table = table;
                     ggml_format_name(ls->pub.host_table, "moe_cache_htbl.%d", c.il);
                 } else {
                     const ggml_tensor * u = c.l->ffn_up_exps;
@@ -694,7 +731,7 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
                     ls->pub.up_c   = ggml_new_tensor_3d(ctx, u->type, u->ne[0], u->ne[1], ls->n_slots + 1);
                     ls->pub.gate_c = ggml_new_tensor_3d(ctx, g->type, g->ne[0], g->ne[1], ls->n_slots + 1);
                     ls->pub.down_c = ggml_new_tensor_3d(ctx, d->type, d->ne[0], d->ne[1], ls->n_slots + 1);
-                    ls->pub.dev_table = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, u->ne[2]);
+                    ls->pub.dev_table = table;
                     ggml_format_name(ls->pub.up_c,      "moe_cache_up.%d",   c.il);
                     ggml_format_name(ls->pub.gate_c,    "moe_cache_gate.%d", c.il);
                     ggml_format_name(ls->pub.down_c,    "moe_cache_down.%d", c.il);
@@ -966,7 +1003,7 @@ void llama_moe_cache_step(ggml_backend_sched_t sched) {
             ls.expert_slot[j.expert]   = j.slot;
             ls.slot_last_use[j.slot]   = ++mc->clock;
             ls.slot_in_flight[j.slot]  = false;
-            set_table_entry(ls.pub, j.expert, j.slot);
+            set_table_entry(*mc, ls.pub, j.expert, j.slot);
         }
         mc->done.clear();
     }
@@ -977,6 +1014,7 @@ void llama_moe_cache_step(ggml_backend_sched_t sched) {
 
     // 2) schedule new uploads: evict at a sync point (clear the victim's table
     //    entry now), then hand the slice copies to the worker
+    std::vector<upload_job> uploads;
     for (size_t li = 0; li < mc->layers.size(); ++li) {
         auto & ls = mc->layers[li];
         if (ls.pending.empty()) {
@@ -1009,7 +1047,7 @@ void llama_moe_cache_step(ggml_backend_sched_t sched) {
             if (victim >= 0) {
                 ls.expert_slot[victim] = -1;
                 ls.slot_expert[slot]   = -1;
-                set_table_entry(ls.pub, victim, ls.n_slots);
+                set_table_entry(*mc, ls.pub, victim, ls.n_slots);
                 ls.n_evict++;
             }
             ls.slot_protected[slot] = false;
@@ -1018,10 +1056,16 @@ void llama_moe_cache_step(ggml_backend_sched_t sched) {
             ls.n_insert++;
             budget--;
 
-            std::lock_guard<std::mutex> wlk(mc->wmtx);
-            mc->todo.push_back({li, id, slot});
+            uploads.push_back({li, id, slot});
         }
         age_demand(ls, mc->rank_by_demand);
+    }
+
+    // the evicted slots stop being read before the worker overwrites them
+    flush_tables(*mc);
+    {
+        std::lock_guard<std::mutex> wlk(mc->wmtx);
+        mc->todo.insert(mc->todo.end(), uploads.begin(), uploads.end());
     }
     mc->wcv.notify_one();
 
