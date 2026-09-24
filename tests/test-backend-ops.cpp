@@ -4498,6 +4498,49 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 };
 
+// DSV4_HC_POST whose post weights are SCALE -> SIGMOID -> SCALE of the injection logits, as qwen4exp builds them
+struct test_dsv4_hc_post_gated : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const bool    reuse;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_POST_GATED";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_tokens, reuse);
+    }
+
+    test_dsv4_hc_post_gated(int64_t n_embd = 31, int64_t n_tokens = 17, bool reuse = false)
+        : n_embd(n_embd), n_tokens(n_tokens), reuse(reuse) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(residual, "residual");
+
+        ggml_tensor * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_set_name(gate, "gate");
+
+        ggml_tensor * post = ggml_scale_bias(ctx, ggml_sigmoid(ctx, ggml_scale_bias(ctx, gate, 1.0f / hc, 0.25f)), 2.0f, -0.5f);
+        ggml_set_name(post, "post_w");
+
+        out = ggml_dsv4_hc_post(ctx, x, residual, post, nullptr);
+        if (reuse) {
+            // a second read of the post weights must block the fusion
+            out = ggml_add(ctx, ggml_sum(ctx, out), ggml_sum(ctx, post));
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
@@ -9709,6 +9752,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
+    test_cases.emplace_back(new test_dsv4_hc_post_gated(31, 17));
+    test_cases.emplace_back(new test_dsv4_hc_post_gated(2560, 1));
+    test_cases.emplace_back(new test_dsv4_hc_post_gated(4096, 21));
+    test_cases.emplace_back(new test_dsv4_hc_post_gated(2560, 1, true));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {

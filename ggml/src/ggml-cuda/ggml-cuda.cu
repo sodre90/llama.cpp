@@ -3722,6 +3722,24 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// SCALE -> SIGMOID -> SCALE whose only use is DSV4_HC_POST's post weights
+static bool ggml_cuda_should_fuse_dsv4_hc_post_gate(const ggml_cgraph * cgraph, int node_idx) {
+    const std::initializer_list<enum ggml_op> ops = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST };
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 3 }) ||
+        !ggml_check_edges(cgraph, node_idx, {{1, 0, 0}, {2, 0, 1}, {3, 2, 2}})) {
+        return false;
+    }
+
+    const ggml_tensor * logits = cgraph->nodes[node_idx]->src[0];
+    if (ggml_get_unary_op(cgraph->nodes[node_idx + 1]) != GGML_UNARY_OP_SIGMOID || logits->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(logits, cgraph->nodes[node_idx + 2])) {
+        return false;
+    }
+
+    const int out_nodes[] = { node_idx + 3 };
+    return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int) ops.size(), out_nodes, 1);
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4508,6 +4526,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_SQR }, { GGML_UNARY_OP_RELU })) {
         ggml_cuda_op_relu_sqr(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
+    }
+
+    if (ggml_cuda_should_fuse_dsv4_hc_post_gate(cgraph, i)) {
+        ggml_cuda_op_dsv4_hc_post_gated(*cuda_ctx, cgraph->nodes[i + 3], node, cgraph->nodes[i + 2]);
+        return 3;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_SIGMOID })) {
