@@ -443,6 +443,11 @@ void launch_mul_mat_vec_f_cuda(
     if(ggml_cuda_info().devices[device].cc > GGML_CUDA_CC_OFFSET_AMD && ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_RDNA1) {
         max_block_size = 128;
     }
+    // Once the rows alone fill the device, a wider block only adds its cross-warp reduction (2560x512 F32 router at 64 threads: decode +1.7% over 256).
+    if (GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[device].cc) &&
+            nrows*nchannels_dst*nsamples_or_ntokens >= 4*ggml_cuda_info().devices[device].nsm) {
+        max_block_size = 64;
+    }
     for (int64_t block_size = 2*warp_size; block_size <= max_block_size; block_size += warp_size) {
         const int64_t niter = (ncols + 2*block_size - 1) / (2*block_size);
         if (niter < niter_best) {
