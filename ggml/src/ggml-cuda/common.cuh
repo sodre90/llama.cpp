@@ -1465,6 +1465,15 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// a single-token conv history left unexecuted: the gather of its state row, the concat with the new column and the
+// copy of the shifted tail back into the states, all done by the SSM_CONV that reads the concat
+struct ggml_cuda_conv_state_fold {
+    const ggml_tensor * gather   = nullptr;
+    const ggml_tensor * concat   = nullptr;
+    const ggml_tensor * tail_cpy = nullptr;
+    const ggml_tensor * conv     = nullptr;
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1531,6 +1540,8 @@ struct ggml_backend_cuda_context {
 
     // a GET_ROWS of recurrent states left unexecuted, whose rows the next GATED_DELTA_NET reads in place
     const ggml_tensor * gdn_state_gather = nullptr;
+
+    ggml_cuda_conv_state_fold conv_state_fold;
 
     // where a kernel that writes dst may also write its q8_1 copy for the next mul_mat_vec_q, or nullptr;
     // every 32-element block must fall into the lanes of one warp, so the rows are whole blocks

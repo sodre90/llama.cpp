@@ -3838,6 +3838,151 @@ static bool ggml_cuda_gdn_can_read_state_rows(const ggml_cgraph * cgraph, int no
     return false;
 }
 
+// CONCAT(RESHAPE(gather), TRANSPOSE(x), 0) of the sequences' conv states with one new column each
+static bool ggml_cuda_is_conv_history_concat(const ggml_tensor * concat, const ggml_tensor * gather) {
+    const ggml_tensor * state = concat->src[0];
+    const ggml_tensor * x     = concat->src[1];
+    return concat->op == GGML_OP_CONCAT && ggml_get_op_params_i32(concat, 0) == 0 && concat->type == GGML_TYPE_F32 &&
+           ggml_is_contiguous(concat) && state->view_src == gather && state->view_offs == 0 &&
+           ggml_is_contiguous(state) && state->ne[2] == ggml_nrows(gather) && state->ne[3] == 1 &&
+           x->type == GGML_TYPE_F32 && x->ne[0] == 1 && x->ne[1] == state->ne[1] && x->ne[2] == state->ne[2] && x->ne[3] == 1;
+}
+
+// CPY of the concat's last ne[0]-1 columns into contiguous state rows, one per sequence
+static bool ggml_cuda_is_conv_tail_copy(const ggml_tensor * cpy, const ggml_tensor * concat) {
+    const ggml_tensor * tail = cpy->src[0];
+    const ggml_tensor * dst  = cpy->src[1];
+    return cpy->op == GGML_OP_CPY && tail->view_src == concat && tail->view_offs == sizeof(float) &&
+           tail->ne[0] == concat->ne[0] - 1 && tail->ne[1] == concat->ne[1] && tail->ne[2] == concat->ne[2] && tail->ne[3] == 1 &&
+           tail->nb[1] == concat->nb[1] && tail->nb[2] == concat->nb[2] && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) &&
+           dst->ne[0] == tail->ne[0]*tail->ne[1] && ggml_nelements(dst) == ggml_nelements(tail);
+}
+
+// the conv history build_conv_state_at lays out for one token of up to 4 sequences, starting at the gather:
+//   GET_ROWS(states, rows) -> CONCAT(RESHAPE(.), TRANSPOSE(x), 0) -> CPY(VIEW(tail), state row)
+//                                                                 -> SSM_CONV(concat, w)
+// with no other reader of the gather or the concat; returns the SSM_CONV's index, -1 when there is none
+static int ggml_cuda_match_conv_state_fold(const ggml_cgraph * cgraph, const int node_idx, ggml_cuda_conv_state_fold & fold) {
+    const ggml_tensor * gather = cgraph->nodes[node_idx];
+    if (gather->op != GGML_OP_GET_ROWS || gather->type != GGML_TYPE_F32 || gather->src[0]->type != GGML_TYPE_F32 ||
+        gather->src[1]->type != GGML_TYPE_I32 || (gather->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        ggml_nrows(gather) > 4 || gather->src[0]->nb[0] != sizeof(float) || !ggml_is_contiguous(gather)) {
+        return -1;
+    }
+
+    fold = {};
+    fold.gather = gather;
+
+    const int lookahead = 64;
+    for (int j = node_idx + 1; j < std::min(cgraph->n_nodes, node_idx + lookahead); ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(node)) {
+            continue;
+        }
+        if (!fold.concat && ggml_cuda_is_conv_history_concat(node, gather) && !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            fold.concat = node;
+            continue;
+        }
+        if (fold.concat && !fold.tail_cpy && ggml_cuda_is_conv_tail_copy(node, fold.concat)) {
+            fold.tail_cpy = node;
+            continue;
+        }
+        if (fold.tail_cpy && node->op == GGML_OP_SSM_CONV && node->src[0] == fold.concat &&
+            node->src[1]->ne[0] == fold.concat->ne[0]) {
+            fold.conv = node;
+            return j;
+        }
+        for (const ggml_tensor * src : node->src) {
+            if (src != nullptr && (src == gather || src->view_src == gather ||
+                                   (fold.concat && (src == fold.concat || src->view_src == fold.concat)))) {
+                return -1;
+            }
+        }
+    }
+    return -1;
+}
+
+// the SSM_CONV node, then its SILU (after an optional bias ADD) that ggml_cuda_try_fuse runs with it
+static int ggml_cuda_conv_output_end(const ggml_cgraph * cgraph, const int conv_idx) {
+    int end = conv_idx;
+    while (end + 1 < cgraph->n_nodes && end < conv_idx + 2) {
+        const ggml_tensor * next = cgraph->nodes[end + 1];
+        if (next->src[0] != cgraph->nodes[end] && next->src[1] != cgraph->nodes[end]) {
+            break;
+        }
+        ++end;
+    }
+    return end;
+}
+
+// the fold reads the states, the rows and x when the SSM_CONV runs rather than at the gather and the concat, and writes
+// the state rows then rather than at the copy: nothing in between may write those or read the states, and the conv's
+// own outputs may not overlap what it still reads. A thread reads and writes one channel of every row, so the rows it
+// writes must start at row boundaries of the states.
+static bool ggml_cuda_conv_state_fold_is_safe(const ggml_cgraph * cgraph, const int node_idx, const int conv_idx,
+        const ggml_cuda_conv_state_fold & fold) {
+    const ggml_tensor * states_t  = fold.gather->src[0];
+    const ggml_tensor * state_out = fold.tail_cpy->src[1];
+    const ptrdiff_t     out_offs  = (const char *) state_out->data - (const char *) states_t->data;
+    if (state_out->nb[1] != states_t->nb[1] || out_offs % (ptrdiff_t) states_t->nb[1] != 0) {
+        return false;
+    }
+
+    struct byte_range {
+        const char * begin;
+        const char * end;
+        bool overlaps(const byte_range & other) const { return begin < other.end && other.begin < end; }
+    };
+    const auto range_of = [](const ggml_tensor * t) {
+        const char * begin = (const char *) t->data;
+        return byte_range{ begin, begin + ggml_nbytes(t) };
+    };
+
+    const byte_range states = range_of(fold.gather->src[0]);
+    const byte_range rows   = range_of(fold.gather->src[1]);
+    const byte_range x      = range_of(fold.concat->src[1]);
+
+    const int end = ggml_cuda_conv_output_end(cgraph, conv_idx);
+    for (int j = node_idx + 1; j <= end; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(node) || node == fold.concat || node == fold.tail_cpy) {
+            continue;
+        }
+        const byte_range out = range_of(node);
+        if (out.overlaps(states) || out.overlaps(rows) || out.overlaps(x)) {
+            return false;
+        }
+        if (j >= conv_idx) {
+            continue;
+        }
+        for (const ggml_tensor * src : node->src) {
+            if (src != nullptr && src->data != nullptr && range_of(src).overlaps(states)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// leaves the gather, concat and copy of a conv history unexecuted when the SSM_CONV can do their work
+static bool ggml_cuda_defer_conv_state_node(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int node_idx) {
+    ggml_cuda_conv_state_fold & pending = cuda_ctx->conv_state_fold;
+    const ggml_tensor * node = cgraph->nodes[node_idx];
+    if (pending.gather != nullptr) {
+        return node == pending.concat || node == pending.tail_cpy;
+    }
+    if (node->op != GGML_OP_GET_ROWS || ggml_cuda_fusion_disabled() || !cuda_ctx->stream_context().concurrent_events.empty()) {
+        return false;
+    }
+    ggml_cuda_conv_state_fold fold;
+    const int conv_idx = ggml_cuda_match_conv_state_fold(cgraph, node_idx, fold);
+    if (conv_idx < 0 || !ggml_cuda_conv_state_fold_is_safe(cgraph, node_idx, conv_idx, fold)) {
+        return false;
+    }
+    pending = fold;
+    return true;
+}
+
 // a single-token MUL_MAT that ggml_cuda_mul_mat would hand to ggml_cuda_mul_mat_vec_q unfused
 static bool ggml_cuda_is_plain_mul_mat_vec_q(const ggml_tensor * node, const int cc, const int warp_size) {
     const ggml_tensor * src0 = node->src[0];
@@ -4968,6 +5113,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 slot.src = nullptr;
             }
             cuda_ctx->gdn_state_gather = nullptr;
+            cuda_ctx->conv_state_fold = {};
             cuda_ctx->q8_1_reuse.enabled = cuda_ctx->q8_1_reuse.slots[0].buf != nullptr && stream_ctx.concurrent_events.empty();
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -5014,6 +5160,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 if (ggml_cuda_gdn_can_read_state_rows(cgraph, i)) {
                     cuda_ctx->gdn_state_gather = node;
+                    continue;
+                }
+
+                if (ggml_cuda_defer_conv_state_node(cuda_ctx, cgraph, i)) {
                     continue;
                 }
 
@@ -5343,6 +5493,18 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
             params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[1], cgraph->nodes[i + n_fused - 1]);
             i += n_fused - 1;
+        }
+
+        // a folded conv history reads x and the rows only when the conv runs, so its outputs must not take over them
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_cuda_conv_state_fold fold;
+            const int conv_idx = ggml_cuda_match_conv_state_fold(cgraph, i, fold);
+            if (conv_idx < 0) {
+                continue;
+            }
+            ggml_tensor * last = cgraph->nodes[ggml_cuda_conv_output_end(cgraph, conv_idx)];
+            params->add_alloc_dep(params->user_data, fold.concat->src[1], last);
+            params->add_alloc_dep(params->user_data, fold.gather->src[1], last);
         }
     }
 

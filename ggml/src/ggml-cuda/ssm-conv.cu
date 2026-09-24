@@ -123,6 +123,92 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
     }
 }
 
+// one token of up to 4 sequences whose histories are still in their state rows: channel c convolves each row's d_conv - 1
+// columns and the new one, the same arithmetic as ssm_conv_f32, then writes the last d_conv - 1 of them back. A sequence
+// may write back the row another one reads, so the thread reads its channel of every row before it writes any.
+static constexpr int SSM_CONV_STATE_ROW_MAX_SEQS = 4;
+
+template <bool apply_silu, size_t d_conv>
+static __global__ void ssm_conv_state_row_f32(const float * states, const int32_t * rows, const int64_t states_stride,
+                                              const float * x_new, const int x_new_stride, const int64_t x_new_seq_stride,
+                                              const float * w_ptr, const int w_stride, const float * bias,
+                                              float * dst, const int64_t dst_seq_stride,
+                                              float * state_out, const int64_t state_out_stride, const int n_seqs) {
+    ggml_cuda_pdl_lc();
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+
+    ggml_cuda_pdl_sync();
+    float x[SSM_CONV_STATE_ROW_MAX_SEQS][d_conv];
+#pragma unroll
+    for (int s = 0; s < SSM_CONV_STATE_ROW_MAX_SEQS; s++) {
+        if (s < n_seqs) {
+            const float * state = states + rows[s] * states_stride + c * (d_conv - 1);
+#pragma unroll
+            for (size_t j = 0; j < d_conv - 1; j++) {
+                x[s][j] = state[j];
+            }
+            x[s][d_conv - 1] = x_new[s * x_new_seq_stride + c * x_new_stride];
+        }
+    }
+
+    float w[d_conv];
+#pragma unroll
+    for (size_t j = 0; j < d_conv; j++) {
+        w[j] = w_ptr[c * w_stride + j];
+    }
+
+    float b = bias != nullptr ? bias[c] : 0.0f;
+
+#pragma unroll
+    for (int s = 0; s < SSM_CONV_STATE_ROW_MAX_SEQS; s++) {
+        if (s < n_seqs) {
+            float sumf = 0.0f;
+#pragma unroll
+            for (size_t j = 0; j < d_conv; j++) {
+                sumf += x[s][j] * w[j];
+            }
+            sumf += b;
+            dst[s * dst_seq_stride + c] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+
+#pragma unroll
+            for (size_t j = 0; j < d_conv - 1; j++) {
+                state_out[s * state_out_stride + c * (d_conv - 1) + j] = x[s][j + 1];
+            }
+        }
+    }
+}
+
+template <typename launch_t>
+static void ssm_conv_switch_d_conv(const int64_t nc, const launch_t & launch_kernel) {
+    switch (nc) {
+        case 3:  launch_kernel(std::integral_constant<int, 3 >{}); break;
+        case 4:  launch_kernel(std::integral_constant<int, 4 >{}); break;
+        case 5:  launch_kernel(std::integral_constant<int, 5 >{}); break;
+        case 9:  launch_kernel(std::integral_constant<int, 9 >{}); break;
+        case 15: launch_kernel(std::integral_constant<int, 15>{}); break;
+        default: GGML_ABORT("Only support kernel sizes 3, 4, 5, 9, 15 right now.");
+    }
+}
+
+template <bool apply_silu>
+static void ssm_conv_state_row_f32_cuda(const float * states, const int32_t * rows, const int64_t states_stride,
+                                        const float * x_new, const int x_new_stride, const int64_t x_new_seq_stride,
+                                        const float * w, const int w_stride, const float * bias,
+                                        float * dst, const int64_t dst_seq_stride, float * state_out, const int64_t state_out_stride,
+                                        const int64_t nc, const int64_t nr, const int64_t n_seqs, cudaStream_t stream) {
+    const int threads = 128;
+    GGML_ASSERT(nr % threads == 0);
+    GGML_ASSERT(n_seqs <= SSM_CONV_STATE_ROW_MAX_SEQS);
+
+    ssm_conv_switch_d_conv(nc, [&](auto NC) {
+        constexpr int kNC = decltype(NC)::value;
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(dim3(nr / threads), threads, 0, stream);
+        ggml_cuda_kernel_launch(ssm_conv_state_row_f32<apply_silu, kNC>, launch_params, states, rows, states_stride,
+                                x_new, x_new_stride, x_new_seq_stride, w, w_stride, bias, dst, dst_seq_stride,
+                                state_out, state_out_stride, (int) n_seqs);
+    });
+}
+
 template <bool apply_silu>
 static void ssm_conv_f32_cuda(const float * src0, const float * src1, const float * bias, const int src0_nb0, const int src0_nb1,
                               const int src0_nb2, const int src1_nb1, float * dst, const int dst_nb0, const int dst_nb1,
@@ -147,14 +233,7 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
         }
     };
 
-    switch (nc) {
-        case 3:  launch_kernel(std::integral_constant<int, 3 >{}); break;
-        case 4:  launch_kernel(std::integral_constant<int, 4 >{}); break;
-        case 5:  launch_kernel(std::integral_constant<int, 5 >{}); break;
-        case 9:  launch_kernel(std::integral_constant<int, 9 >{}); break;
-        case 15: launch_kernel(std::integral_constant<int, 15>{}); break;
-        default: GGML_ABORT("Only support kernel sizes 3, 4, 5, 9, 15 right now.");
-    }
+    ssm_conv_switch_d_conv(nc, launch_kernel);
 }
 
 void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node, ggml_tensor * silu_dst) {
@@ -194,6 +273,23 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
         GGML_ASSERT(bias->type == GGML_TYPE_F32);
         GGML_ASSERT(ggml_is_contiguous(bias));
         GGML_ASSERT(ggml_nelements(bias) == nr);
+    }
+
+    const ggml_cuda_conv_state_fold fold = ctx.conv_state_fold;
+    if (fold.conv == dst) {
+        ctx.conv_state_fold = {};
+        const ggml_tensor * state_out = fold.tail_cpy->src[1];
+        GGML_ASSERT(src0 == fold.concat && n_t == 1);
+        GGML_ASSERT(out->nb[0] == sizeof(float) && state_out->ne[0] == (nc - 1) * nr && ggml_nrows(state_out) == n_s);
+
+        const ggml_tensor * states = fold.gather->src[0];
+        const ggml_tensor * x_new  = fold.concat->src[1];
+        const auto launch = fuse_silu ? ssm_conv_state_row_f32_cuda<true> : ssm_conv_state_row_f32_cuda<false>;
+        launch((const float *) states->data, (const int32_t *) fold.gather->src[1]->data, states->nb[1] / sizeof(float),
+               (const float *) x_new->data, x_new->nb[1] / sizeof(float), x_new->nb[2] / sizeof(float),
+               src1_d, src1->nb[1] / sizeof(float), bias_d, dst_d, out->nb[2] / sizeof(float),
+               (float *) state_out->data, state_out->nb[1] / sizeof(float), nc, nr, n_s, stream);
+        return;
     }
 
     if (fuse_silu) {

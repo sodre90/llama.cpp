@@ -5218,6 +5218,81 @@ struct test_gated_delta_net_state_rows : public test_case {
     }
 };
 
+// GGML_OP_GET_ROWS of a conv state row -> GGML_OP_CONCAT with the new column -> GGML_OP_CPY of the tail back into the
+// states, and GGML_OP_SSM_CONV + SILU of the concat, as build_conv_state_at lays out one token; the CUDA backend folds
+// the history into the conv. Sequence s reads row read_row + s and writes row write_row + s.
+struct test_ssm_conv_state_rows : public test_case {
+    const int64_t channels;
+    const int64_t d_conv;
+    const int64_t read_row;
+    const int64_t write_row;
+    const int64_t n_seqs;
+
+    ggml_tensor * cpy_node = nullptr;
+    ggml_tensor * out      = nullptr;
+
+    static constexpr int64_t n_rs = 4;
+
+    std::string vars() override {
+        return VARS_TO_STR5(channels, d_conv, read_row, write_row, n_seqs);
+    }
+
+    test_ssm_conv_state_rows(int64_t channels, int64_t d_conv, int64_t read_row, int64_t write_row, int64_t n_seqs = 1)
+        : channels(channels), d_conv(d_conv), read_row(read_row), write_row(write_row), n_seqs(n_seqs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t state_cols = d_conv - 1;
+
+        ggml_tensor * states = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, state_cols * channels, n_rs);
+        ggml_set_name(states, "states");
+        ggml_tensor * rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_set_name(rows, "rows");
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, channels, 1, n_seqs);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, channels);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * state = ggml_reshape_3d(ctx, ggml_get_rows(ctx, states, rows), state_cols, channels, n_seqs);
+        ggml_tensor * conv_input = ggml_concat(ctx, state, ggml_transpose(ctx, x), 0);
+
+        ggml_tensor * tail = ggml_view_3d(ctx, conv_input, state_cols, channels, n_seqs,
+                conv_input->nb[1], conv_input->nb[2], ggml_row_size(conv_input->type, 1));
+        ggml_tensor * dst = ggml_view_2d(ctx, states, state_cols * channels, n_seqs, states->nb[1], write_row * states->nb[1]);
+        cpy_node = ggml_cpy(ctx, tail, dst);
+        ggml_set_name(cpy_node, "state_cpy");
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, cpy_node);
+        }
+
+        out = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, w));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_STATE_ROWS";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy_node, out }; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "rows") == 0) {
+                std::vector<int32_t> data(n_seqs);
+                for (int64_t s = 0; s < n_seqs; ++s) {
+                    data[s] = (int32_t) ((read_row + s) % n_rs);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -12086,6 +12161,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gated_delta_net_state_rows(4,  32,  3, first_row));
         test_cases.emplace_back(new test_gated_delta_net_state_rows(16, 128, 4, first_row));
     }
+    // the row read is the row written, another row, and the model's shape
+    test_cases.emplace_back(new test_ssm_conv_state_rows(256,   4, 1, 1));
+    test_cases.emplace_back(new test_ssm_conv_state_rows(256,   4, 2, 0));
+    test_cases.emplace_back(new test_ssm_conv_state_rows(128,   3, 3, 3));
+    test_cases.emplace_back(new test_ssm_conv_state_rows(10240, 4, 0, 0));
+    // several sequences, some reading a row that another one writes
+    test_cases.emplace_back(new test_ssm_conv_state_rows(256,   4, 1, 0, 4));
+    test_cases.emplace_back(new test_ssm_conv_state_rows(128,   3, 2, 1, 2));
+    test_cases.emplace_back(new test_ssm_conv_state_rows(256,   4, 3, 0, 3));
+    test_cases.emplace_back(new test_ssm_conv_state_rows(10240, 4, 0, 0, 4));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
