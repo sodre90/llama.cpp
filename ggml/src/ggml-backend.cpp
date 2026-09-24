@@ -987,6 +987,8 @@ struct ggml_backend_sched {
     int cur_copy;
     int next_copy;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
+    // without pipeline copies: marks the end of a graph's queued input uploads (see the INPUT copies in compute_splits)
+    ggml_backend_event_t inputs_uploaded[GGML_SCHED_MAX_BACKENDS];
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
@@ -2048,6 +2050,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    bool inputs_upload_pending[GGML_SCHED_MAX_BACKENDS] = {false};
+
     // mindcontrol-port of --prefetch-experts-slots. Lookahead depth (1) and cross-stream
     // wait mode (1 = per-split, the only mode that preserves tool_choice semantics) are
     // hardcoded to their measured-optimal safe values; the only user-visible knob is the
@@ -2169,7 +2173,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
-            if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+            const ggml_backend_buffer_t input_buffer = input->view_src ? input->view_src->buffer : input->buffer;
+            if ((input->flags & GGML_TENSOR_FLAG_INPUT) && sched->inputs_uploaded[split_backend_id] != NULL &&
+                    input_buffer && ggml_backend_buffer_is_host(input_buffer) && split_backend->iface.set_tensor_async &&
+                    ggml_backend_buffer_get_type(input_cpy->buffer) == sched->bufts[split_backend_id]) {
+                // Queued behind the split backend's earlier work rather than draining it first and copying
+                // synchronously (~35 us per input with the GPU idle). The user's data must stay put until the upload
+                // has run: the graph waits for inputs_uploaded before returning.
+                ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                inputs_upload_pending[split_backend_id] = true;
+            } else if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
@@ -2404,6 +2417,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // recorded before the compute launch, so the wait at the end of the graph covers only the uploads
+        if (inputs_upload_pending[split_backend_id]) {
+            ggml_backend_event_record(sched->inputs_uploaded[split_backend_id], split_backend);
+        }
+
         if (!sched->callback_eval) {
             // Cross-stream sync for a lookahead/inline-prefetched weight: wait until the
             // H2D on the prefetch backend has completed before launching compute (mode 1).
@@ -2483,6 +2501,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     if (prefetch_wait_mode >= 2 && !pending_prefetch_slots.empty() && last_prefetch_split_backend) {
         for (int slot : pending_prefetch_slots) {
             ggml_backend_event_wait(last_prefetch_split_backend, sched->prefetch_ready[slot]);
+        }
+    }
+
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (inputs_upload_pending[b]) {
+            ggml_backend_event_synchronize(sched->inputs_uploaded[b]);
         }
     }
 
@@ -2578,6 +2602,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
             for (int c = 0; c < sched->n_copies; c++) {
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
             }
+        } else {
+            sched->inputs_uploaded[b] = ggml_backend_event_new(backends[b]->device);
         }
     }
 
@@ -2624,6 +2650,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
+        }
+        if (sched->inputs_uploaded[b]) {
+            ggml_backend_event_free(sched->inputs_uploaded[b]);
         }
     }
     for (int i = 0; i < sched->prefetch_n_slots; i++) {
