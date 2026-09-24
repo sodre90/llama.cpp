@@ -1001,9 +1001,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
         ggml_tensor * fresh = nullptr;
         for (int64_t i = 0; i < r; ++i) {
-            ggml_tensor * slice = ggml_cont(ctx0,
-                    ggml_view_3d(ctx0, members, idx_dim, n_dirty_max, n_stream,
-                            members->nb[2], members->nb[3], i*members->nb[1]));
+            ggml_tensor * slice = ggml_view_3d(ctx0, members, idx_dim, n_dirty_max, n_stream,
+                    members->nb[2], members->nb[3], i*members->nb[1]);
             fresh = fresh ? ggml_add(ctx0, fresh, slice) : slice;
         }
         fresh = ggml_scale(ctx0, fresh, 1.0f/(float) r);
@@ -1042,9 +1041,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
         // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows
         for (int64_t i = 0; i < r; ++i) {
-            ggml_tensor * slice = ggml_cont(ctx0,
-                    ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
-                            members->nb[2], members->nb[3], i*members->nb[1]));
+            ggml_tensor * slice = ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
+                    members->nb[2], members->nb[3], i*members->nb[1]);
             pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
         }
         pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
@@ -1087,7 +1085,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         for (int64_t h = 0; h < n_idx_h; ++h) {
             ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_t, n_stream,
                     score->nb[2], score->nb[3], h*score->nb[1]);
-            summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+            summed = summed ? ggml_add(ctx0, summed, slice) : slice;
         }
 
         cb(summed, "indexer_score", il);
@@ -1103,7 +1101,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         const int64_t n_top_blocks = std::min<int64_t>(n_blocks, (width + r - 1)/r);
 
         // top-k directly on block scores: [n_blocks, n_t, n_stream] -> [n_top_blocks, n_t, n_stream, 1]
-        ggml_tensor * top_blocks = ggml_cont(ctx0, ggml_top_k(ctx0, score, n_top_blocks));
+        ggml_tensor * top_blocks = ggml_top_k(ctx0, score, n_top_blocks);
 
         // view blk_cells as 3D tensor: [r, n_blocks, n_stream]
         ggml_tensor * blk_cells_3d = ggml_view_3d(ctx0, cells,
@@ -1203,7 +1201,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     expanded = ggml_add(ctx0, expanded, inp->bias);
     cb(expanded, "indexer_score_tokens", il);
 
-    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
+    ggml_tensor * top_k = ggml_top_k(ctx0, expanded, width);
     top_k = ggml_reshape_4d(ctx0, top_k, width, n_tps, 1, n_stream);
     cb(top_k, "indexer_top_k", il);
     return top_k;
@@ -1898,7 +1896,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
                 conv_states_all->nb[1],
                 (slot * mem_size + kv_head) * row_size);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
     }
 
     return conv_input;
