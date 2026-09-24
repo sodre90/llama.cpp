@@ -329,6 +329,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
     cb(xn, "hc_norm", il);
 
+    if (inject) {
+        *inject = build_lora_mm(w_inject, xn);
+        cb(*inject, "hc_inject", il);
+        // next to the down projection, so the GPU backend quantizes xn once for both
+        ggml_build_forward_expand(gf, *inject);
+    }
+
     ggml_tensor * lo = build_lora_mm(w_down, xn);
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
     ggml_tensor * gate = build_lora_mm(w_up, lo);
@@ -358,11 +365,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
     }
     cb(mixed, "hc_mixed", il);
-
-    if (inject) {
-        *inject = build_lora_mm(w_inject, xn);
-        cb(*inject, "hc_inject", il);
-    }
 
     return mixed;
 }

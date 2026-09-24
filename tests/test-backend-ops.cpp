@@ -3578,6 +3578,52 @@ struct test_scale_unary : public test_case {
     }
 };
 
+// two GGML_OP_MUL_MAT reading the same src1, which the CUDA backend quantizes once for both
+struct test_mul_mat_shared_src1 : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SHARED_SRC1";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_a, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_shared_src1(ggml_type type_a = GGML_TYPE_Q8_0, int64_t m = 64, int64_t n = 1, int64_t k = 256)
+        : type_a(type_a), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a0 = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * a1 = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * b  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(a0, "a0");
+        ggml_set_name(a1, "a1");
+        ggml_set_name(b, "b");
+
+        ggml_tensor * m0 = ggml_mul_mat(ctx, a0, b);
+        ggml_tensor * m1 = ggml_mul_mat(ctx, a1, b);
+        // a second src1 in between must not be served from the first one's quantization
+        ggml_tensor * b2 = ggml_scale(ctx, b, 0.5f);
+        ggml_tensor * m2 = ggml_mul_mat(ctx, a1, b2);
+
+        ggml_tensor * out = ggml_add(ctx, ggml_add(ctx, m0, m1), m2);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_SILU_BACK
 struct test_silu_back : public test_case {
     const ggml_type type;
@@ -9470,6 +9516,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         test_cases.emplace_back(new test_relu_sqr(type, { 128, 2, 2, 2 }));
         test_cases.emplace_back(new test_relu_sqr(type, { 5, 7, 11, 13 }));
+    }
+
+    for (ggml_type type_a : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_K }) {
+        for (int64_t n : { 1, 3, 8 }) {
+            test_cases.emplace_back(new test_mul_mat_shared_src1(type_a, 64, n, 256));
+            test_cases.emplace_back(new test_mul_mat_shared_src1(type_a, 320, n, 2560));
+        }
     }
 
     // fused scale + unary [+ scale]
