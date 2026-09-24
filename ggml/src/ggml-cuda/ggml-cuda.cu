@@ -118,6 +118,11 @@ static bool ggml_cuda_debug_sync_enabled() {
     return enabled;
 }
 
+static bool ggml_cuda_fusion_disabled() {
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+    return disabled;
+}
+
 static void ggml_cuda_debug_print_tensor(const char * role, const ggml_tensor * t) {
     if (t == nullptr) {
         return;
@@ -3797,11 +3802,77 @@ static int ggml_cuda_topk_moe_ids_copy(const ggml_cgraph * cgraph, int node_idx,
     return -1;
 }
 
+// the GDN may write back a row that another sequence reads. The kernel runs all sequences of the same columns in one
+// block and reads before it writes, so every write must be at the same offset within a row as the read of its columns.
+static bool ggml_cuda_gdn_state_writes_keep_row_offsets(const ggml_cgraph * cgraph, int gdn_idx, const ggml_tensor * states) {
+    const ggml_tensor * gdn = cgraph->nodes[gdn_idx];
+    ggml_cuda_gated_delta_net_fused_cache cache;
+    if (ggml_cuda_try_gdn_cache_fusion(cgraph, gdn_idx, cache) == 0) {
+        const char * gdn_begin    = (const char *) gdn->data;
+        const char * states_begin = (const char *) states->data;
+        return gdn_begin + ggml_nbytes(gdn) <= states_begin || states_begin + ggml_nbytes(states) <= gdn_begin;
+    }
+    const ggml_tensor * state = gdn->src[5];
+    const size_t    row_size  = ggml_row_size(GGML_TYPE_F32, state->ne[0]*state->ne[1]*state->ne[2]);
+    const ptrdiff_t offs      = (const char *) cache.data - (const char *) states->data;
+    return states->nb[1] == row_size && offs % (ptrdiff_t) row_size == 0 && (cache.slot_stride*sizeof(float)) % row_size == 0;
+}
+
+// whether node_idx gathers the recurrent state of at most 4 sequences that only a later GATED_DELTA_NET reads, with
+// nothing writing the states in between, so the GDN kernel can read the rows in place instead
+static bool ggml_cuda_gdn_can_read_state_rows(const ggml_cgraph * cgraph, int node_idx) {
+    if (ggml_cuda_fusion_disabled()) {
+        return false;
+    }
+    const ggml_tensor * gather = cgraph->nodes[node_idx];
+    if (gather->op != GGML_OP_GET_ROWS || gather->type != GGML_TYPE_F32 || gather->src[0]->type != GGML_TYPE_F32 ||
+        gather->src[1]->type != GGML_TYPE_I32 || (gather->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        ggml_nrows(gather) > 4 || gather->src[0]->nb[0] != sizeof(float) || !ggml_is_contiguous(gather)) {
+        return false;
+    }
+
+    const ggml_tensor * states = gather->src[0];
+    const char * states_begin = (const char *) states->data;
+    const char * states_end   = states_begin + (states->ne[1] - 1)*states->nb[1] + ggml_row_size(states->type, states->ne[0]);
+
+    // the rows are read by the GDN instead, so they must outlive their allocation, which ends at the gather
+    const char * rows_begin = (const char *) gather->src[1]->data;
+    const char * rows_end   = rows_begin + ggml_nbytes(gather->src[1]);
+
+    const int lookahead = 64;
+    for (int j = node_idx + 1; j < std::min(cgraph->n_nodes, node_idx + lookahead); ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(node)) {
+            continue;
+        }
+        if (node->op == GGML_OP_GATED_DELTA_NET) {
+            const ggml_tensor * state = node->src[5];
+            if (state == gather || (state->view_src == gather && state->view_offs == 0 && ggml_is_contiguous(state))) {
+                const char * gdn_begin = (const char *) node->data;
+                if (gdn_begin < rows_end && rows_begin < gdn_begin + ggml_nbytes(node)) {
+                    return false;
+                }
+                return ggml_cuda_gdn_state_writes_keep_row_offsets(cgraph, j, states);
+            }
+        }
+        for (const ggml_tensor * src : node->src) {
+            if (src != nullptr && (src == gather || src->view_src == gather)) {
+                return false;
+            }
+        }
+        const char * dst_begin = (const char *) node->data;
+        const char * dst_end   = dst_begin + ggml_nbytes(node);
+        if ((dst_begin < states_end && states_begin < dst_end) || (dst_begin < rows_end && rows_begin < dst_end)) {
+            return false;
+        }
+    }
+    return false;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
-    static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-    if (disable_fusion) {
+    if (ggml_cuda_fusion_disabled()) {
         return 0;
     }
 
@@ -4784,6 +4855,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             for (auto & slot : cuda_ctx->q8_1_reuse.slots) {
                 slot.src = nullptr;
             }
+            cuda_ctx->gdn_state_gather = nullptr;
             cuda_ctx->q8_1_reuse.enabled = cuda_ctx->q8_1_reuse.slots[0].buf != nullptr && stream_ctx.concurrent_events.empty();
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -4825,6 +4897,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    continue;
+                }
+
+                if (ggml_cuda_gdn_can_read_state_rows(cgraph, i)) {
+                    cuda_ctx->gdn_state_gather = node;
                     continue;
                 }
 
@@ -5037,8 +5114,6 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
-    static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-
     auto add_alloc_deps = [&](size_t start, size_t last_node) {
 
         for (size_t i = start; i < last_node; ++i) {
@@ -5052,7 +5127,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         }
     };
 
-    if (!disable_fusion) {
+    if (!ggml_cuda_fusion_disabled()) {
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         ggml_cuda_set_device(cuda_ctx->device);

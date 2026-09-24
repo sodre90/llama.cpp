@@ -3633,6 +3633,7 @@ struct test_mul_mat_shared_src1 : public test_case {
     const int64_t k;
     const producer_kind producer;
     const bool glu;
+    const bool view; // the second mul_mat reads a view of the shared src1
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -3642,7 +3643,7 @@ struct test_mul_mat_shared_src1 : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR6(type_a, m, n, k, producer, glu);
+        return VARS_TO_STR7(type_a, m, n, k, producer, glu, view);
     }
 
     double max_nmse_err() override {
@@ -3650,8 +3651,8 @@ struct test_mul_mat_shared_src1 : public test_case {
     }
 
     test_mul_mat_shared_src1(ggml_type type_a = GGML_TYPE_Q8_0, int64_t m = 64, int64_t n = 1, int64_t k = 256,
-            producer_kind producer = PRODUCER_NONE, bool glu = false)
-        : type_a(type_a), m(m), n(n), k(k), producer(producer), glu(glu) {}
+            producer_kind producer = PRODUCER_NONE, bool glu = false, bool view = false)
+        : type_a(type_a), m(m), n(n), k(k), producer(producer), glu(glu), view(view) {}
 
     ggml_tensor * build_src1(ggml_context * ctx, ggml_tensor * b) {
         switch (producer) {
@@ -3683,7 +3684,7 @@ struct test_mul_mat_shared_src1 : public test_case {
 
         ggml_tensor * src1 = build_src1(ctx, b);
         ggml_tensor * m0 = ggml_mul_mat(ctx, a0, src1);
-        ggml_tensor * m1 = ggml_mul_mat(ctx, a1, src1);
+        ggml_tensor * m1 = ggml_mul_mat(ctx, a1, view ? ggml_view_2d(ctx, src1, k, n, src1->nb[1], 0) : src1);
         // a second src1 in between must not be served from the first one's quantization
         ggml_tensor * b2 = ggml_scale(ctx, src1, 0.5f);
         ggml_tensor * m2 = ggml_mul_mat(ctx, a1, b2);
@@ -5086,6 +5087,94 @@ struct test_gated_delta_net_cache_fusion : public test_case {
                 init_tensor_uniform(t, -0.3f, 5.0f);
             } else if (strcmp(t->name, "cache") == 0) {
                 init_tensor_uniform(t, 0.0f, 0.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_GET_ROWS of the recurrent states -> GGML_OP_GATED_DELTA_NET -> GGML_OP_CPY of the new state back into
+// the states, as build_rs and build_recurrent_attn lay it out; the CUDA backend reads the gathered row in place
+struct test_gated_delta_net_state_rows : public test_case {
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t n_seqs;
+    const int64_t first_row; // the row sequence 0 reads; the new states go to rows 0..n_seqs-1
+
+    ggml_tensor * cpy_node = nullptr;
+
+    static constexpr int64_t n_rs = 4;
+
+    std::string vars() override {
+        return VARS_TO_STR4(head_count, head_size, n_seqs, first_row);
+    }
+
+    test_gated_delta_net_state_rows(int64_t head_count = 4, int64_t head_size = 32, int64_t n_seqs = 1, int64_t first_row = 0)
+        : head_count(head_count), head_size(head_size), n_seqs(n_seqs), first_row(first_row) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t S_v = head_size;
+        const int64_t H   = head_count;
+        const int64_t D   = S_v * S_v * H;
+
+        ggml_tensor * states = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_rs);
+        ggml_set_name(states, "states");
+        ggml_tensor * rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_set_name(rows, "rows");
+
+        ggml_tensor * gathered = ggml_get_rows(ctx, states, rows);
+        ggml_set_name(gathered, "gathered");
+        ggml_tensor * state = ggml_reshape_4d(ctx, gathered, S_v, S_v, H, n_seqs);
+
+        ggml_tensor * q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, 1, n_seqs);
+        ggml_tensor * k    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, 1, n_seqs);
+        ggml_tensor * v    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, 1, n_seqs);
+        ggml_tensor * g    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, 1, n_seqs);
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, 1, n_seqs);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_set_name(g, "g");
+        ggml_set_name(beta, "beta");
+
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+
+        ggml_tensor * gdn_out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+        ggml_set_name(gdn_out, "gdn_out");
+
+        ggml_tensor * new_state = ggml_view_2d(ctx, gdn_out, D, n_seqs, ggml_row_size(GGML_TYPE_F32, D),
+                ggml_row_size(GGML_TYPE_F32, S_v * H * n_seqs));
+        ggml_tensor * dst = ggml_view_2d(ctx, states, D, n_seqs, states->nb[1], 0);
+
+        cpy_node = ggml_cpy(ctx, new_state, dst);
+        ggml_set_name(cpy_node, "state_cpy");
+
+        return ggml_sum(ctx, cpy_node);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_STATE_ROWS";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy_node }; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "rows") == 0) {
+                std::vector<int32_t> data(n_seqs);
+                for (int64_t s = 0; s < n_seqs; ++s) {
+                    data[s] = (int32_t) ((first_row + s) % n_rs);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
             } else {
                 init_tensor_uniform(t);
             }
@@ -9788,6 +9877,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
         test_cases.emplace_back(new test_mul_mat_shared_src1(type_a, 64, 1, 256, test_mul_mat_shared_src1::PRODUCER_NONE, true));
+        for (int64_t n : { 1, 3 }) {
+            test_cases.emplace_back(new test_mul_mat_shared_src1(type_a, 64, n, 256, test_mul_mat_shared_src1::PRODUCER_NONE, false, true));
+            test_cases.emplace_back(new test_mul_mat_shared_src1(type_a, 64, n, 256, test_mul_mat_shared_src1::PRODUCER_RMS_NORM_MUL, false, true));
+        }
     }
 
     // fused scale + unary [+ scale]
@@ -12057,6 +12150,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
+    // in place (row 0 is also where the new state goes), another row, and several sequences, which with first_row 1
+    // read rows that other sequences write
+    for (int64_t first_row : {0, 1, 2}) {
+        test_cases.emplace_back(new test_gated_delta_net_state_rows(4,  32,  1, first_row));
+        test_cases.emplace_back(new test_gated_delta_net_state_rows(16, 128, 1, first_row));
+        test_cases.emplace_back(new test_gated_delta_net_state_rows(4,  32,  2, first_row));
+        test_cases.emplace_back(new test_gated_delta_net_state_rows(4,  32,  3, first_row));
+        test_cases.emplace_back(new test_gated_delta_net_state_rows(16, 128, 4, first_row));
+    }
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
