@@ -740,8 +740,8 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
-    if (q8_1_reuse.buf != nullptr) {
-        CUDA_CHECK(cudaFree(q8_1_reuse.buf));
+    if (q8_1_reuse.slots[0].buf != nullptr) {
+        CUDA_CHECK(cudaFree(q8_1_reuse.slots[0].buf));
     }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
@@ -4587,19 +4587,67 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 }
 
 static void ggml_cuda_q8_1_reuse_drop_overwritten(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int first, int last) {
+    for (auto & slot : cuda_ctx->q8_1_reuse.slots) {
+        if (slot.src == nullptr) {
+            continue;
+        }
+        const char * src_begin = (const char *) slot.src->data;
+        const char * src_end   = src_begin + ggml_nbytes(slot.src);
+        for (int j = first; j <= last; ++j) {
+            const char * dst_begin = (const char *) cgraph->nodes[j]->data;
+            const char * dst_end   = dst_begin + ggml_nbytes(cgraph->nodes[j]);
+            if (dst_begin < src_end && src_begin < dst_end) {
+                slot.src = nullptr;
+                break;
+            }
+        }
+    }
+}
+
+// the src1 of the next quantized MUL_MAT(_ID) a few nodes after node_idx, and the tensor behind it, so the kernel that
+// writes that tensor can also write the q8_1 copy mul_mat_vec_q would quantize
+static void ggml_cuda_q8_1_reuse_plan(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int node_idx) {
     auto & reuse = cuda_ctx->q8_1_reuse;
-    if (reuse.src == nullptr) {
+    reuse.want_dst = nullptr;
+    if (!reuse.enabled) {
         return;
     }
-    const char * src_begin = (const char *) reuse.src->data;
-    const char * src_end   = src_begin + ggml_nbytes(reuse.src);
-    for (int j = first; j <= last; ++j) {
-        const char * dst_begin = (const char *) cgraph->nodes[j]->data;
-        const char * dst_end   = dst_begin + ggml_nbytes(cgraph->nodes[j]);
-        if (dst_begin < src_end && src_begin < dst_end) {
-            reuse.src = nullptr;
+
+    const int lookahead = 32;
+    for (int j = node_idx + 1; j < std::min(cgraph->n_nodes, node_idx + lookahead); ++j) {
+        const ggml_tensor * mm = cgraph->nodes[j];
+        if ((mm->op != GGML_OP_MUL_MAT && mm->op != GGML_OP_MUL_MAT_ID) || !ggml_is_quantized(mm->src[0]->type)) {
+            continue;
+        }
+
+        const ggml_tensor * src1 = mm->src[1];
+        const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+        const size_t  nbytes = ggml_nrows(src1)*ne10_padded*sizeof(block_q8_1)/QK8_1;
+        // the producer writes the rows back to back, as quantize_q8_1 does only when no row needs padding
+        if (src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) || src1->ne[0] % QK8_1 != 0 ||
+            (ggml_nrows(src1) > 1 && ne10_padded != src1->ne[0]) || nbytes > reuse.size) {
             return;
         }
+
+        const ggml_tensor * base = src1->view_src ? src1->view_src : src1;
+        if (base->data != src1->data || ggml_nbytes(base) != ggml_nbytes(src1)) {
+            return;
+        }
+
+        reuse.want_dst    = base;
+        reuse.want_src1   = src1;
+        reuse.want_nbytes = nbytes;
+        return;
+    }
+}
+
+// a q8_1 copy written by the node's own kernel is valid from here on
+static void ggml_cuda_q8_1_reuse_commit(ggml_backend_cuda_context * cuda_ctx) {
+    auto & reuse = cuda_ctx->q8_1_reuse;
+    if (reuse.prequantized != nullptr) {
+        reuse.prequantized->src    = reuse.want_src1;
+        reuse.prequantized->nbytes = reuse.want_nbytes;
+        reuse.prequantized         = nullptr;
     }
 }
 
@@ -4701,8 +4749,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
-            cuda_ctx->q8_1_reuse.src     = nullptr;
-            cuda_ctx->q8_1_reuse.enabled = cuda_ctx->q8_1_reuse.buf != nullptr && stream_ctx.concurrent_events.empty();
+            for (auto & slot : cuda_ctx->q8_1_reuse.slots) {
+                slot.src = nullptr;
+            }
+            cuda_ctx->q8_1_reuse.enabled = cuda_ctx->q8_1_reuse.slots[0].buf != nullptr && stream_ctx.concurrent_events.empty();
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
@@ -4746,10 +4796,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                ggml_cuda_q8_1_reuse_plan(cuda_ctx, cgraph, i);
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
                     ggml_cuda_q8_1_reuse_drop_overwritten(cuda_ctx, cgraph, i, i + nodes_to_skip);
+                    ggml_cuda_q8_1_reuse_commit(cuda_ctx);
                     if (ggml_cuda_debug_sync_enabled()) {
                         ggml_cuda_debug_sync_after(cgraph, i, i + nodes_to_skip);
                     }
@@ -4787,6 +4839,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 GGML_ASSERT(ok);
                 ggml_cuda_q8_1_reuse_drop_overwritten(cuda_ctx, cgraph, i, i);
+                ggml_cuda_q8_1_reuse_commit(cuda_ctx);
 
                 if (ggml_cuda_debug_sync_enabled()) {
                     ggml_cuda_debug_sync_after(cgraph, i, i);
@@ -4857,10 +4910,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
-    if (cuda_ctx->q8_1_reuse.buf == nullptr) {
+    auto & reuse = cuda_ctx->q8_1_reuse;
+    if (reuse.slots[0].buf == nullptr) {
         // outside any capture; sized for token generation, larger batches quantize into the pool as before
-        cuda_ctx->q8_1_reuse.size = 1 << 20;
-        CUDA_CHECK(ggml_cuda_device_malloc(&cuda_ctx->q8_1_reuse.buf, cuda_ctx->q8_1_reuse.size, cuda_ctx->device));
+        reuse.size = 1 << 19;
+        CUDA_CHECK(ggml_cuda_device_malloc(&reuse.slots[0].buf, 2*reuse.size, cuda_ctx->device));
+        reuse.slots[1].buf = (char *) reuse.slots[0].buf + reuse.size;
     }
 
     bool use_cuda_graph             = false;

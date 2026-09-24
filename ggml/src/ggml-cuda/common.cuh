@@ -534,6 +534,27 @@ static __device__ __forceinline__ float warp_reduce_max(float x) {
     return x;
 }
 
+// one element of a q8_1 quantization, called by every lane of the 32 lanes that hold block i/QK8_1
+static __device__ __forceinline__ void quantize_q8_1_element(const float xi, block_q8_1 * y, const int64_t i) {
+    float amax = fabsf(xi);
+    float sum  = xi;
+
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+    const int64_t ib  = i / QK8_1;
+    const int64_t iqs = i % QK8_1;
+
+    y[ib].qs[iqs] = q;
+
+    if (iqs == 0) {
+        y[ib].ds = make_half2(d, sum);
+    }
+}
+
 template<typename T, int width = WARP_SIZE>
 static __device__ __forceinline__ T warp_prefix_inclusive_sum(T x) {
     const int lane_id = threadIdx.x % width;
@@ -1456,15 +1477,70 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
-    // q8_1 copy of the last src1 that mul_mat_vec_q quantized, so later nodes reading the same tensor skip the
+    // q8_1 copies of the last two src1 that mul_mat_vec_q quantized, so later nodes reading the same tensor skip the
     // quantization; valid within one graph evaluation until a node writes over the tensor
     struct q8_1_reuse_state {
-        void              * buf     = nullptr;
-        size_t              size    = 0;
-        bool                enabled = false;
-        const ggml_tensor * src     = nullptr;
-        size_t              nbytes  = 0;
+        struct slot {
+            void              * buf    = nullptr;
+            const ggml_tensor * src    = nullptr;
+            size_t              nbytes = 0;
+        };
+
+        slot   slots[2];
+        int    next    = 0; // the slot the next quantization overwrites
+        size_t size    = 0; // of each slot
+        bool   enabled = false;
+
+        // set per node by the graph walk: the tensor whose producer may also write its q8_1 copy, and the src1 of the
+        // mul_mat_vec_q that reads it next
+        const ggml_tensor * want_dst    = nullptr;
+        const ggml_tensor * want_src1   = nullptr;
+        size_t              want_nbytes = 0;
+        slot              * prequantized = nullptr;
+
+        // keyed on the layout rather than the tensor, so the views of one tensor that different nodes read share it
+        static bool same_elements(const ggml_tensor * a, const ggml_tensor * b) {
+            if (a->data != b->data || a->type != b->type) {
+                return false;
+            }
+            for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                if (a->ne[i] != b->ne[i] || (a->ne[i] > 1 && a->nb[i] != b->nb[i])) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        slot * find(const ggml_tensor * src, size_t nbytes) {
+            for (slot & s : slots) {
+                if (s.src != nullptr && s.nbytes == nbytes && same_elements(s.src, src)) {
+                    return &s;
+                }
+            }
+            return nullptr;
+        }
+
+        slot * claim(const ggml_tensor * src, size_t nbytes) {
+            slot & s = slots[next];
+            next     = (next + 1) % 2;
+            s.src    = src;
+            s.nbytes = nbytes;
+            return &s;
+        }
     } q8_1_reuse;
+
+    // where a kernel that writes dst may also write its q8_1 copy for the next mul_mat_vec_q, or nullptr;
+    // every 32-element block must fall into the lanes of one warp, so the rows are whole blocks
+    block_q8_1 * q8_1_prequantize_dst(const ggml_tensor * dst) {
+        auto & reuse = q8_1_reuse;
+        if (!reuse.enabled || curr_stream_no != 0 || dst != reuse.want_dst || !ggml_is_contiguous(dst) ||
+            dst->ne[0] % QK8_1 != 0) {
+            return nullptr;
+        }
+        // registered once the node's own writes have been checked against the slots
+        reuse.prequantized = reuse.claim(nullptr, 0);
+        return (block_q8_1 *) reuse.prequantized->buf;
+    }
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context

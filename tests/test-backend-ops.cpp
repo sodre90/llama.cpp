@@ -3622,12 +3622,17 @@ struct test_sigmoid_mul_add : public test_case {
     }
 };
 
-// two GGML_OP_MUL_MAT reading the same src1, which the CUDA backend quantizes once for both
+// two GGML_OP_MUL_MAT reading the same src1, which the CUDA backend quantizes once for both, or which the kernel
+// producing src1 already quantized
 struct test_mul_mat_shared_src1 : public test_case {
+    enum producer_kind { PRODUCER_NONE, PRODUCER_RMS_NORM_MUL, PRODUCER_SCALE_SILU, PRODUCER_SWIGLU, PRODUCER_SIGMOID_MUL };
+
     const ggml_type type_a;
     const int64_t m;
     const int64_t n;
     const int64_t k;
+    const producer_kind producer;
+    const bool glu;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -3637,15 +3642,36 @@ struct test_mul_mat_shared_src1 : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR4(type_a, m, n, k);
+        return VARS_TO_STR6(type_a, m, n, k, producer, glu);
     }
 
     double max_nmse_err() override {
         return 5e-4;
     }
 
-    test_mul_mat_shared_src1(ggml_type type_a = GGML_TYPE_Q8_0, int64_t m = 64, int64_t n = 1, int64_t k = 256)
-        : type_a(type_a), m(m), n(n), k(k) {}
+    test_mul_mat_shared_src1(ggml_type type_a = GGML_TYPE_Q8_0, int64_t m = 64, int64_t n = 1, int64_t k = 256,
+            producer_kind producer = PRODUCER_NONE, bool glu = false)
+        : type_a(type_a), m(m), n(n), k(k), producer(producer), glu(glu) {}
+
+    ggml_tensor * build_src1(ggml_context * ctx, ggml_tensor * b) {
+        switch (producer) {
+            case PRODUCER_RMS_NORM_MUL: {
+                ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+                ggml_set_name(w, "w");
+                return ggml_mul(ctx, ggml_rms_norm(ctx, b, 1e-6f), w);
+            }
+            case PRODUCER_SCALE_SILU:
+                return ggml_silu(ctx, ggml_scale_bias(ctx, b, 0.25f, 0.5f));
+            case PRODUCER_SWIGLU:
+            case PRODUCER_SIGMOID_MUL: {
+                ggml_tensor * g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+                ggml_set_name(g, "g");
+                return producer == PRODUCER_SWIGLU ? ggml_swiglu_split(ctx, b, g) : ggml_mul(ctx, ggml_sigmoid(ctx, b), g);
+            }
+            default:
+                return b;
+        }
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a0 = ggml_new_tensor_2d(ctx, type_a, k, m);
@@ -3655,13 +3681,15 @@ struct test_mul_mat_shared_src1 : public test_case {
         ggml_set_name(a1, "a1");
         ggml_set_name(b, "b");
 
-        ggml_tensor * m0 = ggml_mul_mat(ctx, a0, b);
-        ggml_tensor * m1 = ggml_mul_mat(ctx, a1, b);
+        ggml_tensor * src1 = build_src1(ctx, b);
+        ggml_tensor * m0 = ggml_mul_mat(ctx, a0, src1);
+        ggml_tensor * m1 = ggml_mul_mat(ctx, a1, src1);
         // a second src1 in between must not be served from the first one's quantization
-        ggml_tensor * b2 = ggml_scale(ctx, b, 0.5f);
+        ggml_tensor * b2 = ggml_scale(ctx, src1, 0.5f);
         ggml_tensor * m2 = ggml_mul_mat(ctx, a1, b2);
 
-        ggml_tensor * out = ggml_add(ctx, ggml_add(ctx, m0, m1), m2);
+        ggml_tensor * m01 = glu ? ggml_swiglu_split(ctx, m0, m1) : ggml_add(ctx, m0, m1);
+        ggml_tensor * out = ggml_add(ctx, m01, m2);
         ggml_set_name(out, "out");
 
         return out;
@@ -7489,16 +7517,22 @@ struct test_moe_reduce : public test_case {
     const bool unaligned_experts;
     const bool with_expert_scale;
     const bool interleaved_views_adds;
+    const bool project; // a quantized mul_mat reads the sum, as the next projection does
 
     test_moe_reduce(
             int64_t n_embd, int64_t n_expert_used, int64_t n_tokens,
-            bool unaligned_experts = false, bool with_expert_scale = false, bool interleaved_views_adds = false) :
+            bool unaligned_experts = false, bool with_expert_scale = false, bool interleaved_views_adds = false,
+            bool project = false) :
         n_embd(n_embd), n_expert_used(n_expert_used), n_tokens(n_tokens),
         unaligned_experts(unaligned_experts), with_expert_scale(with_expert_scale),
-        interleaved_views_adds(interleaved_views_adds) {}
+        interleaved_views_adds(interleaved_views_adds), project(project) {}
 
     std::string vars() override {
-        return VARS_TO_STR6(n_embd, n_expert_used, n_tokens, unaligned_experts, with_expert_scale, interleaved_views_adds);
+        return VARS_TO_STR7(n_embd, n_expert_used, n_tokens, unaligned_experts, with_expert_scale, interleaved_views_adds, project);
+    }
+
+    double max_nmse_err() override {
+        return project ? 5e-4 : test_case::max_nmse_err();
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -7551,6 +7585,12 @@ struct test_moe_reduce : public test_case {
             }
         }
         ggml_set_name(out, "moe_reduce");
+        if (project) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd, 64);
+            ggml_set_name(w, "w");
+            out = ggml_mul_mat(ctx, w, out);
+            ggml_set_name(out, "projected");
+        }
         return out;
     }
 };
@@ -9629,6 +9669,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_shared_src1(type_a, 64, n, 256));
             test_cases.emplace_back(new test_mul_mat_shared_src1(type_a, 320, n, 2560));
         }
+        for (auto producer : { test_mul_mat_shared_src1::PRODUCER_RMS_NORM_MUL, test_mul_mat_shared_src1::PRODUCER_SCALE_SILU,
+                               test_mul_mat_shared_src1::PRODUCER_SWIGLU, test_mul_mat_shared_src1::PRODUCER_SIGMOID_MUL }) {
+            for (bool glu : { false, true }) {
+                for (int64_t n : { 1, 3 }) {
+                    test_cases.emplace_back(new test_mul_mat_shared_src1(type_a, 64, n, 256, producer, glu));
+                    test_cases.emplace_back(new test_mul_mat_shared_src1(type_a, 320, n, 2560, producer, glu));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat_shared_src1(type_a, 64, 1, 256, test_mul_mat_shared_src1::PRODUCER_NONE, true));
     }
 
     // fused scale + unary [+ scale]
@@ -11768,6 +11818,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
+    for (int64_t n_tokens : {1, 3}) {
+        test_cases.emplace_back(new test_moe_reduce(2560, 10, n_tokens, false, false, false, true));
+        test_cases.emplace_back(new test_moe_reduce(256,  10, n_tokens, false, true,  false, true));
+    }
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));

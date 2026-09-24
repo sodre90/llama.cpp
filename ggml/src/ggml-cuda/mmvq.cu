@@ -1577,22 +1577,20 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     const size_t  q8_1_nbytes = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
 
-    // a src1 that is not the node's own operand may be a stack copy whose address repeats with other data
+    // a src1 that is not the node's own operand may be a stack copy whose address repeats with other data;
+    // the fused paths pass the graph operands of the fused nodes
     auto & reuse = ctx.q8_1_reuse;
     const bool reusable = reuse.enabled && ctx.curr_stream_no == 0 && q8_1_nbytes <= reuse.size &&
-        dst->src[1] == src1 && dst->src[0] == src0 && (!ids || dst->src[2] == ids);
+        (fusion != nullptr || (dst->src[1] == src1 && dst->src[0] == src0 && (!ids || dst->src[2] == ids)));
 
     ggml_cuda_pool_alloc<char> src1_q8_1_alloc(ctx.pool());
-    char * src1_q8_1 = reusable ? (char *) reuse.buf : src1_q8_1_alloc.alloc(q8_1_nbytes);
-    if (!reusable || reuse.src != src1 || reuse.nbytes != q8_1_nbytes) {
+    const auto * cached = reusable ? reuse.find(src1, q8_1_nbytes) : nullptr;
+    char * src1_q8_1 = (char *) (cached ? cached->buf : reusable ? reuse.claim(src1, q8_1_nbytes)->buf : src1_q8_1_alloc.alloc(q8_1_nbytes));
+    if (!cached) {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
         quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
-        if (reusable) {
-            reuse.src    = src1;
-            reuse.nbytes = q8_1_nbytes;
-        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
