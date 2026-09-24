@@ -1637,18 +1637,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
     int64_t nb1_qkv = ggml_row_size(conv_qkv_mix->type, conv_channels);
 
-    // Extract the convolved Q, K, V from conv_output
-    ggml_tensor * q_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+    // Extract the convolved Q, K, V from conv_output; Q and K are adjacent and share one l2 norm launch
+    ggml_tensor * qk_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, 2 * num_k_heads, n_seq_tokens, n_seqs,
             ggml_row_size(conv_qkv_mix->type, head_k_dim),
             nb1_qkv,
             nb1_qkv * n_seq_tokens,
             0);
 
-    ggml_tensor * k_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
-            ggml_row_size(conv_qkv_mix->type, head_k_dim),
-            nb1_qkv,
-            nb1_qkv * n_seq_tokens,
-            head_k_dim * num_k_heads * ggml_element_size(conv_qkv_mix));
+    const float eps_norm = hparams.f_norm_rms_eps;
+
+    ggml_tensor * qk_norm = build_gdn_l2_norm(ctx0, qk_conv, eps_norm);
+
+    ggml_tensor * q_conv = ggml_view_4d(ctx0, qk_norm, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+            qk_norm->nb[1], qk_norm->nb[2], qk_norm->nb[3], 0);
+
+    ggml_tensor * k_conv = ggml_view_4d(ctx0, qk_norm, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+            qk_norm->nb[1], qk_norm->nb[2], qk_norm->nb[3], num_k_heads * qk_norm->nb[1]);
 
     ggml_tensor * v_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
             ggml_row_size(conv_qkv_mix->type, head_v_dim),
@@ -1659,12 +1663,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     cb(q_conv, "q_conv", il);
     cb(k_conv, "k_conv", il);
     cb(v_conv, "v_conv", il);
-
-
-    const float eps_norm = hparams.f_norm_rms_eps;
-
-    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
 
     // repeat to match shapes when head keys != value keys; unneeded with the fused GDN
     if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
