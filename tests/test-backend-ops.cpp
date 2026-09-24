@@ -3578,6 +3578,50 @@ struct test_scale_unary : public test_case {
     }
 };
 
+// GGML_OP_UNARY(SIGMOID) of one gate per row + GGML_OP_MUL into the rows + GGML_OP_ADD
+struct test_sigmoid_mul_add : public test_case {
+    const std::array<int64_t, 4> ne;
+    const bool swap_add;
+    const bool reuse;
+    const bool inplace;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SIGMOID_MUL_ADD";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(ne, swap_add, reuse, inplace);
+    }
+
+    test_sigmoid_mul_add(std::array<int64_t, 4> ne = {10, 5, 4, 3}, bool swap_add = false, bool reuse = false, bool inplace = false)
+        : ne(ne), swap_add(swap_add), reuse(reuse), inplace(inplace) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, ne[1], ne[2], ne[3]);
+        ggml_set_name(gate, "gate");
+        ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(x, "x");
+        ggml_tensor * addend = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(addend, "addend");
+
+        ggml_tensor * gated = ggml_mul(ctx, x, ggml_sigmoid(ctx, gate));
+        ggml_set_name(gated, "gated");
+
+        ggml_tensor * out = inplace  ? ggml_add_inplace(ctx, addend, gated) :
+                            swap_add ? ggml_add(ctx, gated, addend) : ggml_add(ctx, addend, gated);
+        if (reuse) {
+            // a second read of the gated rows must block the fusion
+            out = ggml_add(ctx, out, gated);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // two GGML_OP_MUL_MAT reading the same src1, which the CUDA backend quantizes once for both
 struct test_mul_mat_shared_src1 : public test_case {
     const ggml_type type_a;
@@ -9756,6 +9800,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post_gated(2560, 1));
     test_cases.emplace_back(new test_dsv4_hc_post_gated(4096, 21));
     test_cases.emplace_back(new test_dsv4_hc_post_gated(2560, 1, true));
+    test_cases.emplace_back(new test_sigmoid_mul_add({2560, 1, 1, 1}));
+    test_cases.emplace_back(new test_sigmoid_mul_add({2560, 3, 1, 1}, true));
+    test_cases.emplace_back(new test_sigmoid_mul_add({10, 5, 4, 3}));
+    test_cases.emplace_back(new test_sigmoid_mul_add({2560, 3, 1, 1}, false, true));
+    test_cases.emplace_back(new test_sigmoid_mul_add({2560, 1, 1, 1}, false, false, true));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {

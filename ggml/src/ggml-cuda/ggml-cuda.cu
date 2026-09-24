@@ -3740,6 +3740,46 @@ static bool ggml_cuda_should_fuse_dsv4_hc_post_gate(const ggml_cgraph * cgraph, 
     return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int) ops.size(), out_nodes, 1);
 }
 
+// SIGMOID of one gate value per row -> MUL into the rows -> ADD of a same-shape tensor
+static bool ggml_cuda_should_fuse_sigmoid_mul_add(const ggml_cgraph * cgraph, int node_idx) {
+    const std::initializer_list<enum ggml_op> ops = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
+        return false;
+    }
+
+    const ggml_tensor * sigmoid = cgraph->nodes[node_idx];
+    const ggml_tensor * mul     = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * add     = cgraph->nodes[node_idx + 2];
+    if (ggml_get_unary_op(sigmoid) != GGML_UNARY_OP_SIGMOID ||
+        (mul->src[0] != sigmoid && mul->src[1] != sigmoid) || (add->src[0] != mul && add->src[1] != mul)) {
+        return false;
+    }
+
+    const ggml_tensor * gate   = sigmoid->src[0];
+    const ggml_tensor * x      = mul->src[0] == sigmoid ? mul->src[1] : mul->src[0];
+    const ggml_tensor * addend = add->src[0] == mul     ? add->src[1] : add->src[0];
+    for (const ggml_tensor * t : { gate, x, addend, (const ggml_tensor *) add }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            return false;
+        }
+    }
+    if (gate->ne[0] != 1 || gate->ne[1] != x->ne[1] || gate->ne[2] != x->ne[2] || gate->ne[3] != x->ne[3] ||
+        !ggml_are_same_shape(x, addend) || !ggml_are_same_shape(x, add)) {
+        return false;
+    }
+
+    // each element is read before it is written, so the ADD may run in place over x or the addend,
+    // but not over the gates that every element of a row reads
+    const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a_begin = (const char *) a->data;
+        const char * b_begin = (const char *) b->data;
+        return a_begin < b_begin + ggml_nbytes(b) && b_begin < a_begin + ggml_nbytes(a);
+    };
+    return !overlaps(add, gate) &&
+        (!overlaps(add, x)      || add->data == x->data) &&
+        (!overlaps(add, addend) || add->data == addend->data);
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4514,6 +4554,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
         ggml_cuda_op_ssm_conv(*cuda_ctx, node, /*bias_add_node=*/ nullptr, cgraph->nodes[i + 1]);
         return 1;
+    }
+
+    if (ggml_cuda_should_fuse_sigmoid_mul_add(cgraph, i)) {
+        ggml_cuda_op_sigmoid_mul_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||

@@ -791,3 +791,33 @@ void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * sca
             GGML_ABORT("Unsupported unary op for fused scale+unary");
     }
 }
+
+// the product and the sum round separately, as the MUL and ADD kernels do
+static __global__ void sigmoid_mul_add_kernel(const float * gate, const float * x, const float * addend, float * dst,
+                                              const int ne0, const int k) {
+    ggml_cuda_pdl_lc();
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    dst[i] = __fadd_rn(addend[i], __fmul_rn(x[i], op_sigmoid(gate[i / ne0])));
+}
+
+void ggml_cuda_op_sigmoid_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * sigmoid_node, ggml_tensor * mul_node, ggml_tensor * add_node) {
+    const ggml_tensor * gate   = sigmoid_node->src[0];
+    const ggml_tensor * x      = mul_node->src[0] == sigmoid_node ? mul_node->src[1] : mul_node->src[0];
+    const ggml_tensor * addend = add_node->src[0] == mul_node     ? add_node->src[1] : add_node->src[0];
+
+    GGML_ASSERT(ggml_is_contiguous(gate) && ggml_is_contiguous(x) && ggml_is_contiguous(addend) && ggml_is_contiguous(add_node));
+    GGML_ASSERT(gate->ne[0] == 1 && ggml_nrows(gate) == ggml_nrows(x));
+
+    const int k = ggml_nelements(add_node);
+    const int num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(sigmoid_mul_add_kernel, launch_params,
+            (const float *) gate->data, (const float *) x->data, (const float *) addend->data, (float *) add_node->data,
+            (int) x->ne[0], k);
+}
