@@ -1529,6 +1529,9 @@ struct ggml_backend_cuda_context {
         }
     } q8_1_reuse;
 
+    // a GET_ROWS of recurrent states left unexecuted, whose rows the next GATED_DELTA_NET reads in place
+    const ggml_tensor * gdn_state_gather = nullptr;
+
     // where a kernel that writes dst may also write its q8_1 copy for the next mul_mat_vec_q, or nullptr;
     // every 32-element block must fall into the lanes of one warp, so the rows are whole blocks
     block_q8_1 * q8_1_prequantize_dst(const ggml_tensor * dst) {
