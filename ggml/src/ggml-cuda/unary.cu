@@ -733,3 +733,59 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
         unary_cuda<op_relu_sqr>((const float *)src->data, (float *)sqr_node->data, k, stream);
     }
 }
+
+/* fused scale + unary [+ scale] */
+
+// each step rounds exactly as its own kernel would, so the fusion is bitwise identical to the unfused ops
+template <float (*op)(float), bool post_scale>
+static __global__ void scale_unary_kernel(const float * x, float * dst, const float scale, const float bias,
+                                          const float scale2, const float bias2, const int k) {
+    ggml_cuda_pdl_lc();
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    const float y = op(scale * x[i] + bias);
+    dst[i] = post_scale ? scale2 * y + bias2 : y;
+}
+
+template <float (*op)(float)>
+static void scale_unary_cuda(const float * x, float * dst, const float scale, const float bias,
+                             const float * scale2, const int k, cudaStream_t stream) {
+    const int num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream);
+    if (scale2) {
+        ggml_cuda_kernel_launch(scale_unary_kernel<op, true>, launch_params, x, dst, scale, bias, scale2[0], scale2[1], k);
+    } else {
+        ggml_cuda_kernel_launch(scale_unary_kernel<op, false>, launch_params, x, dst, scale, bias, 1.0f, 0.0f, k);
+    }
+}
+
+void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * unary_node, ggml_tensor * scale2_node) {
+    const ggml_tensor * src = scale_node->src[0];
+    ggml_tensor * dst = scale2_node ? scale2_node : unary_node;
+
+    GGML_ASSERT(ggml_is_contiguous(src));
+    GGML_ASSERT(src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    const float * scale  = (const float *) scale_node->op_params;
+    const float * scale2 = scale2_node ? (const float *) scale2_node->op_params : nullptr;
+    const float * src_d  = (const float *) src->data;
+    float       * dst_d  = (float       *) dst->data;
+    const int     k      = ggml_nelements(src);
+    cudaStream_t  stream = ctx.stream();
+
+    switch (ggml_get_unary_op(unary_node)) {
+        case GGML_UNARY_OP_SILU:
+            scale_unary_cuda<op_silu>(src_d, dst_d, scale[0], scale[1], scale2, k, stream);
+            break;
+        case GGML_UNARY_OP_SIGMOID:
+            scale_unary_cuda<op_sigmoid>(src_d, dst_d, scale[0], scale[1], scale2, k, stream);
+            break;
+        default:
+            GGML_ABORT("Unsupported unary op for fused scale+unary");
+    }
+}
