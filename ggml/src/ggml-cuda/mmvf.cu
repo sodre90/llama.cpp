@@ -136,6 +136,7 @@ static __global__ void mul_mat_vec_f(
             }
         }
 
+#pragma unroll 4
         for (int col2 = tid; col2 < ncols2; col2 += block_size) {
             const float2 tmpx = x2[col2];
             float2 tmpx_gate = make_float2(0.0f, 0.0f);
@@ -244,6 +245,7 @@ static __global__ void mul_mat_vec_f(
                 gate_x2 = (const int *) gate_x;
             }
         }
+#pragma unroll 4
         for (int col2 = tid; col2 < ncols2; col2 += block_size) {
             const int tmpx = x2[col2];
             int tmpx_gate = 0;
