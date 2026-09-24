@@ -12054,6 +12054,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // qwen4exp's decode router: 512 experts, 10 used; the n_expert_used sweep separates the fixed cost from the
+    // per-selected-expert cost
+    for (int n_expert_used : {1, 5, 10, 20}) {
+        test_cases.emplace_back(new test_topk_moe({512, 1, 1, 1}, n_expert_used, true, false, GATING_FUNC_SOFTMAX, 0.0f, true));
+    }
+    test_cases.emplace_back(new test_topk_moe({512, 3, 1, 1}, 10, true, false, GATING_FUNC_SOFTMAX, 0.0f, true));
+
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
