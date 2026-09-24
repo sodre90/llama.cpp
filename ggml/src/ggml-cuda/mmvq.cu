@@ -603,6 +603,21 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
+// the weight channel an expert id reads: its cache slot, or the id itself in the host tensor (see ggml_cuda_mmid_host_experts)
+static __device__ __forceinline__ uint32_t mmvq_expert_channel(
+        const ggml_cuda_mm_fusion_args_device & fusion, const uint32_t expert, const void *& x, const void *& gate) {
+    if (fusion.expert_slot == nullptr) {
+        return expert;
+    }
+    const int32_t slot = fusion.expert_slot[expert];
+    if (slot < fusion.n_expert_slots) {
+        return slot;
+    }
+    x    = fusion.x_host;
+    gate = fusion.gate_host;
+    return expert;
+}
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
@@ -612,7 +627,6 @@ static __global__ void mul_mat_vec_q(
         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
         const uint32_t ids_stride) {
-    const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
     float         * GGML_CUDA_RESTRICT dst = dst_ptr;
@@ -635,7 +649,7 @@ static __global__ void mul_mat_vec_q(
     const bool shared_expert = has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
     const uint32_t channel_dst = shared_expert ? 0 : blockIdx.y;
     if (shared_expert) {
-        vx = fusion.shared_up;
+        vx_ptr = fusion.shared_up;
         dst = fusion.shared_dst;
         stride_col_dst = fusion.shared_stride_col_dst;
     }
@@ -722,8 +736,12 @@ static __global__ void mul_mat_vec_q(
     float tmp[ncols_dst][rows_per_cuda_block] = {{0.0f}};
     float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
 
+    const void * x_weights = vx_ptr;
+    const uint32_t channel_w = ncols_dst == 1 && ids ? mmvq_expert_channel(fusion, channel_x, x_weights, vgate) : channel_x;
+    const void * GGML_CUDA_RESTRICT vx = x_weights;
+
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
-    const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
+    const int kbx_offset = sample_x*stride_sample_x + channel_w*stride_channel_x + row0*stride_row_x;
 
     // small-K rows take only a few K steps per thread, unrolling them is slower
     constexpr int kbx_unroll = small_k ? 1 : 2;
@@ -873,7 +891,6 @@ static __global__ void mul_mat_vec_q_moe(
         const uint32_t stride_row_x, const uint32_t stride_col_y, uint32_t stride_col_dst,
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const uint32_t ncols_dst, const uint32_t ids_stride) {
-    const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
     float         * GGML_CUDA_RESTRICT dst = dst_ptr;
@@ -887,7 +904,7 @@ static __global__ void mul_mat_vec_q_moe(
 
     const bool shared_expert = has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
     if (shared_expert) {
-        vx = fusion.shared_up;
+        vx_ptr = fusion.shared_up;
         dst = fusion.shared_dst;
         stride_col_dst = fusion.shared_stride_col_dst;
     }
@@ -930,8 +947,12 @@ static __global__ void mul_mat_vec_q_moe(
     const uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
+    const void * x_weights = vx_ptr;
+    const uint32_t channel_w = mmvq_expert_channel(fusion, channel_x, x_weights, vgate);
+    const void * GGML_CUDA_RESTRICT vx = x_weights;
+
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
-    const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
+    const int kbx_offset  = channel_w*stride_channel_x + row0*stride_row_x;
 
     // partial sum for each thread
     float tmp[c_rows_per_block] = {0.0f};
@@ -1524,6 +1545,22 @@ void ggml_cuda_mul_mat_vec_q(
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.glu_limit = fusion->glu_limit;
+    }
+
+    const ggml_tensor * x_node    = fusion ? fusion->x_node    : dst;
+    const ggml_tensor * gate_node = fusion ? fusion->gate_node : nullptr;
+    GGML_ASSERT(!ids || (x_node && x_node->src[0] == src0));
+    if (const void * x_host = ids ? ggml_cuda_mmid_host_experts(x_node) : nullptr) {
+        fusion_local.x_host         = x_host;
+        fusion_local.expert_slot    = (const int32_t *) x_node->src[3]->data;
+        fusion_local.n_expert_slots = ggml_get_op_params_i32(x_node, 0);
+        if (fusion_local.gate) {
+            GGML_ASSERT(gate_node && gate_node->src[3] == x_node->src[3] && ggml_get_op_params_i32(gate_node, 0) == fusion_local.n_expert_slots);
+            fusion_local.gate_host = ggml_cuda_mmid_host_experts(gate_node);
+            GGML_ASSERT(fusion_local.gate_host);
+        }
+    } else {
+        GGML_ASSERT(!ids || !ggml_cuda_mmid_host_experts(gate_node));
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.

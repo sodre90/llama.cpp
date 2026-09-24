@@ -2305,7 +2305,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     //synchronize();
 
     // apply throttled MoE expert-cache updates between graph executions
-    llama_moe_cache_step();
+    llama_moe_cache_step(sched.get());
 
     return 0;
 }

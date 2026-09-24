@@ -1974,6 +1974,10 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
     if (!ggml_can_fuse_subgraph_ext(graph, nodes, 6, ops, outputs, 2)) {
         return false;
     }
+    // src[3] marks a MoE cache MUL_MAT_ID, the shared expert kernel path does not read its slots
+    if (graph->nodes[routed_idx]->src[3] != nullptr || graph->nodes[routed_idx + 1]->src[3] != nullptr) {
+        return false;
+    }
 
     const ggml_tensor * routed = graph->nodes[routed_idx + 2];
     const ggml_tensor * shared = graph->nodes[shared_idx + 2];
@@ -2109,6 +2113,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    GGML_ASSERT((!ggml_cuda_mmid_host_experts(dst) || (ggml_is_quantized(src0->type) && ne2 <= get_mmvq_mmid_max_batch(src0->type, cc))) &&
+        "host-resident experts are only read by mul_mat_vec_q");
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -3703,6 +3710,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * up = routed->src[1];
             ggml_cuda_mm_fusion_args_host fusion{};
             fusion.gate = routed->src[0]->src[0];
+            fusion.x_node = up;
+            fusion.gate_node = routed->src[0];
             fusion.glu_op = ggml_get_glu_op(routed);
             fusion.glu_limit = ggml_get_op_params_f32(routed, 3);
             fusion.shared_up = shared->src[1]->src[0];
@@ -4033,6 +4042,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate       = gate_n->src[0];
+                fusion_data.x_node     = up_n;
+                fusion_data.gate_node  = gate_n;
                 fusion_data.x_bias     = up_bias;
                 fusion_data.gate_bias  = gate_bias;
                 fusion_data.x_scale    = up_scale;
@@ -4127,6 +4138,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate       = gate_n->src[0];
+                fusion_data.x_node     = up_n;
+                fusion_data.gate_node  = gate_n;
                 fusion_data.x_bias     = up_bias;
                 fusion_data.gate_bias  = gate_bias;
                 fusion_data.x_scale    = up_scale;
@@ -4186,6 +4199,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (ggml_cuda_should_fuse_mul_mat_vec_f(up_n)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate_n->src[0];
+                fusion_data.x_node    = up_n;
+                fusion_data.gate_node = gate_n;
                 fusion_data.x_bias    = up_bias_tensor;
                 fusion_data.gate_bias = gate_bias_tensor;
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
@@ -4200,6 +4215,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate_n->src[0];
+                fusion_data.x_node    = up_n;
+                fusion_data.gate_node = gate_n;
                 fusion_data.x_bias    = up_bias_tensor;
                 fusion_data.gate_bias = gate_bias_tensor;
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
@@ -4229,6 +4246,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
+                fusion_data.x_node    = up;
+                fusion_data.gate_node = gate;
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 
@@ -4241,6 +4260,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
+                fusion_data.x_node    = up;
+                fusion_data.gate_node = gate;
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 
@@ -4330,6 +4351,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_cuda_mm_fusion_args_host fusion_data{};
             fusion_data.x_bias  = bias;
             fusion_data.x_scale = scale;
+            fusion_data.x_node  = mm_node;
 
             if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);
@@ -4388,6 +4410,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
         ggml_cuda_mm_fusion_args_host fusion_data{};
         fusion_data.x_bias = bias_tensor;
+        fusion_data.x_node = mm_node;
 
         if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
             ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
@@ -6097,6 +6120,9 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     #ifdef GGML_CUDA_FA_QUANTS
         features.push_back({ "FA_QUANTS", GGML_CUDA_FA_QUANTS });
     #endif
+
+        // see ggml_cuda_mmid_host_experts
+        features.push_back({ "MMID_HOST_EXPERTS", "1" });
 
     {
         const auto & info = ggml_cuda_info();
