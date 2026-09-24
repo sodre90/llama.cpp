@@ -100,6 +100,8 @@ static __global__ void soft_max_f32(
 
     // find the max value in the block
     max_val = block_reduce<block_reduce_method::MAX, block_size_template>(max_val, buf_iw);
+    // the sum below reuses buf_iw: a fast warp must not overwrite the maxima a slower one is still reading
+    __syncthreads();
 
     float tmp = 0.0f; // partial sum
 
