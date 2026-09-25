@@ -1826,6 +1826,77 @@ bool llama_kv_cache::has_cell_ext() const {
     return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0;
 }
 
+bool llama_kv_cache::reserve_external(llama_seq_id seq_id, llama_pos block_start) {
+    if (block_start < 0 || (uint32_t) block_start > get_size()) {
+        LLAMA_LOG_ERROR("%s: block_start = %d out of range (size = %u)\n", __func__, block_start, get_size());
+        return false;
+    }
+
+    // a sliding-window cache recycles cells, so the token at position p is not reliably at cell p
+    // and a claim of [0, block_start) would not hold for the next decode
+    if (n_swa > 0 || swa_type != LLAMA_SWA_TYPE_NONE) {
+        LLAMA_LOG_ERROR("%s: a sliding-window cache cannot reserve external cells\n", __func__);
+        return false;
+    }
+
+    auto & cells = v_cells[seq_to_stream[seq_id]];
+
+    for (llama_pos i = 0; i < block_start; i++) {
+        if (cells.is_empty(i)) {
+            // pos_set asserts the cell is empty and marks it used; seq_add asserts seq_id is new
+            cells.pos_set(i, i);
+            cells.seq_add(i, seq_id);
+            continue;
+        }
+
+        // idempotent re-claim: the region may already carry this sequence's own metadata
+        if (cells.pos_get(i) == i && cells.seq_has(i, seq_id)) {
+            continue;
+        }
+
+        LLAMA_LOG_ERROR("%s: cell %d is owned by another sequence\n", __func__, i);
+        return false;
+    }
+
+    v_heads[seq_to_stream[seq_id]] = (uint32_t) block_start;
+
+    return true;
+}
+
+bool llama_kv_cache::ext_tok_set(llama_seq_id seq_id, llama_pos p0, const llama_token * toks, int32_t n_tokens) {
+    if (!has_cell_ext()) {
+        // nothing reads ext.tok on this cache, so a stamp would be dead data
+        return false;
+    }
+
+    if (!toks || n_tokens <= 0 || p0 < 0 || (uint32_t) p0 + (uint32_t) n_tokens > get_size()) {
+        LLAMA_LOG_ERROR("%s: range [%d, %d) outside the cache (size = %u)\n", __func__, p0, p0 + n_tokens, get_size());
+        return false;
+    }
+
+    if (n_swa > 0 || swa_type != LLAMA_SWA_TYPE_NONE) {
+        LLAMA_LOG_ERROR("%s: a sliding-window cache cannot carry external tokens\n", __func__);
+        return false;
+    }
+
+    auto & cells = v_cells[seq_to_stream[seq_id]];
+
+    for (int32_t j = 0; j < n_tokens; j++) {
+        const uint32_t i = (uint32_t) p0 + (uint32_t) j;
+
+        if (cells.is_empty(i) || cells.pos_get(i) != (llama_pos) i || !cells.seq_has(i, seq_id)) {
+            LLAMA_LOG_ERROR("%s: cell %d is not claimed by sequence %d -- reserve_external first\n", __func__, i, seq_id);
+            return false;
+        }
+
+        llama_kv_cell_ext ext = cells.ext_get(i);
+        ext.tok = toks[j];
+        cells.ext_set(i, ext);
+    }
+
+    return true;
+}
+
 void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
     const uint32_t n_tokens = ubatch.n_tokens;
 

@@ -751,6 +751,42 @@ extern "C" {
                  llama_pos p0,
                  llama_pos p1);
 
+    // Claim cells [0, block_start) of the sequence's attention cache as valid metadata whose data
+    // lives outside this context: positions and sequence membership are stamped (so masks, the QSA
+    // block map and n_kv all derive from cell state before the next decode), but no bytes are
+    // written. A rank starting mid-sequence reserves the history it is about to receive, then the
+    // cells are filled by whatever hands the data over. The cache's free slot search continues
+    // after the claimed region.
+    // Returns false when the memory type cannot express this: no token cache (pure recurrent),
+    // a sliding-window cache (cells recycle, so position != cell and the claim would not hold),
+    // block_start beyond the cache size, or a claimed cell already owned by another sequence.
+    // Stamping over cells this sequence already owns is idempotent, so a claim can be repeated.
+    LLAMA_API bool llama_memory_reserve_external(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos block_start);
+
+    // Whether the memory holds recurrent state that no cache cells can represent, and therefore
+    // must be handed over by a predecessor when a decode starts mid-sequence. Answers false for
+    // pure token caches; answering true when no relay actually arrives is the caller's problem to
+    // detect (the state reads would be zeros), so this errs on the side of "asked and answered".
+    LLAMA_API bool llama_memory_recurrent_relay_required(llama_memory_t mem);
+
+    // Hand a rank starting mid-sequence the token ids of the history it is about to receive: the
+    // qwen4exp PLE n-gram hash reads the predecessor tokens out of the attention cache cells, and
+    // a claimed-but-not-yet-filled cell has none. tokens[j] is stamped into the cell at position
+    // next_pos - n_tokens + j; every cell in the range must already be claimed by this sequence
+    // (llama_memory_reserve_external), and only caches that keep per-cell tokens (PLE, M-RoPE)
+    // accept the call.
+    // Returns false when the memory type keeps no per-cell tokens or a cell in the range is not
+    // claimed by this sequence.
+    LLAMA_API bool llama_ple_history_set(
+            struct llama_context * ctx,
+              llama_seq_id seq_id,
+            const llama_token * tokens,
+                 int32_t n_tokens,
+                 llama_pos next_pos);
+
     // Copy all tokens that belong to the specified sequence to another sequence
     // p0 < 0 : [0,  p1]
     // p1 < 0 : [p0, inf)

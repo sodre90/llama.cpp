@@ -6,6 +6,11 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-hybrid-idx.h"
+#include "llama-memory-recurrent.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -3918,6 +3923,79 @@ bool llama_memory_seq_rm(
     }
 
     return mem->seq_rm(seq_id, p0, p1);
+}
+
+bool llama_memory_reserve_external(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos block_start) {
+    if (!mem) {
+        return false;
+    }
+
+    // the claim belongs to the attention half: the indexer cache addresses the same cells by
+    // construction, and the block cache is never slot-allocated
+    if (auto * h = dynamic_cast<llama_memory_hybrid_idx *>(mem)) {
+        return h->get_mem_attn()->reserve_external(seq_id, block_start);
+    }
+
+    if (auto * h = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return h->get_mem_attn()->reserve_external(seq_id, block_start);
+    }
+
+    if (auto * k = dynamic_cast<llama_kv_cache *>(mem)) {
+        return k->reserve_external(seq_id, block_start);
+    }
+
+    return false;
+}
+
+bool llama_memory_recurrent_relay_required(llama_memory_t mem) {
+    if (!mem) {
+        return false;
+    }
+
+    if (dynamic_cast<llama_memory_recurrent *>(mem) != nullptr) {
+        return true;
+    }
+
+    if (auto * h = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return h->get_mem_recr() != nullptr;
+    }
+
+    if (dynamic_cast<llama_memory_hybrid_iswa *>(mem) != nullptr) {
+        return true;
+    }
+
+    return false;
+}
+
+bool llama_ple_history_set(
+        struct llama_context * ctx,
+          llama_seq_id seq_id,
+        const llama_token * tokens,
+             int32_t n_tokens,
+             llama_pos next_pos) {
+    if (!ctx || !llama_get_memory(ctx)) {
+        return false;
+    }
+
+    // the PLE hash reads its predecessors from the attention cache's cells
+    llama_memory_t mem = llama_get_memory(ctx);
+
+    if (auto * h = dynamic_cast<llama_memory_hybrid_idx *>(mem)) {
+        return h->get_mem_attn()->ext_tok_set(seq_id, next_pos - n_tokens, tokens, n_tokens);
+    }
+
+    if (auto * h = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return h->get_mem_attn()->ext_tok_set(seq_id, next_pos - n_tokens, tokens, n_tokens);
+    }
+
+    if (auto * k = dynamic_cast<llama_kv_cache *>(mem)) {
+        return k->ext_tok_set(seq_id, next_pos - n_tokens, tokens, n_tokens);
+    }
+
+    return false;
 }
 
 void llama_memory_seq_cp(

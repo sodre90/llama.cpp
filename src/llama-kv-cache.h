@@ -158,6 +158,13 @@ public:
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
 
+    // claim [0, block_start) as valid-but-unfilled cells of seq_id, so a rank starting
+    // mid-sequence can receive the history into a cache whose masks already count it
+    bool reserve_external(llama_seq_id seq_id, llama_pos block_start);
+
+    // stamp per-cell token ids into cells claimed by reserve_external (llama_ple_history_set)
+    bool ext_tok_set(llama_seq_id seq_id, llama_pos p0, const llama_token * toks, int32_t n_tokens);
+
     bool get_has_shift() const;
 
     ggml_type type_k() const;
