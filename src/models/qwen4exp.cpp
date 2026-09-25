@@ -1464,6 +1464,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa_gathered(
     ggml_tensor * k_sel = qsa_gather_cells(ctx0, k_cache, cell_idx, width);
     ggml_tensor * v_sel = qsa_gather_cells(ctx0, v_cache, cell_idx, width);
 
+    // flash attention needs f16; build_attn_mha would cast after its permute, through a strided copy
+    if (cparams.flash_attn) {
+        k_sel = ggml_cast(ctx0, k_sel, GGML_TYPE_F16);
+        v_sel = ggml_cast(ctx0, v_sel, GGML_TYPE_F16);
+    }
+
     // top_k still names masked cells when the cache holds fewer live cells than its budget, so the
     // mask travels through the same gather. [n_kv, n_tps, 1, n_stream] -> [1, n_kv, n_tps, n_stream]
     // puts the cells on the axis get_rows indexes and leaves a row per token to index it with.
