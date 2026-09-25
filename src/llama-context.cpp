@@ -3925,6 +3925,29 @@ bool llama_memory_seq_rm(
     return mem->seq_rm(seq_id, p0, p1);
 }
 
+bool llama_memory_seq_rm_attn_only(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos p0,
+             llama_pos p1) {
+    if (!mem) {
+        return true;
+    }
+
+    if (auto * h = dynamic_cast<llama_memory_hybrid_idx *>(mem)) {
+        if (auto * idx = h->get_mem_idx()) {
+            idx->seq_rm(seq_id, p0, p1);
+        }
+        return h->get_mem_attn()->seq_rm(seq_id, p0, p1);
+    }
+
+    if (auto * h = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return h->get_mem_attn()->seq_rm(seq_id, p0, p1);
+    }
+
+    return mem->seq_rm(seq_id, p0, p1);
+}
+
 bool llama_memory_reserve_external(
         llama_memory_t mem,
           llama_seq_id seq_id,

@@ -751,6 +751,17 @@ extern "C" {
                  llama_pos p0,
                  llama_pos p1);
 
+    // Truncates [p0, p1) from every token-addressed half of the memory (attention, and the indexer
+    // cache when there is one) and leaves the recurrent half untouched. llama_memory_seq_rm on a
+    // hybrid memory refuses a partial removal, because a scan cannot be un-folded to an earlier
+    // position; a caller that restores the recurrent half itself from a snapshot still needs the
+    // token-addressed cells gone. On a non-hybrid memory this is exactly llama_memory_seq_rm.
+    LLAMA_API bool llama_memory_seq_rm_attn_only(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1);
+
     // Claim cells [0, block_start) of the sequence's attention cache as valid metadata whose data
     // lives outside this context: positions and sequence membership are stamped (so masks, the QSA
     // block map and n_kv all derive from cell state before the next decode), but no bytes are
