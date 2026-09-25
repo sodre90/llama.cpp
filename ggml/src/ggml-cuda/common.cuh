@@ -1678,6 +1678,8 @@ static const void * ggml_cuda_mmid_host_experts(const ggml_tensor * mm_id) {
 }
 
 #define MMVQ_MAX_ROW_SEGMENTS 4
+// tokens a row segment launch takes: on RDNA4 each column then gets the same bits as a single-token launch
+#define MMVQ_MAX_ROW_SEGMENT_COLS 4
 
 // what a row segment applies to its matvec result before storing it, as the graph's own elementwise nodes would
 enum mmvq_row_epilogue : int32_t {
@@ -1708,7 +1710,7 @@ struct ggml_cuda_mm_fusion_args_host {
     // the fused MUL_MAT(_ID) nodes, whose src[0] and gate are the weights above
     const ggml_tensor * x_node = nullptr;
     const ggml_tensor * gate_node = nullptr;
-    // single-token MUL_MATs sharing src1 and the weight layout, computed in one launch (segment 0 is the launch's own)
+    // MUL_MATs of a few tokens sharing src1 and the weight layout, computed in one launch (segment 0 is the launch's own)
     ggml_cuda_mmvq_row_segment row_segments[MMVQ_MAX_ROW_SEGMENTS] = {};
     int                        n_row_segments                      = 0;
 };

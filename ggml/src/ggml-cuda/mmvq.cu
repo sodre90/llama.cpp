@@ -662,7 +662,7 @@ static __global__ void mul_mat_vec_q(
     [[maybe_unused]] const float * epilogue_bias  = nullptr;
     [[maybe_unused]] const float * epilogue_scale = nullptr;
     if constexpr (row_segments) {
-        static_assert(ncols_dst == 1 && !has_fusion, "row segments are single-token plain matvecs");
+        static_assert(ncols_dst <= MMVQ_MAX_ROW_SEGMENT_COLS && !has_fusion, "row segments are plain matvecs of a few tokens");
 #pragma unroll
         for (int s = 0; s < MMVQ_MAX_ROW_SEGMENTS; ++s) {
             if (blockIdx.x >= segments.first_block[s]) {
@@ -917,8 +917,10 @@ static __global__ void mul_mat_vec_q(
                 }
                 if constexpr (row_segments) {
                     result = mmvq_apply_row_epilogue(result, epilogue, epilogue_bias, epilogue_scale, row0 + i);
+                    dst[j*nrows_dst + i] = result;
+                } else {
+                    dst[j*stride_col_dst + i] = result;
                 }
-                dst[j*stride_col_dst + i] = result;
             }
         }
     }
@@ -1138,7 +1140,7 @@ static void mul_mat_vec_q_switch_fusion(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
-    if constexpr (c_ncols_dst == 1 && mmvq_row_segments_supported(type)) {
+    if constexpr (c_ncols_dst <= MMVQ_MAX_ROW_SEGMENT_COLS && mmvq_row_segments_supported(type)) {
         if (segments) {
             GGML_ASSERT(!has_fusion && !ids);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
@@ -1216,7 +1218,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
     GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
-    GGML_ASSERT(!segments || ncols_dst == 1);
+    GGML_ASSERT(!segments || ncols_dst <= MMVQ_MAX_ROW_SEGMENT_COLS);
 
     const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
     const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
@@ -1311,11 +1313,18 @@ static void mul_mat_vec_q_switch_ncols_dst(
         constexpr int c_ncols_dst = decltype(ncols_dst_tag)::value;
         const auto launch = [&](auto small_k_tag) {
             constexpr bool c_small_k = decltype(small_k_tag)::value;
-            const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, c_small_k);
+            mmvq_row_segments_args segments_launch;
+            if (segments) {
+                segments_launch = *segments;
+            }
+            const int nrows_launch = segments ?
+                mmvq_place_row_segments(segments_launch, calc_rows_per_block(c_ncols_dst, table_id, c_small_k,
+                    calc_nwarps(type, c_ncols_dst, table_id, c_small_k, false))) : nrows_x;
+            const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_launch, nchannels_dst, nsamples_dst, warp_size, table_id, c_small_k);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 dims.first, dims.second, 0, ids_stride, stream);
+                 dims.first, dims.second, 0, ids_stride, stream, segments ? &segments_launch : nullptr);
         };
         if (multi_col_small_k) {
             launch(std::true_type{});
@@ -1574,7 +1583,7 @@ void ggml_cuda_mul_mat_vec_q(
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        GGML_ASSERT(  ids || dst->ne[1] == 1 || (fusion->n_row_segments > 0 && dst->ne[1] <= MMVQ_MAX_ROW_SEGMENT_COLS));
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);
@@ -1635,8 +1644,8 @@ void ggml_cuda_mul_mat_vec_q(
                 const ggml_cuda_mmvq_row_segment & segment = fusion->row_segments[s];
                 const ggml_tensor * mm = segment.mm;
                 GGML_ASSERT(mm->src[1] == src1 && mm->src[0]->type == src0->type && mm->src[0]->ne[0] == ne00 &&
-                            mm->src[0]->nb[1] == nb01 && ggml_nrows(mm) == 1 && ggml_is_contiguous(mm));
-                GGML_ASSERT(ggml_nelements(segment.out) == mm->ne[0] && ggml_is_contiguous(segment.out));
+                            mm->src[0]->nb[1] == nb01 && ggml_nrows(mm) == ggml_nrows(dst) && ggml_is_contiguous(mm));
+                GGML_ASSERT(ggml_nelements(segment.out) == ggml_nelements(mm) && ggml_is_contiguous(segment.out));
                 segments.x[s]        = mm->src[0]->data;
                 segments.dst[s]      = (float *) segment.out->data;
                 segments.nrows[s]    = mm->ne[0];

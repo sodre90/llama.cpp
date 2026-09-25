@@ -4027,14 +4027,17 @@ static bool ggml_cuda_defer_conv_state_node(ggml_backend_cuda_context * cuda_ctx
     return true;
 }
 
-// a single-token MUL_MAT that ggml_cuda_mul_mat would hand to ggml_cuda_mul_mat_vec_q unfused
+// a MUL_MAT of one token (on RDNA4 up to MMVQ_MAX_ROW_SEGMENT_COLS) that ggml_cuda_mul_mat would hand to
+// ggml_cuda_mul_mat_vec_q unfused
 static bool ggml_cuda_is_plain_mul_mat_vec_q(const ggml_tensor * node, const int cc, const int warp_size) {
     const ggml_tensor * src0 = node->src[0];
     const ggml_tensor * src1 = node->src[1];
+    const int64_t max_cols = GGML_CUDA_CC_IS_RDNA4(cc) ? MMVQ_MAX_ROW_SEGMENT_COLS : 1;
     return node->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(node, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
            ggml_cuda_mmvq_row_segments_supported(src0->type) && src0->ne[2] == 1 && src0->ne[3] == 1 &&
            src0->buffer && ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
-           src1->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 && ggml_nrows(node) == 1 && ggml_is_contiguous(node) &&
+           src1->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 && ggml_nrows(node) == node->ne[1] &&
+           node->ne[1] <= max_cols && ggml_is_contiguous(node) &&
            !ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]) &&
            !ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id =*/ false) &&
            ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1]);
@@ -4060,15 +4063,19 @@ static int ggml_cuda_match_row_epilogue(const ggml_cgraph * cgraph, const int j,
         return 0;
     }
 
+    // the outputs hold a row per token, the bias and the scale one value per row that the tokens share
     const int64_t nrows = segment->mm->ne[0];
-    const auto is_row_vector = [nrows](const ggml_tensor * t) {
-        return t->type == GGML_TYPE_F32 && ggml_nelements(t) == nrows && ggml_is_contiguous(t);
+    const auto is_output = [segment](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F32 && ggml_nelements(t) == ggml_nelements(segment->mm) && ggml_is_contiguous(t);
+    };
+    const auto is_per_row = [nrows](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F32 && t->ne[0] == nrows && ggml_nelements(t) == nrows && ggml_is_contiguous(t);
     };
     const auto node_at = [cgraph](const int k) { return k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr; };
 
     const ggml_tensor * sigmoid = node_at(j + 1);
     if (sigmoid && sigmoid->op == GGML_OP_UNARY && ggml_get_unary_op(sigmoid) == GGML_UNARY_OP_SIGMOID &&
-            sigmoid->src[0] == reshape && is_row_vector(sigmoid)) {
+            sigmoid->src[0] == reshape && is_output(sigmoid)) {
         segment->epilogue = MMVQ_ROW_EPILOGUE_SIGMOID;
         segment->out      = cgraph->nodes[j + 1];
         return 2;
@@ -4077,13 +4084,13 @@ static int ggml_cuda_match_row_epilogue(const ggml_cgraph * cgraph, const int j,
     const ggml_tensor * add      = node_at(j + 1);
     const ggml_tensor * softplus = node_at(j + 2);
     const ggml_tensor * mul      = node_at(j + 3);
-    if (!add || !softplus || !mul || add->op != GGML_OP_ADD || add->src[0] != reshape || !is_row_vector(add->src[1]) ||
-            softplus->op != GGML_OP_UNARY || ggml_get_unary_op(softplus) != GGML_UNARY_OP_SOFTPLUS || softplus->src[0] != add ||
-            mul->op != GGML_OP_MUL || (mul->src[0] != softplus && mul->src[1] != softplus) || !is_row_vector(mul)) {
+    if (!add || !softplus || !mul || add->op != GGML_OP_ADD || add->src[0] != reshape || reshape->ne[0] != nrows ||
+            !is_per_row(add->src[1]) || softplus->op != GGML_OP_UNARY || ggml_get_unary_op(softplus) != GGML_UNARY_OP_SOFTPLUS ||
+            softplus->src[0] != add || mul->op != GGML_OP_MUL || (mul->src[0] != softplus && mul->src[1] != softplus) || !is_output(mul)) {
         return 0;
     }
     const ggml_tensor * scale = mul->src[0] == softplus ? mul->src[1] : mul->src[0];
-    if (!is_row_vector(add) || !is_row_vector(softplus) || !is_row_vector(scale)) {
+    if (!is_output(add) || !is_output(softplus) || !is_per_row(scale) || softplus->ne[0] != nrows) {
         return 0;
     }
     segment->epilogue = MMVQ_ROW_EPILOGUE_SOFTPLUS_BIAS_SCALE;
@@ -4100,7 +4107,7 @@ static void ggml_cuda_row_segment_out_nodes(const ggml_cgraph * cgraph, const in
     }
 }
 
-// adjacent single-token MUL_MATs from node i that share src1 and the weight layout, plus the elementwise tails
+// adjacent MUL_MATs of a few tokens from node i that share src1 and the weight layout, plus the elementwise tails
 // that follow them: one launch covers them all. Returns how many nodes that is, 0 when not worth a fusion.
 static int ggml_cuda_match_mul_mat_vec_q_row_segments(const ggml_cgraph * cgraph, const int i, ggml_cuda_mm_fusion_args_host & fusion) {
     const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
