@@ -886,6 +886,10 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                     return ne11 <= MMVF_MAX_BATCH_SIZE;
                 }
                 if (bf16_mma_hardware_available(cc)) {
+                    // as F16: at 4 tokens mul_mat_f takes 46 us for a 2560x512 BF16 matrix
+                    if (GGML_CUDA_CC_IS_RDNA4(cc)) {
+                        return ne11 <= 5;
+                    }
                     return ne11 <= 3;
                 }
                 return ne11 <= MMVF_MAX_BATCH_SIZE;
