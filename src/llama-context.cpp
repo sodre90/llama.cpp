@@ -3956,10 +3956,13 @@ bool llama_memory_reserve_external(
         return false;
     }
 
-    // the claim belongs to the attention half: the indexer cache addresses the same cells by
-    // construction, and the block cache is never slot-allocated
+    // the indexer cache shares the attention cache's slots but keeps its own cell metadata, and
+    // the QSA block map is built from that metadata: an unclaimed indexer cell is an empty one, so
+    // the predecessor's blocks would never pool and could never be selected
     if (auto * h = dynamic_cast<llama_memory_hybrid_idx *>(mem)) {
-        return h->get_mem_attn()->reserve_external(seq_id, block_start);
+        auto * idx = h->get_mem_idx();
+        return h->get_mem_attn()->reserve_external(seq_id, block_start) &&
+               (idx == nullptr || idx->reserve_external(seq_id, block_start));
     }
 
     if (auto * h = dynamic_cast<llama_memory_hybrid *>(mem)) {
