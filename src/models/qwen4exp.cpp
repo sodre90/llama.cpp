@@ -1590,8 +1590,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     ggml_tensor * beta      = build_lora_mm(model.layers[il].ssm_beta,  cur, model.layers[il].ssm_beta_s);
     ggml_tensor * alpha     = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
 
-    if (ubatch.n_tokens == 1) {
-        // adjacent graph nodes, so the CUDA backend runs these projections of the same token as one matvec launch
+    if (ubatch.n_tokens <= 4) {
+        // adjacent graph nodes, so the CUDA backend runs these projections of the same tokens as one matvec launch
         for (ggml_tensor * projection : { qkv_mixed, z, beta, alpha }) {
             ggml_build_forward_expand(gf, projection);
         }
@@ -1615,7 +1615,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
     cb(gate, "gate", il);
 
-    if (ubatch.n_tokens == 1) {
+    if (ubatch.n_tokens <= 4) {
         // right behind the projections, so the matvec launch also applies these elementwise tails
         ggml_build_forward_expand(gf, beta);
         ggml_build_forward_expand(gf, gate);
