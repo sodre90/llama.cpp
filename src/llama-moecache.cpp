@@ -81,6 +81,7 @@ struct moe_cache {
     int32_t protected_pct = 75; // SLRU protected segment share, LLAMA_MOE_CACHE_PROTECTED_PCT
     bool    rank_by_demand = true; // LLAMA_MOE_CACHE_INSERT_ORDER=recency restores last-observed-first
     int32_t warm_max      = 0;  // LLAMA_MOE_CACHE_WARM_MAX: slots per layer a prefill may fill from its staged copy, 0 = off
+    int32_t max_in_flight = 4;  // LLAMA_MOE_CACHE_MAX_IN_FLIGHT: pending uploads per layer, 0 = unbounded
 
     uint64_t clock   = 0;
     uint64_t n_steps = 0;
@@ -640,6 +641,9 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
         if (const char * env = getenv("LLAMA_MOE_CACHE_WARM_MAX")) {
             mc->warm_max = std::max(0, atoi(env));
         }
+        if (const char * env = getenv("LLAMA_MOE_CACHE_MAX_IN_FLIGHT")) {
+            mc->max_in_flight = std::max(0, atoi(env));
+        }
         const std::map<int, int32_t> layer_slots_override = parse_layer_slots(getenv("LLAMA_MOE_CACHE_LAYER_SLOTS"));
 
         // collect the host-resident expert layers, grouped by the device buffer
@@ -1021,13 +1025,20 @@ void llama_moe_cache_step(ggml_backend_sched_t sched) {
             continue;
         }
 
-        int n_empty = 0;
+        int n_empty     = 0;
+        int n_in_flight = 0;
         for (int32_t s = 0; s < ls.n_slots; ++s) {
-            if (ls.slot_expert[s] < 0 && !ls.slot_in_flight[s]) {
+            if (ls.slot_in_flight[s]) {
+                n_in_flight++;
+            } else if (ls.slot_expert[s] < 0) {
                 n_empty++;
             }
         }
         int budget = n_empty > 0 ? std::max(mc->max_inserts, std::min(4, n_empty)) : mc->max_inserts;
+        // uploads slower than the step would otherwise evict the whole cache, hot experts included
+        if (mc->max_in_flight > 0) {
+            budget = std::min(budget, mc->max_in_flight - n_in_flight);
+        }
 
         order_pending(ls, mc->rank_by_demand);
         for (int32_t id : ls.pending) {
