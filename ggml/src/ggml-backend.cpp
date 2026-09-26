@@ -1010,6 +1010,7 @@ struct ggml_backend_sched {
     int prefetch_n_slots;
     int prefetch_lookahead;            // 1 = fire split i+2 while split i computes (measured-optimal)
     int prefetch_wait_mode;            // 1 = per-split cross-stream wait; >=2 = one wait per graph (debug)
+    int prefetch_min_routes;           // fire when the ubatch routes at least this many tokens per expert (GGML_SCHED_PREFETCH_MIN_ROUTES)
     ggml_backend_buffer_t prefetch_slots[GGML_SCHED_MAX_PREFETCH_SLOTS];
     ggml_backend_event_t  prefetch_ready[GGML_SCHED_MAX_PREFETCH_SLOTS];
     ggml_backend_event_t  prefetch_free [GGML_SCHED_MAX_PREFETCH_SLOTS];
@@ -2093,7 +2094,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) return;
         const ggml_tensor * ids = node->src[2];
         const int64_t n_expert = input->ne[2];
-        if (ids->ne[0]*ids->ne[1] < 2*n_expert) return;
+        if (ids->ne[0]*ids->ne[1] < sched->prefetch_min_routes*n_expert) return;
 
         ggml_backend_t s_backend = sched->backends[s->backend_id];
         if (!ggml_backend_sched_prefetch_init(sched, s_backend,
@@ -2210,7 +2211,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         node->op == GGML_OP_MUL_MAT_ID && node->src[0] == input_cpy) {
                         const ggml_tensor * ids = node->src[2];
                         const int64_t n_expert = input->ne[2];
-                        if (ids->ne[0]*ids->ne[1] >= 2*n_expert &&
+                        if (ids->ne[0]*ids->ne[1] >= sched->prefetch_min_routes*n_expert &&
                             ggml_backend_sched_prefetch_init(sched, split_backend,
                                 ggml_backend_buft_get_alloc_size(ggml_backend_get_default_buffer_type(split_backend), input))) {
                             const int slot = sched->prefetch_cur;
@@ -2554,6 +2555,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->prefetch_lookahead = 0;
     sched->prefetch_wait_mode = 0;
     sched->prefetch_n_slots   = 2;
+    const char * GGML_SCHED_PREFETCH_MIN_ROUTES = getenv("GGML_SCHED_PREFETCH_MIN_ROUTES");
+    sched->prefetch_min_routes = GGML_SCHED_PREFETCH_MIN_ROUTES ? atoi(GGML_SCHED_PREFETCH_MIN_ROUTES) : 2;
     sched->prefetch_cur       = 0;
 
     sched->expert_rows_fn        = NULL;
