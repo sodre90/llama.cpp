@@ -3561,7 +3561,13 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         float bias;
         memcpy(&bias, (const float *) scale->op_params + 1, sizeof(float));
 
-        return bias == 0.0f && scale->type == GGML_TYPE_F32;
+        if (bias != 0.0f || scale->type != GGML_TYPE_F32) {
+            return false;
+        }
+
+        // the fused kernel writes the scale output while other blocks still read the norm input
+        int out_nodes[] = { node_idx + 1 };
+        return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int) ops.size(), out_nodes, 1);
     }
 
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_SSM_CONV && ops.begin()[1] == GGML_OP_UNARY
