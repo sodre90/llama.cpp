@@ -128,7 +128,22 @@ public:
                        ggml_tensor * dirty_pos   = nullptr,
                        ggml_tensor * dirty_rows  = nullptr,
                        ggml_tensor * blk_rows    = nullptr,
-                       const llama_qsa_device_inputs * dev = nullptr) const;
+                       const llama_qsa_device_inputs * dev = nullptr,
+                       ggml_tensor * scope_rows  = nullptr,
+                       ggml_tensor * scope_cells = nullptr,
+                       ggml_tensor * scope_bias  = nullptr) const;
+
+    // [TAG_QSA_SEQ_SCOPE] a unified pool holds every sequence's blocks, and the indexer would score
+    // all of them for every query. When each sequence of the ubatch is one run of tokens, every
+    // sequence scores only its own candidates instead, from lists kept in the order of the whole-pool
+    // list, so the top-k picks the same blocks in the same order:
+    //   scope_rows  I32 [n_blk*n_seq]          pooled-cache row of each listed block, dustbin-padded
+    //   scope_cells I32 [ratio, n_blk, n_seq]  cells of each listed block
+    //   scope_bias  F32 [n_blk, n_t, n_seq]    the per-block bias of each query, -inf past the list
+    // Returns n_blk for this ubatch, padded so graph reuse holds, and sets n_seq; 0 when the ubatch
+    // cannot be scoped or scoping would score more blocks than the whole pool
+    uint32_t qsa_scope_n_blocks(const llama_ubatch & ubatch, uint32_t n_kv, uint32_t ratio,
+                                uint32_t n_seq_vis, uint32_t & n_seq) const;
 
     // The model's indexer pool size.
     uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
@@ -290,6 +305,11 @@ private:
 
         std::vector<uint8_t>      key_seq;      // [n_key*LLAMA_MAX_SEQ] whether key k's cells belong to sequence sq
         std::vector<llama_seq_id> key_low;      // lowest sequence of key k
+
+        // the arguments of the last sync; with no journal entry since mark the state is current
+        bool synced      = false;
+        bool need_blk_of = false;
+        bool pos_2d      = false;
     };
 
     mutable qsa_input_state qsa_st;
@@ -388,7 +408,13 @@ public:
                        ggml_tensor * dirty_pos   = nullptr,
                        ggml_tensor * dirty_rows  = nullptr,
                        ggml_tensor * blk_rows    = nullptr,
-                       const llama_qsa_device_inputs * dev = nullptr) const;
+                       const llama_qsa_device_inputs * dev = nullptr,
+                       ggml_tensor * scope_rows  = nullptr,
+                       ggml_tensor * scope_cells = nullptr,
+                       ggml_tensor * scope_bias  = nullptr) const;
+
+    // [TAG_QSA_SEQ_SCOPE] see the memory class; 0 as well with more than one stream
+    uint32_t qsa_scope_n_blocks(const llama_ubatch & ubatch, uint32_t ratio, uint32_t n_seq_vis, uint32_t & n_seq) const;
 
     // [TAG_QSA_POOLED_CACHE] true when store rows are keyed on (seq_id, position block) rather
     // than the position block alone, which a unified pool requires - see the memory class

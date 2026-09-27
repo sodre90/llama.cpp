@@ -598,6 +598,47 @@ void llama_memory_hybrid_idx::pooled_reset(llama_seq_id seq_id) {
     }
 }
 
+// [TAG_QSA_SEQ_SCOPE] the sequences of a ubatch made of one equal run of tokens per sequence, in
+// token order; empty for any other ubatch, and for the reserve pass's ubatch, which has no sequences
+static std::vector<llama_seq_id> qsa_scope_seqs(const llama_ubatch & ubatch) {
+    if (ubatch.n_tokens == 0 || ubatch.seq_id == nullptr || ubatch.seq_id[0] == nullptr || ubatch.n_seq_id == nullptr) {
+        return {};
+    }
+
+    std::vector<llama_seq_id> seqs;
+
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.n_seq_id[i] != 1) {
+            return {};
+        }
+
+        const llama_seq_id sq = ubatch.seq_id[i][0];
+
+        if (i > 0 && sq == ubatch.seq_id[i - 1][0]) {
+            continue;
+        }
+        if (std::find(seqs.begin(), seqs.end(), sq) != seqs.end()) {
+            return {};
+        }
+
+        seqs.push_back(sq);
+    }
+
+    if (ubatch.n_tokens % seqs.size() != 0) {
+        return {};
+    }
+
+    const uint32_t n_t = ubatch.n_tokens / (uint32_t) seqs.size();
+
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.seq_id[i][0] != seqs[i/n_t]) {
+            return {};
+        }
+    }
+
+    return seqs;
+}
+
 void llama_memory_hybrid_idx::qsa_sync(
         qsa_input_state & st,
         const llama_kv_cells & cells,
@@ -634,6 +675,14 @@ void llama_memory_hybrid_idx::qsa_sync(
     }
 
     const int32_t n_present = (int32_t) seq_present.size();
+
+    // [TAG_QSA_SEQ_SCOPE] the scope query syncs before the graph is built, and set_input_qsa then
+    // finds nothing new; a state that cannot be updated in place would otherwise be rebuilt twice
+    if (st.synced && st.cells == &cells && st.mark == cells.journal_end() && st.n_kv == n_kv && st.r == r &&
+            st.n_seq_vis == n_seq_vis && st.seq_present == seq_present && st.need_blk_of == need_blk_of &&
+            st.pos_2d == ubatch->is_pos_2d()) {
+        return;
+    }
 
     // [TAG_QSA_CELL_KEY] a cell's sequence set as a small int, so the per-cell passes never
     // compare or scan the 256-bit sets: key k < n_present is the one sequence seq_present[k], a
@@ -1198,6 +1247,85 @@ void llama_memory_hybrid_idx::qsa_sync(
 
         GGML_ASSERT(same && "qsa: in-place input update differs from a rebuild");
     }
+
+    st.synced      = true;
+    st.need_blk_of = need_blk_of;
+    st.pos_2d      = ubatch->is_pos_2d();
+}
+
+uint32_t llama_memory_hybrid_idx::qsa_scope_n_blocks(
+        const llama_ubatch & ubatch,
+        uint32_t n_kv,
+        uint32_t ratio,
+        uint32_t n_seq_vis,
+        uint32_t & n_seq) const {
+    n_seq = 0;
+
+    const int64_t r        = ratio;
+    const int64_t n_blocks = (n_kv + r - 1)/r;
+
+    // up to 1024 columns the device top-k sorts, and a sort returns the winners by score, not in
+    // list order, so every list stays longer than that. The padding lets graph reuse hold while a
+    // sequence grows
+    constexpr int64_t n_blk_min = 1025;
+    constexpr int64_t n_blk_pad = 256;
+
+    const auto seqs = qsa_scope_seqs(ubatch);
+
+    if (seqs.empty() || !pooled_is_keyed_by_seq() || get_mem_idx() == nullptr || n_blocks < n_blk_min) {
+        return 0;
+    }
+
+    qsa_input_state & st = qsa_st;
+
+    const auto & cells = get_mem_idx()->get_cells(seqs[0]);
+
+    qsa_sync(st, cells, &ubatch, n_kv, r, n_seq_vis, true, false, true);
+
+    const int64_t n_key = (int64_t) st.key_low.size();
+
+    std::vector<int64_t> key_n(n_key, 0);
+    for (const int32_t k : st.bid_key) {
+        key_n[k]++;
+    }
+
+    // spare blocks take the unpooled cells r at a time, in cell order, as set_input_qsa packs them
+    const int64_t n_up = (int64_t) st.unpooled.size();
+
+    int64_t n_max = 0;
+
+    for (const llama_seq_id sq : seqs) {
+        int64_t n = 0;
+
+        for (int64_t k = 0; k < n_key; ++k) {
+            if (st.key_seq[k*LLAMA_MAX_SEQ + sq]) {
+                n += key_n[k];
+            }
+        }
+
+        for (int64_t d = 0; d*r < n_up; ++d) {
+            for (int64_t u = d*r; u < std::min(n_up, d*r + r); ++u) {
+                if (cells.seq_has(st.unpooled[u], sq)) {
+                    n++;
+                    break;
+                }
+            }
+        }
+
+        n_max = std::max(n_max, n);
+    }
+
+    int64_t n_blk = std::max(n_max, n_blk_min);
+    n_blk = std::min((n_blk + n_blk_pad - 1)/n_blk_pad*n_blk_pad, n_blocks);
+
+    // every list is padded to the longest, so sequences of very different length can cost more than the pool
+    if ((int64_t) seqs.size()*n_blk > n_blocks + n_blocks/4) {
+        return 0;
+    }
+
+    n_seq = (uint32_t) seqs.size();
+
+    return (uint32_t) n_blk;
 }
 
 void llama_memory_hybrid_idx::set_input_qsa(
@@ -1215,7 +1343,10 @@ void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * dirty_pos,
         ggml_tensor * dirty_rows,
         ggml_tensor * blk_rows,
-        const llama_qsa_device_inputs * dev) const {
+        const llama_qsa_device_inputs * dev,
+        ggml_tensor * scope_rows,
+        ggml_tensor * scope_cells,
+        ggml_tensor * scope_bias) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(get_mem_idx() != nullptr);
 
@@ -1243,6 +1374,10 @@ void llama_memory_hybrid_idx::set_input_qsa(
     GGML_ASSERT(dirty_pos   == nullptr ||  dirty_pos->ne[0]   == 4*dirty_rows->ne[0]*n_ns);
     GGML_ASSERT(dirty_rows  == nullptr ||  dirty_rows->ne[1]  == n_ns);
     GGML_ASSERT(blk_rows    == nullptr || (blk_rows->ne[0]    == n_blocks    && blk_rows->ne[1] == n_ns));
+    GGML_ASSERT(scope_cells == nullptr || (blk_bias && n_ns == 1 && pooled_is_keyed_by_seq() &&
+            scope_cells->ne[0] == r && scope_rows->ne[0] == scope_cells->ne[1]*scope_cells->ne[2] &&
+            scope_bias->ne[0] == scope_cells->ne[1] && scope_bias->ne[2] == scope_cells->ne[2] &&
+            scope_bias->ne[1]*scope_bias->ne[2] == n_tokens));
 
     GGML_ASSERT(n_tokens % n_ns == 0);
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
@@ -1258,7 +1393,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
     const bool dev_bias = tbl.blk_start != nullptr && tbl.blk_start->buffer != nullptr;
     const bool dev_vis  = tbl.cell_idx  != nullptr && tbl.cell_idx->buffer  != nullptr;
 
-    GGML_ASSERT((dev_bias || bias != nullptr) && "qsa: neither a bias input nor its tables");
+    GGML_ASSERT((dev_bias || bias != nullptr || scope_bias != nullptr) && "qsa: neither a bias input nor its tables");
     GGML_ASSERT(!dev_bias || (blk_bias && tbl.blk_start->ne[0] == n_blocks && tbl.blk_start->ne[2] == n_ns &&
             tbl.blk_spare->ne[0] == n_blocks && tbl.blk_spare->ne[2] == n_ns &&
             tbl.tok_seq->ne[0] == n_tps && tbl.tok_seq->ne[1] == n_ns &&
@@ -1340,6 +1475,21 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 dead_cells[idx] = idx < n_up ? unpooled_cells[idx] : pad;
             }
         }
+
+        // whether spare block d holds a cell of seq_id whose causal index is at most q
+        auto spare_has = [&](int64_t d, llama_seq_id seq_id, int64_t q) {
+            const int32_t * dead_row = &dead_cells[d*r];
+
+            for (int64_t k = 0; k < r; ++k) {
+                const int32_t c = dead_row[k];
+
+                if (c >= 0 && !cells.is_empty(c) && cells.seq_has(c, seq_id) && st.cell_idx[c] <= q) {
+                    return true;
+                }
+            }
+
+            return false;
+        };
 
         if (dst_blk_cells != nullptr) {
             int32_t * dst = dst_blk_cells + s*(r*n_blocks);
@@ -1458,6 +1608,104 @@ void llama_memory_hybrid_idx::set_input_qsa(
             }
             if (n_bad > 0) {
                 LLAMA_LOG_WARN("%s: %" PRId64 " of %" PRId64 " blk_rows out of range, sent to the dustbin\n", __func__, n_bad, n_blocks);
+            }
+        }
+
+        // [TAG_QSA_SEQ_SCOPE] each sequence's candidates: the complete blocks it holds and the spare
+        // blocks with a cell of it, in whole-pool order. Past its list a sequence names the dustbin
+        // row and a cell it cannot see, and its bias drops them
+        std::vector<std::vector<int32_t>> scope_blk;
+
+        if (scope_cells != nullptr) {
+            const int64_t n_blk = scope_cells->ne[1];
+            const int64_t n_seq = scope_cells->ne[2];
+
+            const auto seqs = qsa_scope_seqs(*ubatch);
+
+            GGML_ASSERT((int64_t) seqs.size() == n_seq && "qsa: scoped tables sized for another ubatch");
+
+            std::vector<int32_t> col_of(LLAMA_MAX_SEQ, -1);
+            for (int64_t v = 0; v < n_seq; ++v) {
+                col_of[seqs[v]] = (int32_t) v;
+            }
+
+            scope_blk.resize(n_seq);
+            for (auto & list : scope_blk) {
+                list.reserve(n_blk);
+            }
+
+            // keys below n_one name one sequence each
+            const int32_t n_one = (int32_t) st.seq_present.size();
+
+            for (int32_t b = 0; b < n_bid; ++b) {
+                const int32_t k = st.bid_key[b];
+
+                if (k < n_one) {
+                    const int32_t v = col_of[st.seq_present[k]];
+                    if (v >= 0) {
+                        scope_blk[v].push_back(b);
+                    }
+                    continue;
+                }
+
+                for (int64_t v = 0; v < n_seq; ++v) {
+                    if (key_seq[k*LLAMA_MAX_SEQ + seqs[v]]) {
+                        scope_blk[v].push_back(b);
+                    }
+                }
+            }
+
+            for (int64_t d = 0; d < n_dead; ++d) {
+                for (int64_t v = 0; v < n_seq; ++v) {
+                    if (spare_has(d, seqs[v], INT64_MAX)) {
+                        scope_blk[v].push_back(n_bid + (int32_t) d);
+                    }
+                }
+            }
+
+            const int64_t n_rows_valid = (int64_t) get_pooled_rows();
+            int64_t n_bad = 0;
+
+            for (int64_t v = 0; v < n_seq; ++v) {
+                const auto & list = scope_blk[v];
+
+                GGML_ASSERT((int64_t) list.size() <= n_blk && "qsa: scoped tables sized at graph build; see qsa_scope_n_blocks");
+
+                // an empty cell, else the first cell without the sequence
+                int32_t hidden = pad;
+                for (int64_t j = 0; hidden < 0 && j < n_kv; ++j) {
+                    if (!cells.seq_has((uint32_t) j, seqs[v])) {
+                        hidden = (int32_t) j;
+                    }
+                }
+                hidden = std::max(hidden, 0);
+
+                int32_t * dst_rows  = (int32_t *) scope_rows->data  + v*n_blk;
+                int32_t * dst_cells = (int32_t *) scope_cells->data + v*r*n_blk;
+
+                for (int64_t j = 0; j < n_blk; ++j) {
+                    const int32_t b = j < (int64_t) list.size() ? list[j] : -1;
+
+                    int64_t row = b >= 0 && b < n_bid ? pooled_row_of(blk_seq[b], bid_idx[b]/r) : dustbin;
+
+                    // [TAG_QSA_BLK_ROWS_CHECK]
+                    if (row < 0 || row >= n_rows_valid) {
+                        row = dustbin;
+                        n_bad++;
+                    }
+
+                    dst_rows[j] = (int32_t) row;
+
+                    const int32_t * src = b < 0 ? nullptr : b < n_bid ? &st.bid_cells[(size_t) b*r] : &dead_cells[(size_t) (b - n_bid)*r];
+
+                    for (int64_t k = 0; k < r; ++k) {
+                        dst_cells[j*r + k] = src != nullptr ? src[k] : hidden;
+                    }
+                }
+            }
+
+            if (n_bad > 0) {
+                LLAMA_LOG_WARN("%s: %" PRId64 " scoped block rows out of range, sent to the dustbin\n", __func__, n_bad);
             }
         }
 
@@ -1590,6 +1838,26 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 meta[1] = (int32_t) q;
             }
 
+            if (scope_bias != nullptr) {
+                const int64_t n_blk = scope_bias->ne[0];
+                const auto &  list  = scope_blk[ii/scope_bias->ne[1]];
+
+                float * cur_scope_bias = (float *) scope_bias->data + i*n_blk;
+
+                // the whole-pool rule below, on the listed blocks only
+                for (int64_t j = 0; j < n_blk; ++j) {
+                    const int32_t b = j < (int64_t) list.size() ? list[j] : -1;
+
+                    cur_scope_bias[j] = b < 0     ? -INFINITY
+                                      : b >= n_bid ? (spare_has(b - n_bid, seq_id, q) ? 1e9f : -INFINITY)
+                                      : bid_idx[b] >  q          ? -INFINITY
+                                      : bid_idx[b] >= tail_start ? 1e9f
+                                      : 0.0f;
+                }
+
+                continue;
+            }
+
             if (dst_bias == nullptr) {
                 continue;
             }
@@ -1625,25 +1893,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 // and gets the tail value (1e9f) if it contains at least one causally visible cell
                 // for this sequence; otherwise -inf so foreign sequence tails are not selected.
                 for (int64_t d = 0; d < n_dead; ++d) {
-                    const int32_t   bid      = n_bid + (int32_t) d;
-                    const int32_t * dead_row = &dead_cells[d*r];
-
-                    bool visible = false;
-
-                    for (int64_t k = 0; k < r; ++k) {
-                        const int32_t c = dead_row[k];
-
-                        if (c >= 0 && !cells.is_empty(c) && cells.seq_has(c, seq_id)) {
-                            const int64_t idx = st.cell_idx[c];
-
-                            if (!causal_attn || idx <= q) {
-                                visible = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    cur_blk_bias[bid] = visible ? 1e9f : -INFINITY;
+                    cur_blk_bias[n_bid + d] = spare_has(d, seq_id, causal_attn ? q : INT64_MAX) ? 1e9f : -INFINITY;
                 }
 
                 continue;
@@ -1659,7 +1909,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
                     if (!causal_attn) {
                         // every visible block competes on score and the unpooled cells are always selected
-                        v = blk_of[j] < 0 ? 1e9f : 0.0f;
+                        v = st.blk_of[j] < 0 ? 1e9f : 0.0f;
                     } else if (idx <= q) {
                         // finite, so it can never meet a -inf and produce a nan
                         v = idx >= tail_start ? 1e9f : (st.blk_of[j] < 0 ? -INFINITY : 0.0f);
@@ -1956,13 +2206,27 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * dirty_pos,
         ggml_tensor * dirty_rows,
         ggml_tensor * blk_rows,
-        const llama_qsa_device_inputs * dev) const {
+        const llama_qsa_device_inputs * dev,
+        ggml_tensor * scope_rows,
+        ggml_tensor * scope_cells,
+        ggml_tensor * scope_bias) const {
     GGML_ASSERT(mem != nullptr);
     GGML_ASSERT(get_idx() != nullptr);
 
     mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch,
             get_idx()->get_n_kv(), get_n_stream(), ratio, blk_bias, causal_attn,
-            dirty_cells, dirty_pos, dirty_rows, blk_rows, dev);
+            dirty_cells, dirty_pos, dirty_rows, blk_rows, dev,
+            scope_rows, scope_cells, scope_bias);
+}
+
+uint32_t llama_memory_hybrid_idx_context::qsa_scope_n_blocks(const llama_ubatch & ubatch, uint32_t ratio, uint32_t n_seq_vis, uint32_t & n_seq) const {
+    n_seq = 0;
+
+    if (mem == nullptr || get_idx() == nullptr || get_n_stream() != 1) {
+        return 0;
+    }
+
+    return mem->qsa_scope_n_blocks(ubatch, get_idx()->get_n_kv(), ratio, n_seq_vis, n_seq);
 }
 
 llama_memory_hybrid_idx_context::kpool_access::kpool_access(ggml_context * ctx, ggml_tensor * k, int64_t n_embd) : ctx(ctx) {
