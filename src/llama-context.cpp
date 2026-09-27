@@ -20,6 +20,7 @@
 #include <cstring>
 #include <limits>
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -3020,9 +3021,52 @@ public:
             uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
 
     ~llama_io_write_host() {
-        // TODO: add backend support to batch tensor_get? or some other way to speed this up
-        for (const auto & winfo : winfos) {
-            ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+        // a sequence's cells in a shared pool are interleaved with other sequences', so row by row
+        // this would be one synchronous device copy per row: read each run of nearby rows at once
+        std::sort(winfos.begin(), winfos.end(), [](const write_info & a, const write_info & b) {
+            return a.tensor != b.tensor ? std::less<const ggml_tensor *>()(a.tensor, b.tensor) : a.offset < b.offset;
+        });
+
+        const size_t max_gap  = 1u << 20;
+        const size_t max_span = 64u << 20;
+
+        static const bool check_reads = getenv("LLAMA_STATE_READ_CHECK") != nullptr;
+
+        std::vector<uint8_t> span;
+
+        for (size_t i = 0; i < winfos.size(); ) {
+            const write_info & first = winfos[i];
+
+            size_t end = first.offset + first.size;
+            size_t j   = i + 1;
+
+            while (j < winfos.size() && winfos[j].tensor == first.tensor && winfos[j].offset >= end &&
+                    winfos[j].offset - end <= max_gap && winfos[j].offset + winfos[j].size - first.offset <= max_span) {
+                end = winfos[j].offset + winfos[j].size;
+                ++j;
+            }
+
+            if (j == i + 1) {
+                ggml_backend_tensor_get(first.tensor, first.ptr, first.offset, first.size);
+            } else {
+                span.resize(end - first.offset);
+                ggml_backend_tensor_get(first.tensor, span.data(), first.offset, span.size());
+
+                for (size_t k = i; k < j; ++k) {
+                    memcpy(winfos[k].ptr, span.data() + (winfos[k].offset - first.offset), winfos[k].size);
+                }
+
+                if (check_reads) {
+                    std::vector<uint8_t> row;
+                    for (size_t k = i; k < j; ++k) {
+                        row.resize(winfos[k].size);
+                        ggml_backend_tensor_get(winfos[k].tensor, row.data(), winfos[k].offset, row.size());
+                        GGML_ASSERT(memcmp(row.data(), winfos[k].ptr, row.size()) == 0 && "state: coalesced read differs");
+                    }
+                }
+            }
+
+            i = j;
         }
     }
 
