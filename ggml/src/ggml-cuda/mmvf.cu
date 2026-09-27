@@ -638,6 +638,159 @@ static void mul_mat_vec_f_cuda(
         stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
 }
 
+// mul_mat_vec_f<float> over rows that a GET_ROWS would first gather from a Q8_0 matrix to F32. Each value is dequantized
+// like dequantize_q8_0 and summed in the same order as the F32 kernel, so the result is bit-identical to gather + matvec.
+// Channel c reads gathered rows [c*nrows, (c+1)*nrows) with its own y and dst, like the F32 kernel with channel_ratio 1.
+template <int ncols_dst, int block_size>
+static __global__ void mul_mat_vec_f_q8_0_rows(
+        const char * x, const int32_t * rows, const float * y, float * dst,
+        const int ncols2, const int nrows, const int64_t stride_row_bytes, const int stride_col_y2, const int stride_col_dst,
+        const int64_t stride_channel_y, const int64_t stride_channel_dst) {
+    const int row     = blockIdx.x;
+    const int channel = blockIdx.y;
+    const int tid     = threadIdx.x;
+
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    ggml_cuda_pdl_sync();
+
+    const block_q8_0 * xr = (const block_q8_0 *) (x + rows[int64_t(channel)*nrows + row]*stride_row_bytes);
+    const float2     * y2 = (const float2 *) (y + channel*stride_channel_y);
+    dst += channel*stride_channel_dst;
+
+    extern __shared__ char data_mmv[];
+    float * buf_iw = (float *) data_mmv;
+
+    if (block_size > warp_size) {
+        if (tid < warp_size) {
+            buf_iw[tid] = 0.0f;
+        }
+        __syncthreads();
+    }
+
+    float sumf[ncols_dst] = {0.0f};
+
+#pragma unroll 4
+    for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+        const block_q8_0 & b = xr[col2/(QK8_0/2)];
+        const int iqs = 2*(col2 % (QK8_0/2));
+        const float d = b.d;
+
+        float2 tmpx;
+        tmpx.x = b.qs[iqs + 0];
+        tmpx.y = b.qs[iqs + 1];
+        tmpx.x *= d;
+        tmpx.y *= d;
+
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const float2 tmpy = y2[j*stride_col_y2 + col2];
+            ggml_cuda_mad(sumf[j], tmpx.x, tmpy.x);
+            ggml_cuda_mad(sumf[j], tmpx.y, tmpy.y);
+        }
+    }
+
+    ggml_cuda_pdl_lc();
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
+
+        if (block_size > warp_size) {
+            buf_iw[tid/warp_size] = sumf[j];
+            __syncthreads();
+            if (tid < warp_size) {
+                sumf[j] = buf_iw[tid];
+                sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
+            }
+
+            if (j < ncols_dst) {
+                __syncthreads();
+            }
+        }
+    }
+
+    if (tid >= ncols_dst) {
+        return;
+    }
+
+    dst[tid*stride_col_dst + row] = sumf[tid];
+}
+
+template <int ncols_dst>
+static void mul_mat_vec_f_q8_0_rows_cuda(
+        const char * x, const int32_t * rows, const float * y, float * dst, const int64_t ncols, const int64_t nrows,
+        const int64_t nchannels, const int64_t stride_row_bytes, const int64_t stride_col_y, const int64_t stride_col_dst,
+        const int64_t stride_channel_y, const int64_t stride_channel_dst, cudaStream_t stream) {
+    const int device = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+
+    // the block size launch_mul_mat_vec_f_cuda picks for this shape, which the bit-identical sum depends on
+    int64_t block_size_best = warp_size;
+    int64_t niter_best      = (ncols + 2*warp_size - 1) / (2*warp_size);
+    int64_t max_block_size  = 256;
+    if (ggml_cuda_info().devices[device].cc > GGML_CUDA_CC_OFFSET_AMD && ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_RDNA1) {
+        max_block_size = 128;
+    }
+    if (GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[device].cc) && nrows*nchannels >= 4*ggml_cuda_info().devices[device].nsm) {
+        max_block_size = 64;
+    }
+    for (int64_t block_size = 2*warp_size; block_size <= max_block_size; block_size += warp_size) {
+        const int64_t niter = (ncols + 2*block_size - 1) / (2*block_size);
+        if (niter < niter_best) {
+            niter_best      = niter;
+            block_size_best = block_size;
+        }
+    }
+
+    const ggml_cuda_kernel_launch_params launch_params = {dim3(nrows, nchannels, 1), dim3(block_size_best, 1, 1), (int) (warp_size*sizeof(float)), stream};
+    switch (block_size_best) {
+        case  32: ggml_cuda_kernel_launch(mul_mat_vec_f_q8_0_rows<ncols_dst,  32>, launch_params, x, rows, y, dst, (int) ncols/2, (int) nrows, stride_row_bytes, (int) stride_col_y/2, (int) stride_col_dst, stride_channel_y, stride_channel_dst); break;
+        case  64: ggml_cuda_kernel_launch(mul_mat_vec_f_q8_0_rows<ncols_dst,  64>, launch_params, x, rows, y, dst, (int) ncols/2, (int) nrows, stride_row_bytes, (int) stride_col_y/2, (int) stride_col_dst, stride_channel_y, stride_channel_dst); break;
+        case  96: ggml_cuda_kernel_launch(mul_mat_vec_f_q8_0_rows<ncols_dst,  96>, launch_params, x, rows, y, dst, (int) ncols/2, (int) nrows, stride_row_bytes, (int) stride_col_y/2, (int) stride_col_dst, stride_channel_y, stride_channel_dst); break;
+        case 128: ggml_cuda_kernel_launch(mul_mat_vec_f_q8_0_rows<ncols_dst, 128>, launch_params, x, rows, y, dst, (int) ncols/2, (int) nrows, stride_row_bytes, (int) stride_col_y/2, (int) stride_col_dst, stride_channel_y, stride_channel_dst); break;
+        case 160: ggml_cuda_kernel_launch(mul_mat_vec_f_q8_0_rows<ncols_dst, 160>, launch_params, x, rows, y, dst, (int) ncols/2, (int) nrows, stride_row_bytes, (int) stride_col_y/2, (int) stride_col_dst, stride_channel_y, stride_channel_dst); break;
+        case 192: ggml_cuda_kernel_launch(mul_mat_vec_f_q8_0_rows<ncols_dst, 192>, launch_params, x, rows, y, dst, (int) ncols/2, (int) nrows, stride_row_bytes, (int) stride_col_y/2, (int) stride_col_dst, stride_channel_y, stride_channel_dst); break;
+        case 224: ggml_cuda_kernel_launch(mul_mat_vec_f_q8_0_rows<ncols_dst, 224>, launch_params, x, rows, y, dst, (int) ncols/2, (int) nrows, stride_row_bytes, (int) stride_col_y/2, (int) stride_col_dst, stride_channel_y, stride_channel_dst); break;
+        case 256: ggml_cuda_kernel_launch(mul_mat_vec_f_q8_0_rows<ncols_dst, 256>, launch_params, x, rows, y, dst, (int) ncols/2, (int) nrows, stride_row_bytes, (int) stride_col_y/2, (int) stride_col_dst, stride_channel_y, stride_channel_dst); break;
+        default: GGML_ABORT("fatal error");
+    }
+}
+
+void ggml_cuda_mul_mat_vec_f_q8_0_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * gather, const ggml_tensor * src1, ggml_tensor * dst) {
+    const ggml_tensor * src0 = gather->src[0];
+    const ggml_tensor * rows = gather->src[1];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_Q8_0 && rows->type == GGML_TYPE_I32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->ne[0] % QK8_0 == 0 && src1->ne[0] == src0->ne[0] && src1->nb[0] == sizeof(float) && src1->nb[1] % (2*sizeof(float)) == 0);
+    GGML_ASSERT(dst->ne[0]*dst->ne[2] == gather->ne[1] && dst->ne[1] == src1->ne[1] && dst->ne[2] == src1->ne[2] && dst->ne[3] == 1);
+    GGML_ASSERT(dst->nb[0] == sizeof(float) && src1->nb[2] % (2*sizeof(float)) == 0);
+
+    const char    * x      = (const char *) src0->data;
+    const int32_t * rows_d = (const int32_t *) rows->data;
+    const float   * y      = (const float *) src1->data;
+    float         * dst_d  = (float *) dst->data;
+
+    const int64_t ncols  = src0->ne[0];
+    const int64_t nrows  = dst->ne[0];
+    const int64_t nch    = dst->ne[2];
+    const int64_t s11    = src1->nb[1] / sizeof(float);
+    const int64_t s1     = dst->nb[1] / sizeof(float);
+    const int64_t s12    = src1->nb[2] / sizeof(float);
+    const int64_t s2     = dst->nb[2] / sizeof(float);
+
+    switch (src1->ne[1]) {
+        case 1: mul_mat_vec_f_q8_0_rows_cuda<1>(x, rows_d, y, dst_d, ncols, nrows, nch, src0->nb[1], s11, s1, s12, s2, ctx.stream()); break;
+        case 2: mul_mat_vec_f_q8_0_rows_cuda<2>(x, rows_d, y, dst_d, ncols, nrows, nch, src0->nb[1], s11, s1, s12, s2, ctx.stream()); break;
+        case 3: mul_mat_vec_f_q8_0_rows_cuda<3>(x, rows_d, y, dst_d, ncols, nrows, nch, src0->nb[1], s11, s1, s12, s2, ctx.stream()); break;
+        case 4: mul_mat_vec_f_q8_0_rows_cuda<4>(x, rows_d, y, dst_d, ncols, nrows, nch, src0->nb[1], s11, s1, s12, s2, ctx.stream()); break;
+        case 5: mul_mat_vec_f_q8_0_rows_cuda<5>(x, rows_d, y, dst_d, ncols, nrows, nch, src0->nb[1], s11, s1, s12, s2, ctx.stream()); break;
+        case 6: mul_mat_vec_f_q8_0_rows_cuda<6>(x, rows_d, y, dst_d, ncols, nrows, nch, src0->nb[1], s11, s1, s12, s2, ctx.stream()); break;
+        case 7: mul_mat_vec_f_q8_0_rows_cuda<7>(x, rows_d, y, dst_d, ncols, nrows, nch, src0->nb[1], s11, s1, s12, s2, ctx.stream()); break;
+        case 8: mul_mat_vec_f_q8_0_rows_cuda<8>(x, rows_d, y, dst_d, ncols, nrows, nch, src0->nb[1], s11, s1, s12, s2, ctx.stream()); break;
+        default: GGML_ABORT("unsupported ncols_dst: %d", (int) src1->ne[1]);
+    }
+}
+
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);

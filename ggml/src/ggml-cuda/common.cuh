@@ -1541,6 +1541,10 @@ struct ggml_backend_cuda_context {
     // a GET_ROWS of recurrent states left unexecuted, whose rows the next GATED_DELTA_NET reads in place
     const ggml_tensor * gdn_state_gather = nullptr;
 
+    // a GET_ROWS of Q8_0 rows left unexecuted, and the one-token F32 matvec that reads the rows in place instead
+    const ggml_tensor * mmvf_q8_0_gather   = nullptr;
+    const ggml_tensor * mmvf_q8_0_consumer = nullptr;
+
     ggml_cuda_conv_state_fold conv_state_fold;
 
     // where a kernel that writes dst may also write its q8_1 copy for the next mul_mat_vec_q, or nullptr;
