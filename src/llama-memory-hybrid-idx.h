@@ -240,6 +240,62 @@ private:
 
     mutable std::unordered_map<llama_seq_id, int64_t> pooled_w;
 
+    // [TAG_QSA_INPUT_STATE] what set_input_qsa derives from the cells of one stream. With a single
+    // stream it is kept between ubatches and updated from the cells' journal, so a decode step
+    // touches its few new cells instead of rescanning the pool
+    struct qsa_input_state {
+        bool valid = false;                     // true: can be updated in place
+        const llama_kv_cells * cells = nullptr;
+        uint64_t mark = 0;                      // journal position the state reflects
+        int64_t  n_kv = 0;
+        int64_t  r    = 0;
+        int64_t  n_seq_vis = 0;
+
+        std::vector<llama_seq_id>              seq_present;
+        std::vector<llama_kv_cells::seq_set_t> key_set;
+
+        std::vector<int32_t> cell_key;          // -1: empty
+        std::vector<int32_t> cell_idx;          // causal index of a non-empty cell
+        std::vector<int32_t> blk_of;            // only when a per-cell table needs it
+
+        std::vector<int64_t>  grp_ext;
+        std::vector<int64_t>  grp_base;
+        std::vector<int32_t>  grp_first;
+        std::vector<int32_t>  grp_slot0;
+        std::vector<uint64_t> grp_slots;
+        std::vector<int32_t>  grp_bid;
+
+        std::vector<int32_t> bid_idx;
+        std::vector<int32_t> bid_cell;
+        std::vector<int32_t> bid_slot0;
+        std::vector<int32_t> bid_key;
+        std::vector<int64_t> bid_grp;
+        std::vector<int32_t> bid_pos;           // [4] per bid
+        std::vector<int32_t> bid_cells;         // [r] per bid
+
+        std::vector<int32_t> unpooled;          // ascending
+        int32_t pad = -1;                       // first empty cell
+
+        std::vector<int32_t> vis;               // [n_kv] per sequence row
+
+        bool oor    = false;
+        bool dup    = false;
+        bool ranked = false;
+        llama_kv_cells::seq_set_t ranked_seqs;
+        std::vector<int32_t> rank;
+        std::vector<std::vector<int32_t>> seq_order;
+
+        std::vector<uint8_t>      key_seq;      // [n_key*LLAMA_MAX_SEQ] whether key k's cells belong to sequence sq
+        std::vector<llama_seq_id> key_low;      // lowest sequence of key k
+    };
+
+    mutable qsa_input_state qsa_st;
+
+    // brings st up to date with cells: in place when a decode step only added cells, else rebuilt.
+    // keep: st outlives this ubatch and may be updated in place next time
+    void qsa_sync(qsa_input_state & st, const llama_kv_cells & cells, const llama_ubatch * ubatch,
+                  int64_t n_kv, int64_t r, int64_t n_seq_vis, bool keep, bool need_blk_of, bool blk_bias) const;
+
     // clamp helpers, one per llama_memory_i operation that can invalidate rows
     void pooled_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
     void pooled_reset(llama_seq_id seq_id);   // -1 resets every sequence

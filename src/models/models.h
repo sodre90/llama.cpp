@@ -2588,6 +2588,9 @@ struct llama_model_qwen4exp : public llama_model_base {
         ggml_tensor *               qsa_vis_cells = nullptr; // I32 [n_kv, n_seq_max, 1, n_stream]
         ggml_tensor *               qsa_vis_query = nullptr; // I32 [2, n_tps, 1, n_stream]
         ggml_tensor *               qsa_vis_mask  = nullptr; // F16 [n_kv, 1, 1, 1]
+        ggml_tensor *               qsa_vis_kq_mask = nullptr; // F32 [n_kv, n_tps, 1, n_stream], gathered path only
+
+        ggml_tensor * build_qsa_vis_kq_mask();
 
         // QSA: token indices this layer's queries may attend to, or nullptr for dense
         ggml_tensor * build_qsa_top_k(
