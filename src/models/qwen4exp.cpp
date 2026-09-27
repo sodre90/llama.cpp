@@ -1442,6 +1442,35 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa_masked(
     return out;
 }
 
+// [TAG_QSA_DEVICE_VIS] the attention mask rebuilt on the device from the visibility tables, once
+// per graph: a cell is visible to a query of sequence sq when cell_idx[sq][cell] <= q. The host
+// then never fills the n_kv x n_tokens mask, which is O(n_kv) work per ubatch on the latency path
+ggml_tensor * llama_model_qwen4exp::graph::build_qsa_vis_kq_mask() {
+    if (qsa_vis_kq_mask != nullptr) {
+        return qsa_vis_kq_mask;
+    }
+
+    const int64_t n_tps    = qsa_vis_query->ne[1];
+    const int64_t n_stream = qsa_vis_query->ne[3];
+
+    // q_meta holds (sequence, causal index) per query
+    ggml_tensor * seq = ggml_cont(ctx0, ggml_view_4d(ctx0, qsa_vis_query, 1, n_tps, 1, n_stream,
+            qsa_vis_query->nb[1], qsa_vis_query->nb[2], qsa_vis_query->nb[3], 0));
+    ggml_tensor * q = ggml_cast(ctx0, ggml_view_4d(ctx0, qsa_vis_query, 1, n_tps, 1, n_stream,
+            qsa_vis_query->nb[1], qsa_vis_query->nb[2], qsa_vis_query->nb[3], qsa_vis_query->nb[0]), GGML_TYPE_F32);
+
+    // [n_kv, n_seq_max, 1, n_stream] -> [n_kv, n_tps, 1, n_stream]: each query's sequence row
+    ggml_tensor * cell_idx = ggml_get_rows(ctx0, qsa_vis_cells, ggml_reshape_3d(ctx0, seq, n_tps, 1, n_stream));
+
+    // integer-valued floats, so the clamp is 0 for a visible cell and 1 for a hidden one; the scale
+    // stays finite (no 0*inf nan) and the f16 cast after the gather turns it into -inf, as in the mask
+    ggml_tensor * ahead = ggml_sub(ctx0, ggml_cast(ctx0, cell_idx, GGML_TYPE_F32), q);
+
+    qsa_vis_kq_mask = ggml_scale(ctx0, ggml_clamp(ctx0, ahead, 0.0f, 1.0f), -1e30f);
+
+    return qsa_vis_kq_mask;
+}
+
 ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa_gathered(
         ggml_tensor * q_cur,
         ggml_tensor * k_cache,
@@ -1473,9 +1502,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa_gathered(
     // top_k still names masked cells when the cache holds fewer live cells than its budget, so the
     // mask travels through the same gather. [n_kv, n_tps, 1, n_stream] -> [1, n_kv, n_tps, n_stream]
     // puts the cells on the axis get_rows indexes and leaves a row per token to index it with.
-    ggml_tensor * mask_cells = ggml_view_4d(ctx0, kq_mask,
-            1, kq_mask->ne[0], n_tps, n_stream,
-            kq_mask->nb[0], kq_mask->nb[1], kq_mask->nb[3], 0);
+    ggml_tensor * mask_src = qsa_vis != nullptr ? build_qsa_vis_kq_mask() : kq_mask;
+
+    ggml_tensor * mask_cells = ggml_view_4d(ctx0, mask_src,
+            1, mask_src->ne[0], n_tps, n_stream,
+            mask_src->nb[0], mask_src->nb[1], mask_src->nb[3], 0);
 
     ggml_tensor * mask_sel = ggml_get_rows(ctx0, mask_cells,
             ggml_reshape_4d(ctx0, top_k, width, n_tps, n_stream, 1));

@@ -38,6 +38,8 @@ public:
     using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
 
     void reset() {
+        touch_all();
+
         for (uint32_t i = 0; i < pos.size(); ++i) {
             pos[i]   = -1;
             ext[i].reset();
@@ -169,6 +171,8 @@ public:
         for (uint32_t j = 0; j < other.pos.size(); ++j) {
             const auto idx = i + j;
 
+            touch(idx);
+
             if (pos[idx] == -1 && other.pos[j] != -1) {
                 used.insert(i + j);
             }
@@ -200,6 +204,8 @@ public:
         for (uint32_t j = 0; j < other.pos.size(); ++j) {
             const auto idx = idxs[j];
 
+            touch(idx);
+
             if (pos[idx] == -1 && other.pos[j] != -1) {
                 used.insert(idx);
             }
@@ -229,6 +235,8 @@ public:
         assert(i < pos.size());
         assert(pos[i] != -1);
 
+        touch(i);
+
         seq_pos_rm(i);
         seq[i].reset();
 
@@ -246,6 +254,8 @@ public:
         assert(seq[i].test(seq_id));
         assert(pos[i] != -1);
         assert(seq_id >= 0);
+
+        touch(i);
 
         seq[i].reset(seq_id);
         seq_pos_dec(seq_id, i);
@@ -266,6 +276,8 @@ public:
     // return true if the cell becomes empty (i.e. it did not contain seq_id before the call)
     bool seq_keep(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());
+
+        touch(i);
 
         if (seq[i].test(seq_id)) {
             seq_pos_rm(i);
@@ -349,6 +361,8 @@ public:
         assert(i < pos.size());
         assert(pos[i] != -1);
         assert(!seq[i].test(seq_id));
+
+        touch(i);
 
         seq[i].set(seq_id);
         seq_pos_inc(seq_id, i);
@@ -440,6 +454,8 @@ public:
         assert(pos[i] == -1);
         assert(seq[i].none());
 
+        touch(i);
+
         pos[i] = p;
 
         used.insert(i);
@@ -447,6 +463,7 @@ public:
 
     void ext_set(uint32_t i, llama_kv_cell_ext p) {
         assert(i < ext.size());
+        touch(i);
         ext[i] = p;
     }
 
@@ -456,6 +473,8 @@ public:
     bool pos_add(uint32_t i, llama_pos d) {
         assert(i < pos.size());
         assert(pos[i] != -1);
+
+        touch(i);
 
         seq_pos_rm(i);
 
@@ -488,6 +507,8 @@ public:
 
         const llama_pos p_old = pos[i];
 
+        touch(i);
+
         seq_pos_rm(i);
 
         pos[i]   /= d;
@@ -498,8 +519,39 @@ public:
         has_shift = true;
     }
 
+    // [TAG_KV_CELLS_JOURNAL] the cells changed since a reader's mark, so the reader can update what
+    // it derived from them instead of rescanning. nullptr when the journal no longer reaches back
+    // to the mark (overflow, reset); the reader then rebuilds and takes journal_end() as its mark
+    uint64_t journal_end() const {
+        return jn_first + jn.size();
+    }
+
+    const uint32_t * journal_since(uint64_t mark, size_t & n) const {
+        if (mark < jn_first || mark > journal_end()) {
+            return nullptr;
+        }
+        n = journal_end() - mark;
+        return jn.data() + (mark - jn_first);
+    }
+
 private:
     bool has_shift = false;
+
+    std::vector<uint32_t> jn;
+    uint64_t jn_first = 0;
+
+    void touch(uint32_t i) {
+        if (jn.size() >= 65536) {
+            touch_all();
+        }
+        jn.push_back(i);
+    }
+
+    // no reader mark stays valid
+    void touch_all() {
+        jn_first += jn.size() + 1;
+        jn.clear();
+    }
 
     // set of indices of used cells (i.e. pos[i] != -1, allowed to not have any seq_id)
     std::set<uint32_t> used;
