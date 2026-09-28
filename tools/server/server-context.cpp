@@ -2261,7 +2261,7 @@ private:
         // reset server kill-switch counter
         n_empty_consecutive = 0;
 
-        SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
+        SLT_INF(slot, "processing task %d, is_child = %d\n", slot.task->id, slot.task->is_child());
         return true;
     }
 
@@ -4571,7 +4571,7 @@ private:
                 const float * logits = llama_get_logits_ith(slot.ctx_tgt, tok_idx);
                 if (logits != nullptr && !std::isfinite(logits[id])) {
                     SLT_WRN(slot, "non-finite logits at n_gen = %d, n_tokens = %d, dropping the slot state and %zu checkpoints\n",
-                            slot.stats.n_gen, slot.prompt.n_tokens(), slot.prompt.checkpoints.size());
+                            (int) slot.stats.n_gen, slot.prompt.n_tokens(), slot.prompt.checkpoints.size());
                     slot.prompt_clear();
                     send_error(slot, "non-finite logits, the slot state was dropped, retry the request", ERROR_TYPE_SERVER);
                     slot.release();
@@ -4989,6 +4989,37 @@ void server_context::set_state_callback(server_state_callback_t callback) {
 // server_routes
 //
 
+// Claude Code: "<project>/<session id prefix>", from the working directory in its system prompt and its session header
+static std::string session_log_label(const std::map<std::string, std::string> & headers, const json & prompt) {
+    const auto is_session_header = [](const std::pair<const std::string, std::string> & header) {
+        static const std::string name = "x-claude-code-session-id";
+        return header.first.size() == name.size() && std::equal(name.begin(), name.end(), header.first.begin(),
+                [](char a, char b) { return a == std::tolower((unsigned char) b); });
+    };
+    const auto session = std::find_if(headers.begin(), headers.end(), is_session_header);
+
+    std::string project;
+    if (prompt.is_string()) {
+        static const std::string key = "Primary working directory: ";
+        const std::string text = prompt.get<std::string>();
+        const size_t pos = text.find(key);
+        if (pos != std::string::npos) {
+            const size_t start = pos + key.size();
+            std::string dir = text.substr(start, text.find_first_of("\r\n", start) - start);
+            while (dir.size() > 1 && dir.back() == '/') {
+                dir.pop_back();
+            }
+            project = std::filesystem::path(dir).filename().string();
+        }
+    }
+
+    std::string label = project;
+    if (session != headers.end() && !session->second.empty()) {
+        label += (label.empty() ? "" : "/") + session->second.substr(0, 8);
+    }
+    return label.empty() ? "-" : label;
+}
+
 std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const server_http_req & req,
             server_task_type type,
@@ -5010,6 +5041,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         std::vector<server_task> tasks;
 
         const auto & prompt = data.at("prompt");
+        const std::string log_label = session_log_label(req.headers, prompt);
         // TODO: this log can become very long, put it behind a flag or think about a more compact format
         //SRV_DBG("Prompt: %s\n", prompt.is_string() ? prompt.get<std::string>().c_str() : prompt.dump(2).c_str());
 
@@ -5062,6 +5094,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.res_type          = res_type;
             task.params.oaicompat_cmpl_id = completion_id;
             task.params.oaicompat_model   = meta->model_name;
+            task.params.log_label         = log_label;
 
             // prepare child tasks
             if (task.params.n_cmpl > 1) {

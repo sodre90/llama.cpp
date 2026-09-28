@@ -23,11 +23,11 @@
 
 using json = common_json;
 
-#define SLT_DBG(slot, fmt, ...) LOG_DBG("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
-#define SLT_TRC(slot, fmt, ...) LOG_TRC("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
-#define SLT_INF(slot, fmt, ...) LOG_INF("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
-#define SLT_WRN(slot, fmt, ...) LOG_WRN("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
-#define SLT_ERR(slot, fmt, ...) LOG_ERR("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
+#define SLT_DBG(slot, fmt, ...) LOG_DBG("slot %12.*s: id %2d | %s | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->params.log_label.c_str() : "-"), __VA_ARGS__)
+#define SLT_TRC(slot, fmt, ...) LOG_TRC("slot %12.*s: id %2d | %s | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->params.log_label.c_str() : "-"), __VA_ARGS__)
+#define SLT_INF(slot, fmt, ...) LOG_INF("slot %12.*s: id %2d | %s | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->params.log_label.c_str() : "-"), __VA_ARGS__)
+#define SLT_WRN(slot, fmt, ...) LOG_WRN("slot %12.*s: id %2d | %s | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->params.log_label.c_str() : "-"), __VA_ARGS__)
+#define SLT_ERR(slot, fmt, ...) LOG_ERR("slot %12.*s: id %2d | %s | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->params.log_label.c_str() : "-"), __VA_ARGS__)
 #define SLT_CNT(slot, fmt, ...) LOG_CNT(""                                 fmt,                                                                __VA_ARGS__)
 
 #define SRV_DBG(fmt, ...) LOG_DBG("srv  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
