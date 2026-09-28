@@ -1095,8 +1095,51 @@ void llama_memory_hybrid_idx::qsa_sync(
             }
         }
 
-        st.valid = keep && !need_blk_of && !st.ranked && !st.dup && !st.oor;
+        // LLAMA_QSA_NO_RANK_APPEND=1: a ranked state always rebuilds, as before
+        static const bool rank_append = getenv("LLAMA_QSA_NO_RANK_APPEND") == nullptr;
+
+        st.valid = keep && !need_blk_of && !st.dup && !st.oor && (rank_append || !st.ranked);
         st.mark  = cells.journal_end();
+    };
+
+    // [TAG_QSA_RANK_APPEND] with an image anywhere in the pool the state is ranked, and a decoded
+    // cell of a ranked sequence takes the next rank when it sorts after all its old cells. Else -1
+    auto rank_of_new = [&](int64_t j, int32_t key) -> int64_t {
+        const llama_seq_id sq = seq_present[key];
+        const llama_pos    p  = cells.pos_get(j);
+
+        if (!st.ranked_seqs.test(sq)) {
+            st.rank[j] = p;
+            return p;
+        }
+
+        const auto & sp = cells.seq_pos_cells(sq);
+        const auto   it = sp.find({p, (uint32_t) j});
+
+        if (it == sp.end() || (it != sp.begin() && std::prev(it)->first == p)) {
+            return -1;
+        }
+
+        // the cells after j have to be new as well, so no old cell changes its rank
+        int64_t n_after = 0;
+        for (auto nx = std::next(it); nx != sp.end(); ++nx, ++n_after) {
+            if (nx->first == p || nx->second >= n_kv || st.cell_key[nx->second] >= 0 || n_after >= 64) {
+                return -1;
+            }
+        }
+
+        auto & order = st.seq_order[sq];
+
+        const int64_t rank = (int64_t) sp.size() - 1 - n_after;
+
+        if (rank != (int64_t) order.size()) {
+            return -1;
+        }
+
+        order.push_back((int32_t) j);
+        st.rank[j] = (int32_t) rank;
+
+        return rank;
     };
 
     // a decode step adds a few cells to empty slots; anything else (a removal, a new shared
@@ -1113,10 +1156,13 @@ void llama_memory_hybrid_idx::qsa_sync(
             return false;
         }
 
+        // the journal can name a cell more than once; its first entry already saw the final state
+        std::vector<int32_t> added;
+
         for (size_t c = 0; c < n_changed; ++c) {
             const int64_t j = changed[c];
 
-            if (j >= n_kv) {
+            if (j >= n_kv || std::find(added.begin(), added.end(), (int32_t) j) != added.end()) {
                 continue;
             }
 
@@ -1130,7 +1176,14 @@ void llama_memory_hybrid_idx::qsa_sync(
                 return false;
             }
 
-            const int64_t idx = cells.pos_get(j);
+            const int64_t idx = st.ranked ? rank_of_new(j, key) : cells.pos_get(j);
+
+            if (idx < 0) {
+                return false;
+            }
+
+            added.push_back((int32_t) j);
+
             const int64_t pb  = bucket_of(idx);
 
             if (pb >= n_blocks || pb >= st.grp_ext[key]) {
@@ -1234,18 +1287,39 @@ void llama_memory_hybrid_idx::qsa_sync(
     // LLAMA_QSA_INPUT_CHECK=1 rebuilds after every in-place update and aborts on any difference
     static const bool check = getenv("LLAMA_QSA_INPUT_CHECK") != nullptr;
 
-    if (!update()) {
+    const bool in_place = update();
+
+    if (!in_place) {
         build();
     } else if (check) {
         const qsa_input_state upd = st;
 
         build();
 
-        const bool same = upd.cell_key == st.cell_key && upd.cell_idx == st.cell_idx && upd.bid_idx == st.bid_idx &&
+        bool same = upd.cell_key == st.cell_key && upd.cell_idx == st.cell_idx && upd.bid_idx == st.bid_idx &&
             upd.bid_cell == st.bid_cell && upd.bid_key == st.bid_key && upd.bid_pos == st.bid_pos &&
-            upd.bid_cells == st.bid_cells && upd.unpooled == st.unpooled && upd.pad == st.pad && upd.vis == st.vis;
+            upd.bid_cells == st.bid_cells && upd.unpooled == st.unpooled && upd.pad == st.pad && upd.vis == st.vis &&
+            upd.ranked == st.ranked && upd.ranked_seqs == st.ranked_seqs && (!st.ranked || upd.rank == st.rank);
+
+        for (int sq = 0; same && st.ranked && sq < LLAMA_MAX_SEQ; ++sq) {
+            same = !st.ranked_seqs.test(sq) || upd.seq_order[sq] == st.seq_order[sq];
+        }
 
         GGML_ASSERT(same && "qsa: in-place input update differs from a rebuild");
+    }
+
+    // a rebuild on every decode step costs host time per token that grows with the whole pool
+    static uint64_t n_sync    = 0;
+    static uint64_t n_rebuilt = 0;
+
+    n_sync++;
+    n_rebuilt += in_place ? 0 : 1;
+
+    const uint64_t n_log = check ? 256 : 4096;
+
+    if (n_sync % n_log == 0) {
+        LLAMA_LOG_WARN("qsa: input sync rebuilt %" PRIu64 " of the last %" PRIu64 " (ranked %d, n_kv %" PRId64 ")\n", n_rebuilt, n_log, st.ranked ? 1 : 0, n_kv);
+        n_rebuilt = 0;
     }
 
     st.synced      = true;
