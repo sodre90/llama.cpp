@@ -1463,8 +1463,8 @@ void llama_memory_hybrid_idx::set_input_qsa(
     GGML_ASSERT(blk_rows    == nullptr || (blk_rows->ne[0]    == n_blocks    && blk_rows->ne[1] == n_ns));
     GGML_ASSERT(scope_cells == nullptr || (blk_bias && n_ns == 1 && pooled_is_keyed_by_seq() &&
             scope_cells->ne[0] == r && scope_rows->ne[0] == scope_cells->ne[1]*scope_cells->ne[2] &&
-            scope_bias->ne[0] == scope_cells->ne[1] && scope_bias->ne[2] == scope_cells->ne[2] &&
-            scope_bias->ne[1]*scope_bias->ne[2] == n_tokens));
+            (scope_bias == nullptr || (scope_bias->ne[0] == scope_cells->ne[1] && scope_bias->ne[2] == scope_cells->ne[2] &&
+            scope_bias->ne[1]*scope_bias->ne[2] == n_tokens))));
 
     GGML_ASSERT(n_tokens % n_ns == 0);
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
@@ -1477,10 +1477,15 @@ void llama_memory_hybrid_idx::set_input_qsa(
     static const llama_qsa_device_inputs no_dev;
     const llama_qsa_device_inputs & tbl = dev != nullptr ? *dev : no_dev;
 
-    const bool dev_bias = tbl.blk_start != nullptr && tbl.blk_start->buffer != nullptr;
-    const bool dev_vis  = tbl.cell_idx  != nullptr && tbl.cell_idx->buffer  != nullptr;
+    const bool dev_bias  = tbl.blk_start   != nullptr && tbl.blk_start->buffer   != nullptr;
+    const bool dev_scope = tbl.scope_start != nullptr && tbl.scope_start->buffer != nullptr;
+    const bool dev_vis   = tbl.cell_idx    != nullptr && tbl.cell_idx->buffer    != nullptr;
 
-    GGML_ASSERT((dev_bias || bias != nullptr || scope_bias != nullptr) && "qsa: neither a bias input nor its tables");
+    GGML_ASSERT((dev_bias || dev_scope || bias != nullptr || scope_bias != nullptr) && "qsa: neither a bias input nor its tables");
+    GGML_ASSERT(!dev_scope || (scope_cells != nullptr && scope_bias == nullptr &&
+            tbl.scope_start->ne[0] == scope_cells->ne[1] && tbl.scope_start->ne[2] == scope_cells->ne[2] &&
+            tbl.scope_spare->ne[0] == scope_cells->ne[1] && tbl.scope_spare->ne[2] == scope_cells->ne[2] &&
+            tbl.tok_q->ne[1] == n_tps && tbl.tok_m->ne[1] == n_tps));
     GGML_ASSERT(!dev_bias || (blk_bias && tbl.blk_start->ne[0] == n_blocks && tbl.blk_start->ne[2] == n_ns &&
             tbl.blk_spare->ne[0] == n_blocks && tbl.blk_spare->ne[2] == n_ns &&
             tbl.tok_seq->ne[0] == n_tps && tbl.tok_seq->ne[1] == n_ns &&
@@ -1788,6 +1793,28 @@ void llama_memory_hybrid_idx::set_input_qsa(
                     for (int64_t k = 0; k < r; ++k) {
                         dst_cells[j*r + k] = src != nullptr ? src[k] : hidden;
                     }
+
+                    // [TAG_QSA_SCOPE_CHUNKS] the blk_start/blk_spare values of this block for this sequence
+                    if (dev_scope) {
+                        constexpr float never = 1e30f;
+
+                        float start = never;
+                        if (b >= 0 && b < n_bid) {
+                            if (cells.seq_has((uint32_t) bid_cell[b], seqs[v])) {
+                                start = (float) bid_idx[b];
+                            }
+                        } else if (b >= n_bid) {
+                            for (int64_t k = 0; k < r; ++k) {
+                                const int32_t c = src[k];
+                                if (c >= 0 && !cells.is_empty(c) && cells.seq_has(c, seqs[v])) {
+                                    start = std::min(start, (float) st.cell_idx[c]);
+                                }
+                            }
+                        }
+
+                        ((float *) tbl.scope_start->data)[v*n_blk + j] = start;
+                        ((float *) tbl.scope_spare->data)[v*n_blk + j] = b >= n_bid ? 1.0f : 0.0f;
+                    }
                 }
             }
 
@@ -1915,6 +1942,9 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
             if (dev_bias) {
                 ((int32_t *) tbl.tok_seq->data)[s*n_tps + ii] = (int32_t) seq_id;
+            }
+
+            if (dev_bias || dev_scope) {
                 ((float   *) tbl.tok_q->data)  [s*n_tps + ii] = (float) q;
                 ((float   *) tbl.tok_m->data)  [s*n_tps + ii] = (float) ((q + 1) % r);
             }

@@ -622,6 +622,10 @@ public:
             res &= dev.tok_q->ne[1]     == n_tps    && dev.tok_q->ne[2]     == n_stream;
             res &= dev.tok_m->ne[1]     == n_tps    && dev.tok_m->ne[2]     == n_stream;
         }
+        if (dev.scope_start != nullptr) {
+            res &= dev.tok_q->ne[1]     == n_tps    && dev.tok_q->ne[2]     == n_stream;
+            res &= dev.tok_m->ne[1]     == n_tps    && dev.tok_m->ne[2]     == n_stream;
+        }
         if (dev.cell_idx != nullptr) {
             res &= dev.cell_idx->ne[0]  == n_kv     && dev.cell_idx->ne[3]  == n_stream;
             res &= dev.q_meta->ne[1]    == n_tps    && dev.q_meta->ne[3]    == n_stream;
@@ -709,6 +713,16 @@ static bool qsa_block_top_k_enabled() {
 static bool qsa_seq_scope_enabled() {
     static const bool enabled = []() {
         const char * requested = getenv("LLAMA_QSA_SEQ_SCOPE");
+        return requested == nullptr || atoi(requested) != 0;
+    }();
+
+    return enabled;
+}
+
+// [TAG_QSA_SCOPE_CHUNKS] LLAMA_QSA_SCOPE_CHUNKS=0 scores the token chunks of a long ubatch against the whole pool again
+static bool qsa_scope_chunks_enabled() {
+    static const bool enabled = []() {
+        const char * requested = getenv("LLAMA_QSA_SCOPE_CHUNKS");
         return requested == nullptr || atoi(requested) != 0;
     }();
 
@@ -909,8 +923,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
         // [TAG_QSA_SEQ_SCOPE] a unified pool with keyed pooled rows and one decode-sized score
         qsa->n_seq_vis  = with_vis ? cparams.n_seq_max : 0;
+        const bool chunked = qsa_chunk_tokens(n_stream, n_tps);
+
+        // [TAG_QSA_DEVICE_INPUTS] scoring in token chunks is when the bias is large enough to
+        // matter, and a chunk is where the device can derive it; a decode ubatch keeps the direct
+        // upload, which is small and needs no extra kernels on the latency path
+        const bool device_bias = blk_bias && chunked && qsa_device_bias_enabled();
+
         qsa->scope_able = blk_bias && use_pooled && mctx_hyb->pooled_is_keyed_by_seq() && n_stream == 1 &&
-            !qsa_chunk_tokens(n_stream, n_tps) && qsa_seq_scope_enabled();
+            (!chunked || (device_bias && qsa_scope_chunks_enabled())) && qsa_seq_scope_enabled();
 
         uint32_t n_seq_scope = 0;
         const uint32_t n_blk_scope = qsa->scope_able ? mctx_hyb->qsa_scope_n_blocks(ubatch, (uint32_t) r, qsa->n_seq_vis, n_seq_scope) : 0;
@@ -923,19 +944,34 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         }
 
         if (scoped) {
-            static bool reported[9] = { false };
-            if (!reported[std::min<uint32_t>(n_seq_scope, 8)]) {
-                reported[std::min<uint32_t>(n_seq_scope, 8)] = true;
-                LLAMA_LOG_WARN("qsa: per-sequence scope, %u sequences x %u of %" PRId64 " blocks\n", n_seq_scope, n_blk_scope, n_blocks);
+            static bool reported[2][9] = { { false } };
+            if (!reported[chunked][std::min<uint32_t>(n_seq_scope, 8)]) {
+                reported[chunked][std::min<uint32_t>(n_seq_scope, 8)] = true;
+                LLAMA_LOG_WARN("qsa: per-sequence scope%s, %u sequences x %u of %" PRId64 " blocks\n",
+                        chunked ? " in token chunks" : "", n_seq_scope, n_blk_scope, n_blocks);
             }
 
             qsa->scope_rows  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) n_blk_scope*n_seq_scope);
             qsa->scope_cells = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, r, n_blk_scope, n_seq_scope);
-            qsa->scope_bias  = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_blk_scope, n_tokens/n_seq_scope, n_seq_scope);
 
             ggml_set_input(qsa->scope_rows);
             ggml_set_input(qsa->scope_cells);
-            ggml_set_input(qsa->scope_bias);
+
+            // [TAG_QSA_SCOPE_CHUNKS] a chunked ubatch derives its bias from per-block tables, as the whole-pool chunks do
+            if (device_bias) {
+                qsa->dev.scope_start = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_blk_scope, 1, n_seq_scope);
+                qsa->dev.scope_spare = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_blk_scope, 1, n_seq_scope);
+                qsa->dev.tok_q       = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_tps, n_stream);
+                qsa->dev.tok_m       = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_tps, n_stream);
+
+                ggml_set_input(qsa->dev.scope_start);
+                ggml_set_input(qsa->dev.scope_spare);
+                ggml_set_input(qsa->dev.tok_q);
+                ggml_set_input(qsa->dev.tok_m);
+            } else {
+                qsa->scope_bias = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_blk_scope, n_tokens/n_seq_scope, n_seq_scope);
+                ggml_set_input(qsa->scope_bias);
+            }
         }
 
         // blk_cells feeds the full-recompute pooling gather and the block-level top-k gather;
@@ -945,12 +981,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ggml_set_input(qsa->blk_cells);
         }
 
-        // [TAG_QSA_DEVICE_INPUTS] scoring in token chunks is when the bias is large enough to
-        // matter, and a chunk is where the device can derive it; a decode ubatch keeps the direct
-        // upload, which is small and needs no extra kernels on the latency path
-        const bool device_bias = blk_bias && qsa_chunk_tokens(n_stream, n_tps) && qsa_device_bias_enabled();
-
-        if (device_bias) {
+        if (device_bias && !scoped) {
             const int64_t n_seq_max = cparams.n_seq_max;
 
             qsa->dev.blk_start = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_blocks, n_seq_max, n_stream);
@@ -1194,12 +1225,47 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     if (blk_bias) {
         ggml_tensor * top_k = nullptr;
 
-        if (inp->scope_cells != nullptr) {
+        if (inp->scope_cells != nullptr && inp->scope_bias != nullptr) {
             // [TAG_QSA_SEQ_SCOPE] the tokens run per sequence, so sequence v's queries meet only its list
             const int64_t n_seq = inp->scope_cells->ne[2];
             const int64_t n_t   = n_tokens/n_seq;
 
             top_k = select_top_blocks(score_blocks(pooled, q, n_t), inp->scope_bias, inp->scope_cells, n_t);
+            top_k = ggml_reshape_4d(ctx0, top_k, width, n_tps, 1, n_stream);
+        } else if (inp->scope_cells != nullptr) {
+            // [TAG_QSA_SCOPE_CHUNKS] the token chunks below, with each sequence's run scored against its own list;
+            // the sequences take the place of the streams, and the bias is the same device rule on the listed blocks
+            const int64_t n_blk = inp->scope_cells->ne[1];
+            const int64_t n_seq = inp->scope_cells->ne[2];
+            const int64_t n_t   = n_tokens/n_seq;
+            const int64_t chunk = qsa_chunk_per_stream(n_seq);
+
+            ggml_tensor * q_dev = ggml_reshape_3d(ctx0, ggml_cont(ctx0, inp->dev.tok_q), 1, n_t, n_seq);
+            ggml_tensor * m_dev = ggml_reshape_3d(ctx0, ggml_cont(ctx0, inp->dev.tok_m), 1, n_t, n_seq);
+
+            for (int64_t t0 = 0; t0 < n_t; t0 += chunk) {
+                const int64_t n_c = std::min(chunk, n_t - t0);
+
+                ggml_tensor * q_t = qsa_token_range(ctx0, q, n_seq, n_t, t0, n_c);
+
+                ggml_tensor * tq = ggml_view_3d(ctx0, q_dev, 1, n_c, n_seq, q_dev->nb[1], q_dev->nb[2], t0*q_dev->nb[1]);
+                ggml_tensor * tm = ggml_view_3d(ctx0, m_dev, 1, n_c, n_seq, m_dev->nb[1], m_dev->nb[2], t0*m_dev->nb[1]);
+
+                ggml_tensor * start  = ggml_repeat_4d(ctx0, inp->dev.scope_start, n_blk, n_c, n_seq, 1);
+                ggml_tensor * ahead  = ggml_sub(ctx0, start, tq);
+                ggml_tensor * future = ggml_clamp(ctx0, ahead, 0.0f, 1.0f);
+                ggml_tensor * tail   = ggml_clamp(ctx0, ggml_add(ctx0, ahead, tm), 0.0f, 1.0f);
+                ggml_tensor * forced = ggml_add(ctx0, tail, inp->dev.scope_spare);
+                ggml_tensor * bias_t = ggml_add(ctx0, ggml_scale(ctx0, forced, 1e9f), ggml_scale(ctx0, future, -1e30f));
+
+                ggml_tensor * top_k_t = select_top_blocks(score_blocks(pooled, q_t, n_c), bias_t, inp->scope_cells, n_c);
+
+                // pin the graph order so each chunk's workspace is released before the next
+                ggml_build_forward_expand(gf, top_k_t);
+
+                top_k = top_k ? ggml_concat(ctx0, top_k, top_k_t, 1) : top_k_t;
+            }
+
             top_k = ggml_reshape_4d(ctx0, top_k, width, n_tps, 1, n_stream);
         } else if (qsa_chunk_tokens(n_stream, n_tps)) {
             // [TAG_QSA_TOKEN_CHUNKS] score a token range of every stream at a time; the chunks'
