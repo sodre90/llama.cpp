@@ -127,6 +127,10 @@ struct moe_cache {
     std::deque<upload_job>   todo;
     std::vector<upload_job>  done;
     bool                     stop = false;
+
+    // the worker's own stream per cache device: it queues a whole batch of copies and waits once,
+    // instead of one synchronous copy per slice
+    std::vector<std::pair<ggml_backend_buffer_type_t, ggml_backend_t>> upload_backends;
 };
 
 moe_cache * g_cache = nullptr;
@@ -210,14 +214,32 @@ void observe_device_routing(moe_cache & mc) {
     }
 }
 
-void upload_slice(ggml_tensor * dst_c, const ggml_tensor * src, int32_t expert, int32_t slot) {
+ggml_backend_t upload_backend_of(const moe_cache & mc, const ggml_tensor * dst_c) {
+    const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(dst_c->buffer);
+    for (const auto & ub : mc.upload_backends) {
+        if (ub.first == buft) {
+            return ub.second;
+        }
+    }
+    return nullptr;
+}
+
+// queued on the cache device's upload stream when it has one; the worker waits for the whole batch
+void upload_slice(const moe_cache & mc, ggml_tensor * dst_c, const ggml_tensor * src, int32_t expert, int32_t slot) {
     const size_t sz = src->nb[2];
     if ((size_t) slot*dst_c->nb[2] + sz > ggml_nbytes(dst_c) || (size_t) expert*sz + sz > ggml_nbytes(src)) {
         LLAMA_LOG_ERROR("moe-cache: bad upload %s <- %s expert=%d slot=%d sz=%zu dst_nb2=%zu dst_bytes=%zu src_bytes=%zu\n",
                 dst_c->name, src->name, expert, slot, sz, dst_c->nb[2], ggml_nbytes(dst_c), ggml_nbytes(src));
         return;
     }
-    ggml_backend_tensor_set(dst_c, (const char *) src->data + (size_t) expert*sz, (size_t) slot*dst_c->nb[2], sz);
+    const void * data   = (const char *) src->data + (size_t) expert*sz;
+    const size_t offset = (size_t) slot*dst_c->nb[2];
+
+    if (ggml_backend_t backend = upload_backend_of(mc, dst_c)) {
+        ggml_backend_tensor_set_async(backend, dst_c, data, offset, sz);
+    } else {
+        ggml_backend_tensor_set(dst_c, data, offset, sz);
+    }
 }
 
 // the device tables follow at the next flush_tables()
@@ -807,26 +829,44 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
             host_reads = "on, uncached experts are read in place from pinned host memory";
         }
 
+        for (ggml_backend_buffer_t buf : mc->bufs) {
+            const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU || ggml_backend_dev_buffer_type(dev) != buft) {
+                continue;
+            }
+            if (ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr)) {
+                mc->upload_backends.push_back({buft, backend});
+            }
+        }
+
         mc->worker = std::thread([mc]() {
             for (;;) {
-                upload_job j;
+                std::vector<upload_job> batch;
                 {
                     std::unique_lock<std::mutex> lk(mc->wmtx);
                     mc->wcv.wait(lk, [mc]() { return mc->stop || !mc->todo.empty(); });
                     if (mc->stop) {
                         return;
                     }
-                    j = mc->todo.front();
-                    mc->todo.pop_front();
+                    batch.assign(mc->todo.begin(), mc->todo.end());
+                    mc->todo.clear();
                 }
-                auto & ls = mc->layers[j.layer_idx];
-                upload_slice(ls.pub.up_c,   ls.pub.up_src,   j.expert, j.slot);
-                upload_slice(ls.pub.gate_c, ls.pub.gate_src, j.expert, j.slot);
-                upload_slice(ls.pub.down_c, ls.pub.down_src, j.expert, j.slot);
+                for (const auto & j : batch) {
+                    auto & ls = mc->layers[j.layer_idx];
+                    upload_slice(*mc, ls.pub.up_c,   ls.pub.up_src,   j.expert, j.slot);
+                    upload_slice(*mc, ls.pub.gate_c, ls.pub.gate_src, j.expert, j.slot);
+                    upload_slice(*mc, ls.pub.down_c, ls.pub.down_src, j.expert, j.slot);
+                }
+                for (const auto & ub : mc->upload_backends) {
+                    ggml_backend_synchronize(ub.second);
+                }
                 {
                     std::lock_guard<std::mutex> lk(mc->wmtx);
-                    j.done = true;
-                    mc->done.push_back(j);
+                    for (auto & j : batch) {
+                        j.done = true;
+                        mc->done.push_back(j);
+                    }
                 }
             }
         });
