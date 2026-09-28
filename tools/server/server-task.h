@@ -84,6 +84,7 @@ struct task_params {
     task_response_type res_type = TASK_RESPONSE_TYPE_NONE;
     std::string        oaicompat_model;
     std::string        oaicompat_cmpl_id;
+    std::string        log_label = "-"; // client session, shown in the slot logs
 
     // realtime control (SERVER_TASK_TYPE_CONTROL)
     std::string        control_action;
