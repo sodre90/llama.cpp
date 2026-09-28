@@ -19,6 +19,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -4563,6 +4564,20 @@ private:
             }
 
             slot.i_batch = -1;
+
+            // [TAG_NAN_GUARD] NaN logits mean the sequence state holds NaN, so every later token is the same pick
+            // (all-NaN top-k 20 samples token 14). Checkpoints taken after the NaN hold it too: drop them all.
+            if (!slot.task->params.sampling.backend_sampling) {
+                const float * logits = llama_get_logits_ith(slot.ctx_tgt, tok_idx);
+                if (logits != nullptr && !std::isfinite(logits[id])) {
+                    SLT_WRN(slot, "non-finite logits at n_gen = %d, n_tokens = %d, dropping the slot state and %zu checkpoints\n",
+                            slot.stats.n_gen, slot.prompt.n_tokens(), slot.prompt.checkpoints.size());
+                    slot.prompt_clear();
+                    send_error(slot, "non-finite logits, the slot state was dropped, retry the request", ERROR_TYPE_SERVER);
+                    slot.release();
+                    return;
+                }
+            }
 
             common_sampler_accept(slot.smpl.get(), id, true);
 
