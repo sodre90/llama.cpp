@@ -29,6 +29,8 @@
 //   tok_seq   I32 [n_tps, ns]            sequence of each token
 //   tok_q     F32 [1, n_tps, ns]         causal index of each token (its rank under an image, else its position)
 //   tok_m     F32 [1, n_tps, ns]         (q + 1) % ratio: how far the token's own incomplete block reaches back
+//   scope_start F32 [n_blk, 1, n_seq]    [TAG_QSA_SCOPE_CHUNKS] blk_start and blk_spare of each block on a
+//   scope_spare F32 [n_blk, 1, n_seq]    sequence's own list, for that sequence; +1e30 and 0 past the list
 //   cell_idx  I32 [n_kv, n_seq, 1, ns]   causal index of each cell per sequence, INT32_MAX when empty or foreign
 //   q_meta    I32 [2, n_tps, 1, ns]      (sequence, causal index) of each token
 //   zero_mask F16 [n_kv, 1, 1, 1]        the one mask row the attention op reads at visible cells
@@ -38,6 +40,9 @@ struct llama_qsa_device_inputs {
     ggml_tensor * tok_seq   = nullptr;
     ggml_tensor * tok_q     = nullptr;
     ggml_tensor * tok_m     = nullptr;
+
+    ggml_tensor * scope_start = nullptr;
+    ggml_tensor * scope_spare = nullptr;
 
     ggml_tensor * cell_idx  = nullptr;
     ggml_tensor * q_meta    = nullptr;
