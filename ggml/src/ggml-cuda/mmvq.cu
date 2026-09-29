@@ -623,8 +623,8 @@ static __device__ __forceinline__ uint32_t mmvq_expert_channel(
     return expert;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool row_segments = false, int rows_override = 0>
-__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool row_segments = false, int rows_override = 0, int warps_override = 0>
+__launch_bounds__((warps_override > 0 ? warps_override : calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters))*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -675,7 +675,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
-    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+    constexpr int nwarps = warps_override > 0 ? warps_override : calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
     // rows per block does not change the K split or the reduction, so the bits match the default
     constexpr int rows_per_cuda_block = rows_override > 0 ? rows_override : calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
@@ -1096,8 +1096,8 @@ template<ggml_type type>
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false,
-        const int rows_override = 0) {
-    const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+        const int rows_override = 0, const int warps_override = 0) {
+    const int nwarps = warps_override > 0 ? warps_override : calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
     const int rpb = rows_override > 0 ? rows_override : calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
@@ -1119,9 +1119,39 @@ static int mmvq_place_row_segments(mmvq_row_segments_args & segments, const int 
     return nblocks * rows_per_block;
 }
 
+static constexpr int mmvq_trim_warps = 4;
+
+static constexpr bool mmvq_trim_warps_supported(ggml_type type) {
+    return type == GGML_TYPE_IQ4_XS;
+}
+
+static bool ggml_cuda_mmvq_trim_warps() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MMVQ_TRIM_WARPS");
+        const bool on = env == nullptr || std::atoi(env) != 0;
+        GGML_LOG_WARN("ggml_cuda: mmvq trim warps: %s\n", on ? "on (IQ4_XS, 4 warps when K fits one pass)" : "off");
+        return on;
+    }();
+    return enabled;
+}
+
+bool ggml_cuda_mmvq_trim_warps_check_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_MMVQ_TRIM_WARPS_CHECK") != nullptr && std::atoi(getenv("GGML_CUDA_MMVQ_TRIM_WARPS_CHECK"));
+    return enabled;
+}
+
 static constexpr bool mmvq_multi_rows_supported(ggml_type type) {
     return type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q6_K ||
            type == GGML_TYPE_Q8_0   || type == GGML_TYPE_Q5_K   || type == GGML_TYPE_Q4_K;
+}
+
+static constexpr bool mmvq_multi_rows_default_type(ggml_type type) {
+    return type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q4_K;
+}
+
+static bool ggml_cuda_mmvq_multi_rows_all_types() {
+    static const bool all_types = getenv("GGML_CUDA_MMVQ_MULTI_ROWS_ALL_TYPES") != nullptr && std::atoi(getenv("GGML_CUDA_MMVQ_MULTI_ROWS_ALL_TYPES"));
+    return all_types;
 }
 
 static int ggml_cuda_mmvq_multi_rows() {
@@ -1188,6 +1218,55 @@ static void mmvq_multi_rows_check_report(const ggml_type type, const int ncols_x
     GGML_ASSERT(n_diff == 0);
 }
 
+static void mmvq_trim_warps_check_report(const ggml_type type, const int ncols_x, const int nrows_x, const int ncols_dst,
+        const int nchannels_dst, const int nsamples_dst, const int64_t n_diff) {
+    static std::atomic<int64_t> n_checked{0};
+    const int64_t n_seen = n_checked.fetch_add(1) + 1;
+    if (n_diff != 0 || n_seen % 1000 == 1) {
+        GGML_LOG_WARN("%s: %s [%d, %d] ncols=%d channels=%d samples=%d %" PRId64 " values differ (%" PRId64 " checked)\n", __func__,
+                ggml_type_name(type), ncols_x, nrows_x, ncols_dst, nchannels_dst, nsamples_dst, n_diff, n_seen);
+    }
+    GGML_ASSERT(n_diff == 0);
+}
+
+// copies dst to scratch, lets run_reference rewrite it there (segment dsts swapped for scratch) and counts the values whose bits differ
+template <typename run_reference_t>
+static int64_t mmvq_count_differing_bits_vs_reference(const run_reference_t & run_reference, float * dst, const mmvq_row_segments_args * segments,
+        const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_dst,
+        const int stride_col_dst, const int stride_channel_dst, const int stride_sample_dst, cudaStream_t stream) {
+    const int64_t dst_extent = (int64_t) (nsamples_dst - 1)*stride_sample_dst + (int64_t) (nchannels_dst - 1)*stride_channel_dst;
+    std::vector<mmvq_check_output> outputs;
+    if (segments) {
+        for (int s = 0; s < segments->n; ++s) {
+            outputs.push_back({segments->dst[s], (size_t) (dst_extent + (int64_t) ncols_dst*segments->nrows[s])});
+        }
+    } else {
+        outputs.push_back({dst, (size_t) (dst_extent + (int64_t) (ncols_dst - 1)*stride_col_dst + nrows_x)});
+    }
+
+    mmvq_row_segments_args segments_ref;
+    if (segments) {
+        segments_ref = *segments;
+    }
+    for (size_t k = 0; k < outputs.size(); ++k) {
+        mmvq_check_output & output = outputs[k];
+        CUDA_CHECK(cudaMalloc(&output.scratch, output.n*sizeof(float)));
+        CUDA_CHECK(cudaMemcpyAsync(output.scratch, output.dst, output.n*sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        if (segments) {
+            segments_ref.dst[k] = output.scratch;
+        }
+    }
+
+    run_reference(outputs[0].scratch, segments ? &segments_ref : nullptr);
+
+    int64_t n_diff = 0;
+    for (const mmvq_check_output & output : outputs) {
+        n_diff += mmvq_count_differing_bits(output.dst, output.scratch, output.n, stream);
+        CUDA_CHECK(cudaFree(output.scratch));
+    }
+    return n_diff;
+}
+
 bool ggml_cuda_q8_1_preq_check_enabled() {
     static const bool enabled = getenv("GGML_CUDA_Q8_1_PREQ_CHECK") != nullptr && std::atoi(getenv("GGML_CUDA_Q8_1_PREQ_CHECK"));
     return enabled;
@@ -1222,7 +1301,7 @@ static void mmvq_q8_1_preq_check(const ggml_tensor * src1, const void * cached, 
     GGML_ASSERT(n_diff == 0);
 }
 
-template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, int rows_override = 0>
+template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, int rows_override = 0, int warps_override = 0>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -1238,7 +1317,7 @@ static void mul_mat_vec_q_switch_fusion(
         if (segments) {
             GGML_ASSERT(!has_fusion && !ids);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, true, rows_override>, launch_params,
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, true, rows_override, warps_override>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, *segments, false);
@@ -1250,7 +1329,7 @@ static void mul_mat_vec_q_switch_fusion(
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, false, 0, warps_override>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, mmvq_no_row_segments{}, ids && ggml_cuda_moe_slot_major());
@@ -1261,7 +1340,7 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, false, rows_override>, launch_params,
+    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, false, rows_override, warps_override>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, mmvq_no_row_segments{}, ids && ggml_cuda_moe_slot_major());
@@ -1332,6 +1411,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
     constexpr int vdr                   = get_vdr_mmvq(type);
     const int     blocks_per_row_x      = ncols_x / qk;
     const int     blocks_per_iter_1warp = vdr * warp_size / qi;
+
+    // K fits one pass of the trimmed block, so the dropped warps only held zero partials
+    [[maybe_unused]] const bool trim_warps = mmvq_trim_warps_supported(type) && table_id == MMVQ_PARAMETERS_RDNA4 && !has_ids &&
+        calc_nwarps(type, 1, table_id) > mmvq_trim_warps && blocks_per_row_x <= mmvq_trim_warps * blocks_per_iter_1warp &&
+        ggml_cuda_mmvq_trim_warps();
 
     const auto should_use_small_k = [&](int c_ncols_dst) {
         // When K is small, increase rows_per_block to match nwarps so each warp has more work to do
@@ -1406,85 +1490,76 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const bool multi_col_small_k = table_id == MMVQ_PARAMETERS_RDNA4 && should_use_small_k(1);
     const auto launch_multi_col = [&](auto ncols_dst_tag) {
         constexpr int c_ncols_dst = decltype(ncols_dst_tag)::value;
-        const auto launch = [&](auto small_k_tag, auto rows_tag) {
+        const auto launch = [&](auto small_k_tag, auto rows_tag, auto warps_tag) {
             constexpr bool c_small_k = decltype(small_k_tag)::value;
             constexpr int  c_rows    = decltype(rows_tag)::value;
+            constexpr int  c_warps   = decltype(warps_tag)::value;
 
-            const auto run = [&](auto rows_run_tag, float * dst_run, const mmvq_row_segments_args * segments_run) {
-                constexpr int c_rows_run = decltype(rows_run_tag)::value;
+            const auto run = [&](auto rows_run_tag, auto warps_run_tag, float * dst_run, const mmvq_row_segments_args * segments_run) {
+                constexpr int c_rows_run  = decltype(rows_run_tag)::value;
+                constexpr int c_warps_run = decltype(warps_run_tag)::value;
                 mmvq_row_segments_args segments_launch;
                 if (segments_run) {
                     segments_launch = *segments_run;
                 }
                 const int rows_per_block = c_rows_run > 0 ? c_rows_run : calc_rows_per_block(c_ncols_dst, table_id, c_small_k,
-                    calc_nwarps(type, c_ncols_dst, table_id, c_small_k, false));
+                    c_warps_run > 0 ? c_warps_run : calc_nwarps(type, c_ncols_dst, table_id, c_small_k, false));
                 const int nrows_launch = segments_run ? mmvq_place_row_segments(segments_launch, rows_per_block) : nrows_x;
-                const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_launch, nchannels_dst, nsamples_dst, warp_size, table_id, c_small_k, false, c_rows_run);
-                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, false, c_rows_run>(vx, vy, ids, fusion, dst_run, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_launch, nchannels_dst, nsamples_dst, warp_size, table_id, c_small_k, false, c_rows_run, c_warps_run);
+                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, false, c_rows_run, c_warps_run>(vx, vy, ids, fusion, dst_run, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                      channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                      sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
                      dims.first, dims.second, 0, ids_stride, stream, segments_run ? &segments_launch : nullptr);
             };
 
-            run(rows_tag, dst, segments);
+            [[maybe_unused]] const auto count_differing_bits_vs_default = [&] {
+                return mmvq_count_differing_bits_vs_reference([&](float * dst_ref, const mmvq_row_segments_args * segments_ref) {
+                        run(std::integral_constant<int, 0>{}, std::integral_constant<int, 0>{}, dst_ref, segments_ref);
+                    }, dst, segments, c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, stride_col_dst, stride_channel_dst, stride_sample_dst, stream);
+            };
+
+            run(rows_tag, warps_tag, dst, segments);
 
             if constexpr (c_rows > 0) {
                 if (ggml_cuda_mmvq_multi_rows_check_enabled()) {
-                    const int64_t dst_extent = (int64_t) (nsamples_dst - 1)*stride_sample_dst + (int64_t) (nchannels_dst - 1)*stride_channel_dst;
-                    std::vector<mmvq_check_output> outputs;
-                    if (segments) {
-                        for (int s = 0; s < segments->n; ++s) {
-                            outputs.push_back({segments->dst[s], (size_t) (dst_extent + (int64_t) c_ncols_dst*segments->nrows[s])});
-                        }
-                    } else {
-                        outputs.push_back({dst, (size_t) (dst_extent + (int64_t) (c_ncols_dst - 1)*stride_col_dst + nrows_x)});
-                    }
-
-                    mmvq_row_segments_args segments_ref;
-                    if (segments) {
-                        segments_ref = *segments;
-                    }
-                    for (size_t k = 0; k < outputs.size(); ++k) {
-                        mmvq_check_output & output = outputs[k];
-                        CUDA_CHECK(cudaMalloc(&output.scratch, output.n*sizeof(float)));
-                        CUDA_CHECK(cudaMemcpyAsync(output.scratch, output.dst, output.n*sizeof(float), cudaMemcpyDeviceToDevice, stream));
-                        if (segments) {
-                            segments_ref.dst[k] = output.scratch;
-                        }
-                    }
-
-                    run(std::integral_constant<int, 0>{}, outputs[0].scratch, segments ? &segments_ref : nullptr);
-
-                    int64_t n_diff = 0;
-                    for (const mmvq_check_output & output : outputs) {
-                        n_diff += mmvq_count_differing_bits(output.dst, output.scratch, output.n, stream);
-                        CUDA_CHECK(cudaFree(output.scratch));
-                    }
-                    mmvq_multi_rows_check_report(type, ncols_x, nrows_x, c_ncols_dst, nchannels_dst, nsamples_dst, c_rows, n_diff);
+                    mmvq_multi_rows_check_report(type, ncols_x, nrows_x, c_ncols_dst, nchannels_dst, nsamples_dst, c_rows, count_differing_bits_vs_default());
+                }
+            }
+            if constexpr (c_warps > 0) {
+                if (ggml_cuda_mmvq_trim_warps_check_enabled()) {
+                    mmvq_trim_warps_check_report(type, ncols_x, nrows_x, c_ncols_dst, nchannels_dst, nsamples_dst, count_differing_bits_vs_default());
                 }
             }
         };
 
         if (multi_col_small_k) {
-            launch(std::true_type{}, std::integral_constant<int, 0>{});
+            launch(std::true_type{}, std::integral_constant<int, 0>{}, std::integral_constant<int, 0>{});
             return;
         }
+        if constexpr (mmvq_trim_warps_supported(type) && c_ncols_dst <= 4) {
+            if (trim_warps) {
+                launch(std::false_type{}, std::integral_constant<int, 0>{}, std::integral_constant<int, mmvq_trim_warps>{});
+                return;
+            }
+        }
         if constexpr (mmvq_multi_rows_supported(type) && c_ncols_dst >= 2 && c_ncols_dst <= 4) {
-            const int rows = ggml_cuda_mmvq_multi_rows();
+            const bool all_types = ggml_cuda_mmvq_multi_rows_all_types();
+            const bool allowed = all_types || (mmvq_multi_rows_default_type(type) && !segments);
+            const int rows = allowed ? ggml_cuda_mmvq_multi_rows() : 1;
             const bool divisible = segments ?
                 std::all_of(segments->nrows, segments->nrows + segments->n, [&](uint32_t n) { return n % rows == 0; }) : nrows_x % rows == 0;
             const int64_t total_rows = segments ? std::accumulate(segments->nrows, segments->nrows + segments->n, (int64_t) 0) : (int64_t) nrows_x;
             const bool enough_rows = total_rows >= ggml_cuda_mmvq_multi_rows_min_rows();
             if (table_id == MMVQ_PARAMETERS_RDNA4 && divisible && enough_rows && rows == 4) {
-                launch(std::false_type{}, std::integral_constant<int, 4>{});
+                launch(std::false_type{}, std::integral_constant<int, 4>{}, std::integral_constant<int, 0>{});
                 return;
             }
             if (table_id == MMVQ_PARAMETERS_RDNA4 && divisible && enough_rows && rows == 2) {
-                launch(std::false_type{}, std::integral_constant<int, 2>{});
+                launch(std::false_type{}, std::integral_constant<int, 2>{}, std::integral_constant<int, 0>{});
                 return;
             }
         }
-        launch(std::false_type{}, std::integral_constant<int, 0>{});
+        launch(std::false_type{}, std::integral_constant<int, 0>{}, std::integral_constant<int, 0>{});
     };
 
     switch (ncols_dst) {
@@ -1493,7 +1568,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             static constexpr int c_ncols_dst = 1;
 
             // Tag types keep the flags compile-time, so __launch_bounds__ matches what is launched.
-            const auto launch = [&](auto small_k_tag, auto halve_iters_tag) {
+            const auto launch = [&](auto small_k_tag, auto halve_iters_tag, auto warps_tag) {
                 constexpr bool c_small_k = decltype(small_k_tag)::value;
                 // Types the table does not promote would compile a second, identical kernel.
                 constexpr bool c_promoted =
@@ -1501,29 +1576,50 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_GB10, false, false);
 
                 constexpr bool c_halve_iters = decltype(halve_iters_tag)::value && c_promoted;
+                constexpr int  c_warps       = decltype(warps_tag)::value;
 
-                mmvq_row_segments_args segments_launch;
-                if (segments) {
-                    segments_launch = *segments;
+                const auto run = [&](auto warps_run_tag, float * dst_run, const mmvq_row_segments_args * segments_run) {
+                    constexpr int c_warps_run = decltype(warps_run_tag)::value;
+                    mmvq_row_segments_args segments_launch;
+                    if (segments_run) {
+                        segments_launch = *segments_run;
+                    }
+                    const int nrows_launch = segments_run ?
+                        mmvq_place_row_segments(segments_launch, calc_rows_per_block(c_ncols_dst, table_id, c_small_k,
+                            c_warps_run > 0 ? c_warps_run : calc_nwarps(type, c_ncols_dst, table_id, c_small_k, c_halve_iters))) : nrows_x;
+                    const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_launch, nchannels_dst + (fusion.shared_up != nullptr),
+                                                                                  nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters, 0, c_warps_run);
+                    mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters, 0, c_warps_run>(
+                        vx, vy, ids, fusion, dst_run, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                        channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
+                        stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
+                        stream, segments_run ? &segments_launch : nullptr);
+                };
+
+                run(warps_tag, dst, segments);
+
+                if constexpr (c_warps > 0) {
+                    if (ggml_cuda_mmvq_trim_warps_check_enabled()) {
+                        const int64_t n_diff = mmvq_count_differing_bits_vs_reference([&](float * dst_ref, const mmvq_row_segments_args * segments_ref) {
+                                run(std::integral_constant<int, 0>{}, dst_ref, segments_ref);
+                            }, dst, segments, c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, stride_col_dst, stride_channel_dst, stride_sample_dst, stream);
+                        mmvq_trim_warps_check_report(type, ncols_x, nrows_x, c_ncols_dst, nchannels_dst, nsamples_dst, n_diff);
+                    }
                 }
-                const int nrows_launch = segments ?
-                    mmvq_place_row_segments(segments_launch, calc_rows_per_block(c_ncols_dst, table_id, c_small_k,
-                        calc_nwarps(type, c_ncols_dst, table_id, c_small_k, c_halve_iters))) : nrows_x;
-                const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_launch, nchannels_dst + (fusion.shared_up != nullptr),
-                                                                              nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters);
-                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters>(
-                    vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
-                    channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
-                    stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
-                    stream, segments ? &segments_launch : nullptr);
             };
 
             if (should_use_small_k(c_ncols_dst)) {
-                launch(std::true_type{},  std::false_type{});
+                launch(std::true_type{},  std::false_type{}, std::integral_constant<int, 0>{});
             } else if (should_halve_iters()) {
-                launch(std::false_type{}, std::true_type{});
+                launch(std::false_type{}, std::true_type{}, std::integral_constant<int, 0>{});
             } else {
-                launch(std::false_type{}, std::false_type{});
+                if constexpr (mmvq_trim_warps_supported(type)) {
+                    if (trim_warps) {
+                        launch(std::false_type{}, std::false_type{}, std::integral_constant<int, mmvq_trim_warps>{});
+                        break;
+                    }
+                }
+                launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 0>{});
             }
         } break;
         case 2:

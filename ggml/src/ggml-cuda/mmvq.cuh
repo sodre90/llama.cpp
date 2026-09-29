@@ -10,6 +10,9 @@ bool ggml_cuda_mmvq_row_segments_supported(enum ggml_type type);
 // GGML_CUDA_MMVQ_MULTI_ROWS_CHECK=1 compares every multi-row launch against the one-row kernel on the host, which a captured graph cannot do
 bool ggml_cuda_mmvq_multi_rows_check_enabled();
 
+// GGML_CUDA_MMVQ_TRIM_WARPS_CHECK=1 compares every trimmed-block launch against the default block on the host, which a captured graph cannot do
+bool ggml_cuda_mmvq_trim_warps_check_enabled();
+
 // GGML_CUDA_Q8_1_PREQ_CHECK=1 compares every reused q8_1 copy against a fresh quantization on the host, which a captured graph cannot do
 bool ggml_cuda_q8_1_preq_check_enabled();
 
