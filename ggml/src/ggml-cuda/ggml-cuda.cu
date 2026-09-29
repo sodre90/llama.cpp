@@ -2898,8 +2898,26 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
+static bool ggml_cuda_graph_reinstantiate_enabled() {
+#ifdef GGML_USE_HIP
+    static const bool default_enabled = true;
+#else
+    static const bool default_enabled = false;
+#endif // GGML_USE_HIP
+    static const bool enabled = getenv("GGML_CUDA_GRAPH_REINSTANTIATE") != nullptr ? std::atoi(getenv("GGML_CUDA_GRAPH_REINSTANTIATE")) != 0 : default_enabled;
+    return enabled;
+}
+
 static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+
+    if (ggml_cuda_graph_reinstantiate_enabled()) {
+        // hipGraphExecUpdate is ~10x slower than a fresh instantiate for large graphs
+        CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+        graph->instance = nullptr;
+        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        return;
+    }
 
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
@@ -5539,8 +5557,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
-        }
-        if (cuda_graph_update_required) { // Update graph executable
+        } else if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
         // Launch graph
