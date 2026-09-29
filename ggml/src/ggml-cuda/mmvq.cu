@@ -1398,6 +1398,15 @@ static constexpr bool mmvq_multi_rows_default_type(ggml_type type) {
     return type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q4_K;
 }
 
+// fused gate/up/GLU kernels beyond one column are only built for the types tuned for RDNA4 multi-column decode
+static constexpr bool mmvq_fusion_ncols_supported(ggml_type type, int ncols_dst) {
+    return ncols_dst == 1 || (ncols_dst <= MMVQ_MAX_ROW_SEGMENT_COLS && mmvq_multi_rows_supported(type));
+}
+
+bool ggml_cuda_mmvq_glu_multi_type(ggml_type type) {
+    return mmvq_fusion_ncols_supported(type, MMVQ_MAX_ROW_SEGMENT_COLS);
+}
+
 static bool ggml_cuda_mmvq_multi_rows_all_types() {
     static const bool all_types = getenv("GGML_CUDA_MMVQ_MULTI_ROWS_ALL_TYPES") != nullptr && std::atoi(getenv("GGML_CUDA_MMVQ_MULTI_ROWS_ALL_TYPES"));
     return all_types;
@@ -1621,7 +1630,7 @@ static void mul_mat_vec_q_switch_fusion(
             GGML_ASSERT(block_dims.y == 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(prologue_block_nums, prologue_block_dims, nbytes_shared, stream);
             const mmvq_quant_prologue_args prologue{block_nums.x};
-            if constexpr (c_ncols_dst == 1) {
+            if constexpr (mmvq_fusion_ncols_supported(type, c_ncols_dst)) {
                 if (has_fusion) {
                     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, false, false, 0, 0, true>, launch_params,
                          vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
@@ -1630,7 +1639,7 @@ static void mul_mat_vec_q_switch_fusion(
                     return;
                 }
             }
-            GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
+            GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1, or up to MMVQ_MAX_ROW_SEGMENT_COLS for the RDNA4 multi-row types");
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, false, false, 0, 0, true>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -1640,10 +1649,10 @@ static void mul_mat_vec_q_switch_fusion(
     }
     GGML_ASSERT(!quant_prologue);
 
-    if constexpr (c_ncols_dst == 1) {
+    if constexpr (mmvq_fusion_ncols_supported(type, c_ncols_dst)) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, false, 0, warps_override>, launch_params,
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, false, rows_override, warps_override>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, mmvq_no_row_segments{}, ids && ggml_cuda_moe_slot_major(), mmvq_no_quant_prologue{});
@@ -1651,7 +1660,7 @@ static void mul_mat_vec_q_switch_fusion(
         }
     }
 
-    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
+    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1, or up to MMVQ_MAX_ROW_SEGMENT_COLS for the RDNA4 multi-row types");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, false, rows_override, warps_override>, launch_params,
@@ -2282,7 +2291,8 @@ void ggml_cuda_mul_mat_vec_q(
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
-        GGML_ASSERT(  ids || dst->ne[1] == 1 || (fusion->n_row_segments > 0 && dst->ne[1] <= MMVQ_MAX_ROW_SEGMENT_COLS));
+        GGML_ASSERT(  ids || dst->ne[1] == 1 || (fusion->n_row_segments > 0 && dst->ne[1] <= MMVQ_MAX_ROW_SEGMENT_COLS) ||
+                     (fusion->gate && !fusion->x_bias && !fusion->gate_bias && dst->ne[1] <= MMVQ_MAX_ROW_SEGMENT_COLS));
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);
