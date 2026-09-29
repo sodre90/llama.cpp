@@ -7,9 +7,6 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 // weight types whose single-token MUL_MATs can share one launch (ggml_cuda_mm_fusion_args_host::row_segment_nodes)
 bool ggml_cuda_mmvq_row_segments_supported(enum ggml_type type);
 
-// weight types with fused gate/up/GLU kernels for more than one token
-bool ggml_cuda_mmvq_glu_multi_type(enum ggml_type type);
-
 // GGML_CUDA_MMVQ_MULTI_ROWS_CHECK=1 compares every multi-row launch against the one-row kernel on the host, which a captured graph cannot do
 bool ggml_cuda_mmvq_multi_rows_check_enabled();
 
