@@ -87,8 +87,6 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <numeric>
-#include <cstring>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -2040,106 +2038,6 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
     return true;
 }
 
-static int ggml_cuda_mmvq_glu_multi_max_tokens() {
-    static const int max_tokens = [] {
-        const char * env = getenv("GGML_CUDA_MMVQ_GLU_MULTI");
-        const int n = env != nullptr && std::atoi(env) == 0 ? 1 : MMVQ_MAX_ROW_SEGMENT_COLS;
-        GGML_LOG_WARN("ggml_cuda: mmvq gate/up/GLU fusion: up to %d tokens\n", n);
-        return n;
-    }();
-    return max_tokens;
-}
-
-static bool ggml_cuda_mmvq_glu_multi_check_enabled() {
-    static const bool enabled = getenv("GGML_CUDA_MMVQ_GLU_MULTI_CHECK") != nullptr && std::atoi(getenv("GGML_CUDA_MMVQ_GLU_MULTI_CHECK"));
-    return enabled;
-}
-
-static bool ggml_cuda_mmvq_bad_padding_clear(const ggml_tensor * src0) {
-    return ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
-           ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
-}
-
-// the launch config and the GLU math are the unfused ones, so the bits match
-static bool ggml_cuda_should_fuse_mul_mat_vec_q_glu_multi(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu) {
-    const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
-    if (!GGML_CUDA_CC_IS_RDNA4(cc) || warp_size != 32) {
-        return false;
-    }
-    if (up->op != GGML_OP_MUL_MAT || gate->op != GGML_OP_MUL_MAT) {
-        return false;
-    }
-    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] == nullptr || ggml_get_op_params_i32(glu, 1) != 0) {
-        return false;
-    }
-    if (up->ne[1] < 2 || up->ne[1] > ggml_cuda_mmvq_glu_multi_max_tokens() || up->ne[2] != 1 || up->ne[3] != 1) {
-        return false;
-    }
-
-    const ggml_tensor * up_w   = up->src[0];
-    const ggml_tensor * gate_w = gate->src[0];
-    const ggml_tensor * src1   = up->src[1];
-    if (src1 != gate->src[1] || !ggml_cuda_mmvq_glu_multi_type(up_w->type) || gate_w->type != up_w->type ||
-            gate_w->ne[0] != up_w->ne[0] || gate_w->ne[1] != up_w->ne[1] || gate_w->nb[1] != up_w->nb[1]) {
-        return false;
-    }
-    if (src1->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 ||
-            !ggml_is_contiguous(up) || !ggml_is_contiguous(gate) || !ggml_is_contiguous(glu)) {
-        return false;
-    }
-    if (ggml_cuda_mmvq_bad_padding_clear(up_w) || ggml_cuda_mmvq_bad_padding_clear(gate_w)) {
-        return false;
-    }
-    // the unfused matmuls must dispatch to mmvq too, else the fusion changes the kernel family
-    if (ggml_cuda_should_use_mmvf(up_w->type, cc, up_w->ne, up_w->nb, src1->ne[1]) ||
-            ggml_cuda_should_use_mmf(up_w->type, cc, warp_size, up_w->ne, up_w->nb, src1->ne[1], /*mul_mat_id =*/ false) ||
-            !ggml_cuda_should_use_mmvq(up_w->type, cc, src1->ne[1])) {
-        return false;
-    }
-
-    const char * glu_begin  = (const char *) glu->data;
-    const char * src1_begin = (const char *) src1->data;
-    return glu_begin + ggml_nbytes(glu) <= src1_begin || src1_begin + ggml_nbytes(src1) <= glu_begin;
-}
-
-static void ggml_cuda_mmvq_glu_multi_check(ggml_backend_cuda_context & ctx, ggml_tensor * up, ggml_tensor * gate, ggml_tensor * glu,
-        const ggml_cuda_mm_fusion_args_host & fusion_data) {
-    static std::atomic<int64_t> n_checks[MMVQ_MAX_ROW_SEGMENT_COLS + 1];
-    static std::atomic<int64_t> n_differing[MMVQ_MAX_ROW_SEGMENT_COLS + 1];
-
-    cudaStream_t stream = ctx.stream();
-    const size_t n = ggml_nelements(glu);
-
-    ggml_cuda_mul_mat_vec_q(ctx, up->src[0], up->src[1], nullptr, glu, &fusion_data);
-    ggml_cuda_pool_alloc<float> fused_copy(ctx.pool(), n);
-    CUDA_CHECK(cudaMemcpyAsync(fused_copy.get(), glu->data, n*sizeof(float), cudaMemcpyDeviceToDevice, stream));
-
-    ggml_cuda_mul_mat_vec_q(ctx, gate->src[0], gate->src[1], nullptr, gate, nullptr);
-    ggml_cuda_mul_mat_vec_q(ctx, up->src[0], up->src[1], nullptr, up, nullptr);
-    // the reference must not claim a q8_1 slot, the down projection has to take the prologue as in the fused run
-    const ggml_tensor * saved_want_dst = ctx.q8_1_reuse.want_dst;
-    ctx.q8_1_reuse.want_dst = nullptr;
-    ggml_cuda_op_swiglu(ctx, glu);
-    ctx.q8_1_reuse.want_dst = saved_want_dst;
-
-    std::vector<float> host_fused(n);
-    std::vector<float> host_ref(n);
-    CUDA_CHECK(cudaMemcpyAsync(host_fused.data(), fused_copy.get(), n*sizeof(float), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(host_ref.data(), glu->data, n*sizeof(float), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    const int64_t n_differ = std::inner_product(host_fused.begin(), host_fused.end(), host_ref.begin(), (int64_t) 0,
-        std::plus<int64_t>(), [](float a, float b) { return std::memcmp(&a, &b, sizeof(float)) != 0; });
-
-    const int ncols = (int) up->ne[1];
-    const int64_t n_seen   = ++n_checks[ncols];
-    const int64_t n_differ_checks = n_differing[ncols] += n_differ != 0 ? 1 : 0;
-    if (n_differ != 0 || n_seen <= 3 || n_seen % 1000 == 0) {
-        GGML_LOG_WARN("mmvq_glu_multi_check: ncols=%d %s %" PRId64 " values differ (%" PRId64 " checks, %" PRId64 " differing)\n",
-            ncols, ggml_type_name(up->src[0]->type), n_differ, n_seen, n_differ_checks);
-    }
-}
-
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -2936,9 +2834,6 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         return false;
     }
     if (ggml_cuda_hc_post_norm_check_enabled()) {
-        return false;
-    }
-    if (ggml_cuda_mmvq_glu_multi_check_enabled()) {
         return false;
     }
     if (ggml_cuda_moe_reduce_add_check_enabled()) {
@@ -5564,24 +5459,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
-                fused_mul_mat_vec = true;
-                fused_node_count  = 3;
-                break;
-            }
-
-            if (ggml_cuda_should_fuse_mul_mat_vec_q_glu_multi(up, gate, glu)) {
-                ggml_cuda_mm_fusion_args_host fusion_data{};
-                fusion_data.gate      = gate->src[0];
-                fusion_data.x_node    = up;
-                fusion_data.gate_node = gate;
-                fusion_data.glu_op    = ggml_get_glu_op(glu);
-                fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
-
-                if (ggml_cuda_mmvq_glu_multi_check_enabled()) {
-                    ggml_cuda_mmvq_glu_multi_check(*cuda_ctx, up, gate, glu, fusion_data);
-                } else {
-                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
-                }
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
                 break;
