@@ -631,9 +631,23 @@ static __global__ void mul_mat_vec_q(
         uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
-        const uint32_t ids_stride, const mmvq_row_segments_param<row_segments> segments) {
+        const uint32_t ids_stride, const mmvq_row_segments_param<row_segments> segments, const bool slot_major) {
     uint32_t nrows_dst = stride_col_dst;
-    uint32_t block_row = blockIdx.x;
+    uint32_t block_x   = blockIdx.x;
+    uint32_t channel_dst = blockIdx.y;
+    if (slot_major && ids_ptr) {
+        const uint32_t bid = blockIdx.x + gridDim.x*blockIdx.y;
+        channel_dst = bid % gridDim.y;
+        block_x     = bid / gridDim.y;
+    }
+    const bool shared_expert = has_fusion && fusion.shared_up && channel_dst == gridDim.y - 1;
+    if (shared_expert) {
+        channel_dst = 0;
+        vx_ptr = fusion.shared_up;
+        dst_ptr = fusion.shared_dst;
+        stride_col_dst = fusion.shared_stride_col_dst;
+    }
+    uint32_t block_row = block_x;
     [[maybe_unused]] mmvq_row_epilogue epilogue = MMVQ_ROW_EPILOGUE_NONE;
     [[maybe_unused]] const float * epilogue_bias  = nullptr;
     [[maybe_unused]] const float * epilogue_scale = nullptr;
@@ -641,11 +655,11 @@ static __global__ void mul_mat_vec_q(
         static_assert(ncols_dst <= MMVQ_MAX_ROW_SEGMENT_COLS && !has_fusion, "row segments are plain matvecs of a few tokens");
 #pragma unroll
         for (int s = 0; s < MMVQ_MAX_ROW_SEGMENTS; ++s) {
-            if (blockIdx.x >= segments.first_block[s]) {
+            if (block_x >= segments.first_block[s]) {
                 vx_ptr         = segments.x[s];
                 dst_ptr        = segments.dst[s];
                 nrows_dst      = segments.nrows[s];
-                block_row      = blockIdx.x - segments.first_block[s];
+                block_row      = block_x - segments.first_block[s];
                 epilogue       = segments.epilogue[s];
                 epilogue_bias  = segments.bias[s];
                 epilogue_scale = segments.scale[s];
@@ -672,14 +686,6 @@ static __global__ void mul_mat_vec_q(
     const     int row0 = rows_per_cuda_block*block_row;
     const     int blocks_per_row_x = ncols_x / qk;
     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
-
-    const bool shared_expert = has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
-    const uint32_t channel_dst = shared_expert ? 0 : blockIdx.y;
-    if (shared_expert) {
-        vx_ptr = fusion.shared_up;
-        dst = fusion.shared_dst;
-        stride_col_dst = fusion.shared_stride_col_dst;
-    }
 
     uint32_t channel_x;
     uint32_t channel_y;
@@ -922,7 +928,7 @@ static __global__ void mul_mat_vec_q_moe(
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
         const uint32_t stride_row_x, const uint32_t stride_col_y, uint32_t stride_col_dst,
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
-        const uint32_t ncols_dst, const uint32_t ids_stride) {
+        const uint32_t ncols_dst, const uint32_t ids_stride, const bool slot_major) {
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
     float         * GGML_CUDA_RESTRICT dst = dst_ptr;
@@ -934,8 +940,18 @@ static __global__ void mul_mat_vec_q_moe(
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
-    const bool shared_expert = has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
+    const uint32_t token_idx   = threadIdx.y;
+    uint32_t block_x     = blockIdx.x;
+    uint32_t channel_dst = blockIdx.y;
+    if (slot_major) {
+        const uint32_t bid = blockIdx.x + gridDim.x*blockIdx.y;
+        channel_dst = bid % gridDim.y;
+        block_x     = bid / gridDim.y;
+    }
+
+    const bool shared_expert = has_fusion && fusion.shared_up && channel_dst == gridDim.y - 1;
     if (shared_expert) {
+        channel_dst = 0;
         vx_ptr = fusion.shared_up;
         dst = fusion.shared_dst;
         stride_col_dst = fusion.shared_stride_col_dst;
@@ -964,12 +980,9 @@ static __global__ void mul_mat_vec_q_moe(
         }
     }
 
-    const uint32_t token_idx   = threadIdx.y;
-    const int      row0        = c_rows_per_block*blockIdx.x;
+    const int      row0        = c_rows_per_block*block_x;
     const int      blocks_per_row_x = ncols_x / qk;
     constexpr int  blocks_per_iter  = vdr * warp_size / qi;
-
-    const uint32_t channel_dst = shared_expert ? 0 : blockIdx.y;
 
     if (token_idx >= ncols_dst) {
         return;
@@ -1129,6 +1142,16 @@ static int64_t ggml_cuda_mmvq_multi_rows_min_rows() {
     return min_rows;
 }
 
+static bool ggml_cuda_moe_slot_major() {
+    static const bool slot_major = [] {
+        const char * env = getenv("GGML_CUDA_MOE_SLOT_MAJOR");
+        const bool enabled = env == nullptr || std::atoi(env) != 0;
+        GGML_LOG_WARN("ggml_cuda: moe matvec block order: %s\n", enabled ? "slot-major" : "row-major");
+        return enabled;
+    }();
+    return slot_major;
+}
+
 bool ggml_cuda_mmvq_multi_rows_check_enabled() {
     static const bool enabled = getenv("GGML_CUDA_MMVQ_MULTI_ROWS_CHECK") != nullptr && std::atoi(getenv("GGML_CUDA_MMVQ_MULTI_ROWS_CHECK"));
     return enabled;
@@ -1218,7 +1241,7 @@ static void mul_mat_vec_q_switch_fusion(
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, true, rows_override>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, *segments);
+                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, *segments, false);
             return;
         }
     }
@@ -1230,7 +1253,7 @@ static void mul_mat_vec_q_switch_fusion(
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, mmvq_no_row_segments{});
+                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, mmvq_no_row_segments{}, ids && ggml_cuda_moe_slot_major());
             return;
         }
     }
@@ -1241,7 +1264,7 @@ static void mul_mat_vec_q_switch_fusion(
     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, false, rows_override>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, mmvq_no_row_segments{});
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, mmvq_no_row_segments{}, ids && ggml_cuda_moe_slot_major());
 }
 
 template <ggml_type type>
@@ -1261,19 +1284,20 @@ static void mul_mat_vec_q_moe_launch(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+    const bool slot_major = ggml_cuda_moe_slot_major();
 
     if (has_fusion) {
         ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true>, launch_params,
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
-            ncols_dst, ids_stride);
+            ncols_dst, ids_stride, slot_major);
     } else {
         ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false>, launch_params,
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
-            ncols_dst, ids_stride);
+            ncols_dst, ids_stride, slot_major);
     }
 }
 
