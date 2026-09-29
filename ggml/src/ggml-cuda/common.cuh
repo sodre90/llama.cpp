@@ -1486,7 +1486,7 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
-    // q8_1 copies of the last two src1 that mul_mat_vec_q quantized, so later nodes reading the same tensor skip the
+    // q8_1 copies of the last n_slots src1 that mul_mat_vec_q quantized, so later nodes reading the same tensor skip the
     // quantization; valid within one graph evaluation until a node writes over the tensor
     struct q8_1_reuse_state {
         struct slot {
@@ -1495,7 +1495,8 @@ struct ggml_backend_cuda_context {
             size_t              nbytes = 0;
         };
 
-        slot   slots[2];
+        slot   slots[3];
+        int    n_slots = 3;
         int    next    = 0; // the slot the next quantization overwrites
         size_t size    = 0; // of each slot
         bool   enabled = false;
@@ -1505,6 +1506,8 @@ struct ggml_backend_cuda_context {
         const ggml_tensor * want_dst    = nullptr;
         const ggml_tensor * want_src1   = nullptr;
         size_t              want_nbytes = 0;
+        int64_t             want_ne10        = 0;
+        int64_t             want_ne10_padded = 0;
         slot              * prequantized = nullptr;
 
         // keyed on the layout rather than the tensor, so the views of one tensor that different nodes read share it
@@ -1521,7 +1524,8 @@ struct ggml_backend_cuda_context {
         }
 
         slot * find(const ggml_tensor * src, size_t nbytes) {
-            for (slot & s : slots) {
+            for (int k = 0; k < n_slots; ++k) {
+                slot & s = slots[k];
                 if (s.src != nullptr && s.nbytes == nbytes && same_elements(s.src, src)) {
                     return &s;
                 }
@@ -1531,7 +1535,7 @@ struct ggml_backend_cuda_context {
 
         slot * claim(const ggml_tensor * src, size_t nbytes) {
             slot & s = slots[next];
-            next     = (next + 1) % 2;
+            next     = (next + 1) % n_slots;
             s.src    = src;
             s.nbytes = nbytes;
             return &s;
@@ -1548,12 +1552,21 @@ struct ggml_backend_cuda_context {
     ggml_cuda_conv_state_fold conv_state_fold;
 
     // where a kernel that writes dst may also write its q8_1 copy for the next mul_mat_vec_q, or nullptr;
-    // every 32-element block must fall into the lanes of one warp, so the rows are whole blocks
-    block_q8_1 * q8_1_prequantize_dst(const ggml_tensor * dst) {
+    // every 32-element block must fall into the lanes of one warp, so the rows are whole blocks;
+    // a producer that maps the padded row layout passes ne10 and ne10_padded, the others get nullptr for it
+    block_q8_1 * q8_1_prequantize_dst(const ggml_tensor * dst, int64_t * ne10 = nullptr, int64_t * ne10_padded = nullptr) {
         auto & reuse = q8_1_reuse;
         if (!reuse.enabled || curr_stream_no != 0 || dst != reuse.want_dst || !ggml_is_contiguous(dst) ||
             dst->ne[0] % QK8_1 != 0) {
             return nullptr;
+        }
+        const bool padded_rows = ggml_nrows(reuse.want_src1) > 1 && reuse.want_ne10_padded != reuse.want_ne10;
+        if (padded_rows && ne10_padded == nullptr) {
+            return nullptr;
+        }
+        if (ne10 != nullptr && ne10_padded != nullptr) {
+            *ne10        = reuse.want_ne10;
+            *ne10_padded = reuse.want_ne10_padded;
         }
         // registered once the node's own writes have been checked against the slots
         reuse.prequantized = reuse.claim(nullptr, 0);
