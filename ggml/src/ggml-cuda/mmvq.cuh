@@ -16,6 +16,19 @@ bool ggml_cuda_mmvq_trim_warps_check_enabled();
 // GGML_CUDA_Q8_1_PREQ_CHECK=1 compares every reused q8_1 copy against a fresh quantization on the host, which a captured graph cannot do
 bool ggml_cuda_q8_1_preq_check_enabled();
 
+// GGML_CUDA_HC_UP_PRE_CHECK=1 compares every fused hc up+pre launch against the unfused ops on the host, which a captured graph cannot do
+bool ggml_cuda_hc_up_pre_check_enabled();
+
+// whether hc_up would run as the one-warp small-K kernel with a single K pass, so the hc up+pre kernel can match it
+bool ggml_cuda_mmvq_hc_up_pre_supported(const ggml_tensor * w_up, int64_t ncols_dst, int cc);
+
+// the SCALE + SILU, hc up MUL_MAT and gated DSV4_HC_PRE nodes can run as one launch on this device
+bool ggml_cuda_hc_up_pre_supported(const ggml_tensor * scale_node, const ggml_tensor * mm_node, const ggml_tensor * pre_node, int cc);
+
+// writes pre_node from the three nodes, none of the intermediates
+void ggml_cuda_op_mul_mat_vec_q_hc_up_pre(ggml_backend_cuda_context & ctx,
+    const ggml_tensor * scale_node, const ggml_tensor * mm_node, ggml_tensor * pre_node);
+
 // Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,
 // based on the quantization type and GPU architecture (compute capability).
 int get_mmvq_mmid_max_batch(ggml_type type, int cc);

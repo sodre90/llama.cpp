@@ -2829,6 +2829,9 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     if (ggml_cuda_q8_1_preq_check_enabled()) {
         return false;
     }
+    if (ggml_cuda_hc_up_pre_check_enabled()) {
+        return false;
+    }
 
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
@@ -3816,6 +3819,83 @@ static bool ggml_cuda_should_fuse_dsv4_hc_post_rms_norm(const ggml_cgraph * cgra
            ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, 6, out_nodes, 2);
 }
 
+// SCALE -> UNARY SILU -> MUL_MAT by a quantized matrix -> gated DSV4_HC_PRE over a view of the MUL_MAT output, as
+// qwen4exp's build_hc_mix builds the hyper-connection mix, with only views between them; returns the index of the
+// DSV4_HC_PRE node, or -1
+static int ggml_cuda_match_dsv4_hc_up_pre(const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * scale = cgraph->nodes[node_idx];
+    if (scale->op != GGML_OP_SCALE) {
+        return -1;
+    }
+
+    const enum ggml_op wanted[] = { GGML_OP_UNARY, GGML_OP_MUL_MAT, GGML_OP_DSV4_HC_PRE };
+    const int max_nodes = 8;
+    int idxs[max_nodes];
+    enum ggml_op ops[max_nodes];
+    int count = 0;
+    const auto take = [&](int j) {
+        idxs[count] = j;
+        ops[count]  = cgraph->nodes[j]->op;
+        ++count;
+    };
+    take(node_idx);
+
+    int n_wanted = 0;
+    const ggml_tensor * tail = scale;
+    for (int j = node_idx + 1; j < std::min(cgraph->n_nodes, node_idx + max_nodes) && n_wanted < 3; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(node)) {
+            // the views of the MUL_MAT output are part of the fusion, the ones of other tensors stay outside it
+            if (n_wanted == 2 && node->src[0] == tail) {
+                take(j);
+                tail = node;
+            }
+            continue;
+        }
+        if (node->op != wanted[n_wanted]) {
+            return -1;
+        }
+        take(j);
+        tail = node;
+        ++n_wanted;
+    }
+    if (n_wanted < 3) {
+        return -1;
+    }
+
+    const int pre_idx = idxs[count - 1];
+    const ggml_tensor * unary = cgraph->nodes[idxs[1]];
+    const ggml_tensor * mm    = cgraph->nodes[idxs[2]];
+    const ggml_tensor * pre   = cgraph->nodes[pre_idx];
+    const ggml_tensor * xn    = pre->src[0];
+    const ggml_tensor * gate  = pre->src[1];
+    if (ggml_get_unary_op(unary) != GGML_UNARY_OP_SILU || unary->src[0] != scale || mm->src[1] != unary ||
+        !ggml_is_quantized(mm->src[0]->type) || ggml_get_op_params_i32(pre, 1) == 0 || xn == nullptr || gate != tail) {
+        return -1;
+    }
+    if ((gate != mm && gate->view_src != mm) || gate->view_offs != 0 || !ggml_is_contiguous(gate) ||
+        gate->ne[0] != xn->ne[0] || gate->ne[1] != xn->ne[1] || gate->ne[2] != xn->ne[2] || gate->ne[3] != 1 || xn->ne[3] != 1 ||
+        mm->ne[0] != xn->ne[0]*xn->ne[1] || mm->ne[1] != xn->ne[2] || mm->ne[2] != 1 || mm->ne[3] != 1 ||
+        scale->src[0]->ne[0] != mm->src[0]->ne[0]) {
+        return -1;
+    }
+
+    const int out_nodes[] = { pre_idx };
+    return ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, out_nodes, 1) ? pre_idx : -1;
+}
+
+// the match above when this device also runs it as one launch
+static int ggml_cuda_hc_up_pre_index(const ggml_cgraph * cgraph, int node_idx, int cc) {
+    const int pre_idx = ggml_cuda_match_dsv4_hc_up_pre(cgraph, node_idx);
+    if (pre_idx < 0) {
+        return -1;
+    }
+    const ggml_tensor * pre  = cgraph->nodes[pre_idx];
+    const ggml_tensor * gate = pre->src[1];
+    const ggml_tensor * mm   = gate->view_src ? gate->view_src : gate;
+    return ggml_cuda_hc_up_pre_supported(cgraph->nodes[node_idx], mm, pre, cc) ? pre_idx : -1;
+}
+
 // SIGMOID of one gate value per row -> MUL into the rows -> ADD of a same-shape tensor
 static bool ggml_cuda_should_fuse_sigmoid_mul_add(const ggml_cgraph * cgraph, int node_idx) {
     const std::initializer_list<enum ggml_op> ops = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
@@ -4386,6 +4466,8 @@ static bool ggml_cuda_get_rows_f16_cast_keeps_reads(const ggml_tensor * gather, 
     }
     return true;
 }
+
+static void ggml_cuda_q8_1_reuse_plan(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int node_idx);
 
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
@@ -5210,6 +5292,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    if (node->op == GGML_OP_SCALE) {
+        const int pre_idx = ggml_cuda_hc_up_pre_index(cgraph, i, ggml_cuda_info().devices[cuda_ctx->device].cc);
+        const int out_nodes[] = { pre_idx };
+        if (pre_idx >= 0 && ggml_cuda_check_fusion_memory_ranges(cgraph, i, pre_idx - i + 1, out_nodes, 1)) {
+            ggml_tensor * pre  = cgraph->nodes[pre_idx];
+            ggml_tensor * gate = pre->src[1];
+            // the q8_1 copy that the plan for this node meant for the SILU output now belongs to the output of the fused op
+            ggml_cuda_q8_1_reuse_plan(cuda_ctx, cgraph, pre_idx);
+            ggml_cuda_op_mul_mat_vec_q_hc_up_pre(*cuda_ctx, node, gate->view_src ? gate->view_src : gate, pre);
+            return pre_idx - i;
+        }
+    }
+
     if (ggml_cuda_should_fuse_dsv4_hc_post_rms_norm(cgraph, i)) {
         ggml_cuda_op_dsv4_hc_post_gated_rms_norm(*cuda_ctx, cgraph->nodes[i + 3], node, cgraph->nodes[i + 2],
                 cgraph->nodes[i + 4], cgraph->nodes[i + 5]);
@@ -5871,6 +5966,29 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             params->add_alloc_dep(params->user_data, post->src[1], mul);
             params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[0], mul);
             i += 5;
+        }
+
+        // the fused hc up+pre reads the down projection and the normed streams when it runs, so its output must not take over their memory
+        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        int n_hc_up_pre = 0;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const int pre_idx = ggml_cuda_hc_up_pre_index(cgraph, i, cc);
+            if (pre_idx < 0) {
+                continue;
+            }
+            ggml_tensor * pre = cgraph->nodes[pre_idx];
+            params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[0], pre);
+            params->add_alloc_dep(params->user_data, pre->src[0]->view_src ? pre->src[0]->view_src : pre->src[0], pre);
+            ++n_hc_up_pre;
+            i = pre_idx;
+        }
+
+        static int n_hc_up_pre_logged = 0;
+        static int n_hc_up_pre_last   = 0;
+        if (n_hc_up_pre != n_hc_up_pre_last && n_hc_up_pre_logged < 10) {
+            GGML_LOG_WARN("ggml_cuda: hc up+pre fused: %d matched\n", n_hc_up_pre);
+            ++n_hc_up_pre_logged;
+            n_hc_up_pre_last = n_hc_up_pre;
         }
     }
 

@@ -758,7 +758,7 @@ static __global__ void scale_unary_kernel(const float * x, float * dst, block_q8
     }
 
     ggml_cuda_pdl_sync();
-    const float y   = op(scale * x[i] + bias);
+    const float y   = ggml_cuda_scale_unary_single<op>(scale, x[i], bias);
     const float out = post_scale ? scale2 * y + bias2 : y;
     dst[i] = out;
     if (dst_q8_1 != nullptr) {
@@ -805,6 +805,11 @@ void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * sca
         default:
             GGML_ABORT("Unsupported unary op for fused scale+unary");
     }
+}
+
+void ggml_cuda_scale_silu_raw(const float * x, float * dst, block_q8_1 * dst_q8_1, float scale, float bias, int k,
+        int64_t ne10, int64_t ne10_padded, cudaStream_t stream) {
+    scale_unary_cuda<op_silu>(x, dst, dst_q8_1, scale, bias, nullptr, k, ne10, ne10_padded, stream);
 }
 
 // the product and the sum round separately, as the MUL and ADD kernels do

@@ -99,6 +99,10 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
 
 void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * unary_node, ggml_tensor * scale2_node);
 
+// SCALE + SILU on plain device buffers, for the hc up+pre fusion check; dst_q8_1 may be null
+void ggml_cuda_scale_silu_raw(const float * x, float * dst, block_q8_1 * dst_q8_1, float scale, float bias, int k,
+        int64_t ne10, int64_t ne10_padded, cudaStream_t stream);
+
 // add = addend + x * sigmoid(gate), one gate value per row of x
 void ggml_cuda_op_sigmoid_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * sigmoid_node, ggml_tensor * mul_node, ggml_tensor * add_node);
 
@@ -165,4 +169,10 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_clamp_single(float gate, fl
     up = fmaxf(fminf(up, limit), -limit);
 
     return ggml_cuda_op_silu_single(gate) * up;
+}
+
+// the SCALE + UNARY step of scale_unary_kernel, shared with the hc up+pre matvec so both round the same
+template <float (*op)(float)>
+static __device__ __forceinline__ float ggml_cuda_scale_unary_single(const float scale, const float x, const float bias) {
+    return op(scale * x + bias);
 }
