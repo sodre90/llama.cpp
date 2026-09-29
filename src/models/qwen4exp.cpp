@@ -1252,6 +1252,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ggml_tensor * q_dev = ggml_reshape_3d(ctx0, ggml_cont(ctx0, inp->dev.tok_q), 1, n_t, n_seq);
             ggml_tensor * m_dev = ggml_reshape_3d(ctx0, ggml_cont(ctx0, inp->dev.tok_m), 1, n_t, n_seq);
 
+            // build these before the chunks, so each chunk's score and bias nodes sit together in the graph
+            ggml_build_forward_expand(gf, q_dev);
+            ggml_build_forward_expand(gf, m_dev);
+
             for (int64_t t0 = 0; t0 < n_t; t0 += chunk) {
                 const int64_t n_c = std::min(chunk, n_t - t0);
 
