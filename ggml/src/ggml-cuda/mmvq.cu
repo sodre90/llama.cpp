@@ -630,6 +630,54 @@ static __device__ __forceinline__ uint32_t mmvq_expert_channel(
     return expert;
 }
 
+static __device__ __forceinline__ bool mmvq_expert_missed(const ggml_cuda_mm_fusion_args_device & fusion, const void * x_weights) {
+    return fusion.x_host != nullptr && x_weights == fusion.x_host;
+}
+
+// the channel of fill_x a missed expert is copied to, -1: read it in place
+static __device__ __forceinline__ int32_t mmvq_fill_channel(
+        const ggml_cuda_mm_fusion_args_device & fusion, const uint32_t channel_dst, const uint32_t token_idx) {
+    return fusion.fill_x != nullptr ? (int32_t) (channel_dst + token_idx*fusion.fill_pairs_per_token) : -1;
+}
+
+template <typename chunk_t>
+static __device__ __forceinline__ void mmvq_copy_chunks(char * dst, const char * src, const size_t nbytes, const int tid, const int nthreads) {
+    for (size_t i = tid; i < nbytes/sizeof(chunk_t); i += nthreads) {
+        ((chunk_t *) dst)[i] = ((const chunk_t *) src)[i];
+    }
+}
+
+// consecutive threads copy consecutive chunks, of the widest size the addresses and the length allow
+static __device__ __forceinline__ void mmvq_copy_bytes(char * dst, const char * src, const size_t nbytes, const int tid, const int nthreads) {
+    const size_t alignment = (size_t) dst | (size_t) src | nbytes;
+    if (alignment % 16 == 0) {
+        mmvq_copy_chunks<int4>(dst, src, nbytes, tid, nthreads);
+    } else if (alignment % 8 == 0) {
+        mmvq_copy_chunks<int2>(dst, src, nbytes, tid, nthreads);
+    } else if (alignment % 4 == 0) {
+        mmvq_copy_chunks<int>(dst, src, nbytes, tid, nthreads);
+    } else if (alignment % 2 == 0) {
+        mmvq_copy_chunks<short>(dst, src, nbytes, tid, nthreads);
+    } else {
+        mmvq_copy_chunks<char>(dst, src, nbytes, tid, nthreads);
+    }
+}
+
+// copies rows [row0, row0 + nrows) of an expert to a fill channel, without the rows past fill_nrows
+static __device__ __forceinline__ void mmvq_fill_rows(
+        const ggml_cuda_mm_fusion_args_device & fusion, char * fill_base, const void * src_base, const size_t block_bytes,
+        const uint32_t expert, const uint32_t fill_channel, const uint32_t row0, const uint32_t nrows,
+        const uint32_t stride_row_x, const uint32_t stride_channel_x, const int tid, const int nthreads) {
+    if (row0 >= fusion.fill_nrows) {
+        return;
+    }
+    const uint32_t nrows_copy = min(nrows, fusion.fill_nrows - row0);
+    const size_t offset_rows  = (size_t) row0*stride_row_x;
+    const size_t offset_src   = ((size_t) expert*stride_channel_x + offset_rows)*block_bytes;
+    const size_t offset_dst   = ((size_t) fill_channel*stride_channel_x + offset_rows)*block_bytes;
+    mmvq_copy_bytes(fill_base + offset_dst, (const char *) src_base + offset_src, (size_t) nrows_copy*stride_row_x*block_bytes, tid, nthreads);
+}
+
 // the small-K kernel with the q8_1 quantization of src1 as prologue: every warp of the block is one 1-warp small-K block of mul_mat_vec_q
 static constexpr int mmvq_quant_prologue_warps    = 4;
 static constexpr int mmvq_quant_prologue_max_k    = 1024;
@@ -832,7 +880,28 @@ static __global__ void mul_mat_vec_q(
     float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
 
     const void * x_weights = vx_ptr;
-    const uint32_t channel_w = ncols_dst == 1 && ids ? mmvq_expert_channel(fusion, channel_x, x_weights, vgate) : channel_x;
+    uint32_t channel_w = ncols_dst == 1 && ids ? mmvq_expert_channel(fusion, channel_x, x_weights, vgate) : channel_x;
+    if (ncols_dst == 1 && ids && mmvq_expert_missed(fusion, x_weights)) {
+        const int32_t fill_channel = mmvq_fill_channel(fusion, channel_dst, 0);
+        if (fill_channel >= 0) {
+            constexpr size_t block_bytes = ggml_cuda_type_traits<type>::bs;
+            constexpr int    nthreads    = nwarps*warp_size;
+            mmvq_fill_rows(fusion, fusion.fill_x, x_weights, block_bytes, channel_x, fill_channel, row0, rows_per_cuda_block,
+                stride_row_x, stride_channel_x, tid, nthreads);
+            if (use_gate) {
+                mmvq_fill_rows(fusion, fusion.fill_gate, vgate, block_bytes, channel_x, fill_channel, row0, rows_per_cuda_block,
+                    stride_row_x, stride_channel_x, tid, nthreads);
+            }
+            if constexpr (quant_prologue) {
+                __threadfence_block();
+            } else {
+                __syncthreads();
+            }
+            x_weights = fusion.fill_x;
+            vgate     = use_gate ? fusion.fill_gate : nullptr;
+            channel_w = fill_channel;
+        }
+    }
     const void * GGML_CUDA_RESTRICT vx = x_weights;
 
     const block_q8_1 * y = quant_prologue ? y_lds : ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
@@ -1058,7 +1127,23 @@ static __global__ void mul_mat_vec_q_moe(
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
     const void * x_weights = vx_ptr;
-    const uint32_t channel_w = mmvq_expert_channel(fusion, channel_x, x_weights, vgate);
+    uint32_t channel_w = mmvq_expert_channel(fusion, channel_x, x_weights, vgate);
+    if (mmvq_expert_missed(fusion, x_weights)) {
+        const int32_t fill_channel = mmvq_fill_channel(fusion, channel_dst, token_idx);
+        if (fill_channel >= 0) {
+            constexpr size_t block_bytes = ggml_cuda_type_traits<type>::bs;
+            mmvq_fill_rows(fusion, fusion.fill_x, x_weights, block_bytes, channel_x, fill_channel, row0, c_rows_per_block,
+                stride_row_x, stride_channel_x, threadIdx.x, warp_size);
+            if (use_gate) {
+                mmvq_fill_rows(fusion, fusion.fill_gate, vgate, block_bytes, channel_x, fill_channel, row0, c_rows_per_block,
+                    stride_row_x, stride_channel_x, threadIdx.x, warp_size);
+            }
+            __threadfence_block();
+            x_weights = fusion.fill_x;
+            vgate     = use_gate ? fusion.fill_gate : nullptr;
+            channel_w = fill_channel;
+        }
+    }
     const void * GGML_CUDA_RESTRICT vx = x_weights;
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
@@ -2140,6 +2225,38 @@ static bool ggml_cuda_mmvq_quant_prologue() {
     return enabled;
 }
 
+static bool ggml_cuda_moe_fill_scratch() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MOE_FILL_SCRATCH");
+        const bool on = env != nullptr && std::atoi(env) != 0;
+        GGML_LOG_WARN("ggml_cuda: moe fill scratch: %s\n", on ? "on" : "off");
+        return on;
+    }();
+    return enabled;
+}
+
+bool ggml_cuda_moe_fill_check_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_MOE_FILL_CHECK") != nullptr && std::atoi(getenv("GGML_CUDA_MOE_FILL_CHECK"));
+    return enabled;
+}
+
+// reruns the launch without fill into scratch and compares that with the filled result in dst
+static void mmvq_moe_fill_check(cudaStream_t stream, const ggml_tensor * src0, const ggml_tensor * ids, const ggml_tensor * dst,
+        const int64_t ncols_dst, const int64_t stride_col_dst, const int64_t stride_channel_dst, const int64_t stride_sample_dst,
+        const std::function<void(float *)> & launch_without_fill) {
+    const int64_t n_diff = mmvq_count_differing_bits_vs_reference([&](float * scratch, const mmvq_row_segments_args *) { launch_without_fill(scratch); },
+        (float *) dst->data, nullptr, ncols_dst, src0->ne[1], ids ? dst->ne[1] : dst->ne[2], dst->ne[3], stride_col_dst, stride_channel_dst, stride_sample_dst, stream);
+
+    static std::atomic<int64_t> n_checked_variant[MMVQ_MAX_BATCH_SIZE + 1];
+    static std::atomic<int64_t> n_differing_variant[MMVQ_MAX_BATCH_SIZE + 1];
+    const int64_t n_seen      = n_checked_variant[ncols_dst].fetch_add(1) + 1;
+    const int64_t n_differing = n_differing_variant[ncols_dst] += n_diff != 0 ? 1 : 0;
+    if (n_diff != 0 || n_seen % 1000 == 1) {
+        GGML_LOG_WARN("moe fill check: type=%s ncols=%d K=%d nrows=%d: %" PRId64 " values differ (%" PRId64 " checked, %" PRId64 " differing)\n",
+                ggml_type_name(src0->type), (int) ncols_dst, (int) src0->ne[0], (int) src0->ne[1], n_diff, n_seen, n_differing);
+    }
+}
+
 // the small-K decision of mul_mat_vec_q_switch_ncols_dst for one column, which RDNA4 applies to every column
 template <ggml_type type>
 static bool mmvq_small_k_one_col(const int cc, const mmvq_parameter_table_id table_id, const int ne00, const int warp_size) {
@@ -2459,6 +2576,20 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t f32_s12 = src1->nb[2] / ts_src1;
     const int64_t f32_s13 = src1->nb[3] / ts_src1;
 
+    ggml_cuda_pool_alloc<char> fill_scratch(ctx.pool());
+    if (ids && fusion_local.x_host != nullptr && ggml_cuda_moe_fill_scratch()) {
+        const size_t n_pairs       = ids->ne[0]*ids->ne[1];
+        const size_t region_bytes  = n_pairs*src0->nb[2];
+        fill_scratch.alloc(fusion_local.gate_host ? 2*region_bytes : region_bytes);
+        fusion_local.fill_x               = fill_scratch.get();
+        fusion_local.fill_gate            = fusion_local.gate_host ? fill_scratch.get() + region_bytes : nullptr;
+        fusion_local.fill_nrows           = ne01;
+        fusion_local.fill_pairs_per_token = ids->ne[0];
+    }
+    ggml_cuda_mm_fusion_args_device fusion_without_fill = fusion_local;
+    fusion_without_fill.fill_x    = nullptr;
+    fusion_without_fill.fill_gate = nullptr;
+
     if (segments.n > 0) {
         const auto launch_segments = [&](auto type_tag) {
             mul_mat_vec_q_switch_ncols_dst<decltype(type_tag)::value>(
@@ -2484,28 +2615,41 @@ void ggml_cuda_mul_mat_vec_q(
         return;
     }
 
-    const auto launch_matvec = [&](const void * vy, const int64_t col_y, const int64_t channel_y, const int64_t sample_y, float * dst_launch, const bool prologue) {
+    const auto launch_matvec = [&](const ggml_cuda_mm_fusion_args_device & launch_fusion, const void * vy, const int64_t col_y,
+            const int64_t channel_y, const int64_t sample_y, float * dst_launch, const bool prologue) {
         mul_mat_vec_q_switch_type(
-            src0->data, src0->type, vy, ids_d, fusion_local, dst_launch, ne00,
+            src0->data, src0->type, vy, ids_d, launch_fusion, dst_launch, ne00,
             ne01,              ncols_dst,     s01, col_y,     stride_col_dst,
             ne02, nchannels_y, nchannels_dst, s02, channel_y, stride_channel_dst,
             ne03,              ne3,           s03, sample_y,  s3,               ids_stride, stream, prologue);
     };
+    const bool fill_check = fusion_local.fill_x != nullptr && ggml_cuda_moe_fill_check_enabled();
 
     if (!quant_prologue) {
-        launch_matvec(src1_q8_1, stride_col_y, stride_channel_y, s13, dst_d, false);
+        launch_matvec(fusion_local, src1_q8_1, stride_col_y, stride_channel_y, s13, dst_d, false);
+        if (fill_check) {
+            mmvq_moe_fill_check(stream, src0, ids, dst, ncols_dst, stride_col_dst, stride_channel_dst, s3, [&](float * dst_ref) {
+                launch_matvec(fusion_without_fill, src1_q8_1, stride_col_y, stride_channel_y, s13, dst_ref, false);
+            });
+        }
         return;
     }
 
-    launch_matvec(src1_d, ids ? f32_s12 : f32_s11, ids ? f32_s11 : f32_s12, f32_s13, dst_d, true);
+    launch_matvec(fusion_local, src1_d, ids ? f32_s12 : f32_s11, ids ? f32_s11 : f32_s12, f32_s13, dst_d, true);
+
+    if (fill_check) {
+        mmvq_moe_fill_check(stream, src0, ids, dst, ncols_dst, stride_col_dst, stride_channel_dst, s3, [&](float * dst_ref) {
+            launch_matvec(fusion_without_fill, src1_d, ids ? f32_s12 : f32_s11, ids ? f32_s11 : f32_s12, f32_s13, dst_ref, true);
+        });
+    }
 
     if (ggml_cuda_mmvq_quant_prologue_check_enabled()) {
         mmvq_quant_prologue_check(ctx, src0, src1, ids, dst, ncols_dst, stride_col_dst, stride_channel_dst, s3, q8_1_nbytes,
             [&](const void * src1_q8_1_ref, float * dst_ref) {
-                launch_matvec(src1_q8_1_ref, stride_col_y, stride_channel_y, s13, dst_ref, false);
+                launch_matvec(fusion_local, src1_q8_1_ref, stride_col_y, stride_channel_y, s13, dst_ref, false);
             },
             [&](float * dst_fused) {
-                launch_matvec(src1_d, ids ? f32_s12 : f32_s11, ids ? f32_s11 : f32_s12, f32_s13, dst_fused, true);
+                launch_matvec(fusion_local, src1_d, ids ? f32_s12 : f32_s11, ids ? f32_s11 : f32_s12, f32_s13, dst_fused, true);
             });
     }
 }

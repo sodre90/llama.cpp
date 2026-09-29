@@ -22,6 +22,9 @@ bool ggml_cuda_q8_1_reuse_debug_enabled();
 // GGML_CUDA_MMVQ_QUANT_PROLOGUE_CHECK=1 compares every launch that quantizes src1 in the kernel against the quantize + matvec kernels on the host, which a captured graph cannot do
 bool ggml_cuda_mmvq_quant_prologue_check_enabled();
 
+// GGML_CUDA_MOE_FILL_CHECK=1 compares every MoE launch that fills missed experts against a launch that reads them in place, on the host, which a captured graph cannot do
+bool ggml_cuda_moe_fill_check_enabled();
+
 // GGML_CUDA_HC_UP_PRE_CHECK=1 compares every fused hc up+pre launch against the unfused ops on the host, which a captured graph cannot do
 bool ggml_cuda_hc_up_pre_check_enabled();
 

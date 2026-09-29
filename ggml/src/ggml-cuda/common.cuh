@@ -1765,6 +1765,11 @@ struct ggml_cuda_mm_fusion_args_device {
     const void    * gate_host      = nullptr;
     const int32_t * expert_slot    = nullptr;
     int32_t         n_expert_slots = 0;
+    // fill targets, in src0's layout: a missed expert is copied to channel (pair index) here before it is used
+    char          * fill_x               = nullptr;
+    char          * fill_gate            = nullptr;
+    uint32_t        fill_nrows           = 0;
+    uint32_t        fill_pairs_per_token = 0;
 };
 
 struct ggml_cuda_kernel_launch_params {
