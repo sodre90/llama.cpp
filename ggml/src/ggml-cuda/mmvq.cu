@@ -5,7 +5,10 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <type_traits>
+#include <vector>
 
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
 // has little exposed latency left to hide and the extra requests cost more than they save.
@@ -618,7 +621,7 @@ static __device__ __forceinline__ uint32_t mmvq_expert_channel(
     return expert;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool row_segments = false>
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool row_segments = false, int rows_override = 0>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -657,7 +660,8 @@ static __global__ void mul_mat_vec_q(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    // rows per block does not change the K split or the reduction, so the bits match the default
+    constexpr int rows_per_cuda_block = rows_override > 0 ? rows_override : calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
@@ -1076,9 +1080,10 @@ bool ggml_cuda_mmvq_row_segments_supported(ggml_type type) {
 template<ggml_type type>
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
-        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
+        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false,
+        const int rows_override = 0) {
     const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    const int rpb = rows_override > 0 ? rows_override : calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
@@ -1099,7 +1104,60 @@ static int mmvq_place_row_segments(mmvq_row_segments_args & segments, const int 
     return nblocks * rows_per_block;
 }
 
-template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false>
+static constexpr bool mmvq_multi_rows_supported(ggml_type type) {
+    return type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q6_K ||
+           type == GGML_TYPE_Q8_0   || type == GGML_TYPE_Q5_K   || type == GGML_TYPE_Q4_K;
+}
+
+static int ggml_cuda_mmvq_multi_rows() {
+    static const int rows = [] {
+        const char * env = getenv("GGML_CUDA_MMVQ_MULTI_ROWS");
+        if (env == nullptr) {
+            return 2;
+        }
+        const int value = std::atoi(env);
+        return value == 1 || value == 2 || value == 4 ? value : 1;
+    }();
+    return rows;
+}
+
+bool ggml_cuda_mmvq_multi_rows_check_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_MMVQ_MULTI_ROWS_CHECK") != nullptr && std::atoi(getenv("GGML_CUDA_MMVQ_MULTI_ROWS_CHECK"));
+    return enabled;
+}
+
+struct mmvq_check_output {
+    float * dst;
+    size_t  n;
+    float * scratch = nullptr;
+};
+
+static int64_t mmvq_count_differing_bits(const float * a, const float * b, const size_t n, cudaStream_t stream) {
+    std::vector<float> host_a(n);
+    std::vector<float> host_b(n);
+    CUDA_CHECK(cudaMemcpyAsync(host_a.data(), a, n*sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(host_b.data(), b, n*sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    int64_t n_diff = 0;
+    for (size_t k = 0; k < n; ++k) {
+        n_diff += memcmp(&host_a[k], &host_b[k], sizeof(float)) != 0;
+    }
+    return n_diff;
+}
+
+static void mmvq_multi_rows_check_report(const ggml_type type, const int ncols_x, const int nrows_x, const int ncols_dst,
+        const int nchannels_dst, const int nsamples_dst, const int rows, const int64_t n_diff) {
+    static std::atomic<int64_t> n_checked{0};
+    const int64_t n_seen = n_checked.fetch_add(1) + 1;
+    if (n_diff != 0 || n_seen % 1000 == 1) {
+        GGML_LOG_WARN("%s: %s x [%d, %d] ncols=%d channels=%d samples=%d R=%d %" PRId64 " values differ (%" PRId64 " checked)\n", __func__,
+                ggml_type_name(type), ncols_x, nrows_x, ncols_dst, nchannels_dst, nsamples_dst, rows, n_diff, n_seen);
+    }
+    GGML_ASSERT(n_diff == 0);
+}
+
+template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, int rows_override = 0>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -1115,7 +1173,7 @@ static void mul_mat_vec_q_switch_fusion(
         if (segments) {
             GGML_ASSERT(!has_fusion && !ids);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, true>, launch_params,
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, true, rows_override>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, *segments);
@@ -1138,7 +1196,7 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
+    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, false, rows_override>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, mmvq_no_row_segments{});
@@ -1282,26 +1340,83 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const bool multi_col_small_k = table_id == MMVQ_PARAMETERS_RDNA4 && should_use_small_k(1);
     const auto launch_multi_col = [&](auto ncols_dst_tag) {
         constexpr int c_ncols_dst = decltype(ncols_dst_tag)::value;
-        const auto launch = [&](auto small_k_tag) {
+        const auto launch = [&](auto small_k_tag, auto rows_tag) {
             constexpr bool c_small_k = decltype(small_k_tag)::value;
-            mmvq_row_segments_args segments_launch;
-            if (segments) {
-                segments_launch = *segments;
+            constexpr int  c_rows    = decltype(rows_tag)::value;
+
+            const auto run = [&](auto rows_run_tag, float * dst_run, const mmvq_row_segments_args * segments_run) {
+                constexpr int c_rows_run = decltype(rows_run_tag)::value;
+                mmvq_row_segments_args segments_launch;
+                if (segments_run) {
+                    segments_launch = *segments_run;
+                }
+                const int rows_per_block = c_rows_run > 0 ? c_rows_run : calc_rows_per_block(c_ncols_dst, table_id, c_small_k,
+                    calc_nwarps(type, c_ncols_dst, table_id, c_small_k, false));
+                const int nrows_launch = segments_run ? mmvq_place_row_segments(segments_launch, rows_per_block) : nrows_x;
+                const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_launch, nchannels_dst, nsamples_dst, warp_size, table_id, c_small_k, false, c_rows_run);
+                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, false, c_rows_run>(vx, vy, ids, fusion, dst_run, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                     sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                     dims.first, dims.second, 0, ids_stride, stream, segments_run ? &segments_launch : nullptr);
+            };
+
+            run(rows_tag, dst, segments);
+
+            if constexpr (c_rows > 0) {
+                if (ggml_cuda_mmvq_multi_rows_check_enabled()) {
+                    const int64_t dst_extent = (int64_t) (nsamples_dst - 1)*stride_sample_dst + (int64_t) (nchannels_dst - 1)*stride_channel_dst;
+                    std::vector<mmvq_check_output> outputs;
+                    if (segments) {
+                        for (int s = 0; s < segments->n; ++s) {
+                            outputs.push_back({segments->dst[s], (size_t) (dst_extent + (int64_t) c_ncols_dst*segments->nrows[s])});
+                        }
+                    } else {
+                        outputs.push_back({dst, (size_t) (dst_extent + (int64_t) (c_ncols_dst - 1)*stride_col_dst + nrows_x)});
+                    }
+
+                    mmvq_row_segments_args segments_ref;
+                    if (segments) {
+                        segments_ref = *segments;
+                    }
+                    for (size_t k = 0; k < outputs.size(); ++k) {
+                        mmvq_check_output & output = outputs[k];
+                        CUDA_CHECK(cudaMalloc(&output.scratch, output.n*sizeof(float)));
+                        CUDA_CHECK(cudaMemcpyAsync(output.scratch, output.dst, output.n*sizeof(float), cudaMemcpyDeviceToDevice, stream));
+                        if (segments) {
+                            segments_ref.dst[k] = output.scratch;
+                        }
+                    }
+
+                    run(std::integral_constant<int, 0>{}, outputs[0].scratch, segments ? &segments_ref : nullptr);
+
+                    int64_t n_diff = 0;
+                    for (const mmvq_check_output & output : outputs) {
+                        n_diff += mmvq_count_differing_bits(output.dst, output.scratch, output.n, stream);
+                        CUDA_CHECK(cudaFree(output.scratch));
+                    }
+                    mmvq_multi_rows_check_report(type, ncols_x, nrows_x, c_ncols_dst, nchannels_dst, nsamples_dst, c_rows, n_diff);
+                }
             }
-            const int nrows_launch = segments ?
-                mmvq_place_row_segments(segments_launch, calc_rows_per_block(c_ncols_dst, table_id, c_small_k,
-                    calc_nwarps(type, c_ncols_dst, table_id, c_small_k, false))) : nrows_x;
-            const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_launch, nchannels_dst, nsamples_dst, warp_size, table_id, c_small_k);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
-                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 dims.first, dims.second, 0, ids_stride, stream, segments ? &segments_launch : nullptr);
         };
+
         if (multi_col_small_k) {
-            launch(std::true_type{});
-        } else {
-            launch(std::false_type{});
+            launch(std::true_type{}, std::integral_constant<int, 0>{});
+            return;
         }
+        if constexpr (mmvq_multi_rows_supported(type) && c_ncols_dst >= 2 && c_ncols_dst <= 4) {
+            const int rows = ggml_cuda_mmvq_multi_rows();
+            const bool divisible = segments ?
+                std::all_of(segments->nrows, segments->nrows + segments->n, [&](uint32_t n) { return n % rows == 0; }) : nrows_x % rows == 0;
+            if (table_id == MMVQ_PARAMETERS_RDNA4 && divisible && rows == 4) {
+                launch(std::false_type{}, std::integral_constant<int, 4>{});
+                return;
+            }
+            if (table_id == MMVQ_PARAMETERS_RDNA4 && divisible && rows == 2) {
+                launch(std::false_type{}, std::integral_constant<int, 2>{});
+                return;
+            }
+        }
+        launch(std::false_type{}, std::integral_constant<int, 0>{});
     };
 
     switch (ncols_dst) {
