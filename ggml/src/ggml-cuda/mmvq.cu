@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "mmvf.cuh"
 #include "dsv4-hc.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
@@ -1153,15 +1154,73 @@ static constexpr int mmvq_hc_up_pre_max_hc  = 4;
 static_assert(mmvq_hc_up_pre_outputs % mmvq_hc_up_pre_warps == 0, "outputs must divide evenly between warps");
 static constexpr int mmvq_hc_up_pre_outputs_per_warp = mmvq_hc_up_pre_outputs / mmvq_hc_up_pre_warps;
 
+// the F32-accumulated BF16 matvec of mul_mat_vec_f with 256 threads, one row per group of 256 threads, two rows per block
+template <int ncols_dst>
+static __device__ __forceinline__ void mmvq_hc_inject_rows(
+        const nv_bfloat16 * inject_x, const float * inject_y, float * inject_dst, const int inject_nrows, const int inject_stride_row,
+        const int inject_stride_col_y, const int inject_stride_col_dst, const int inject_ncols, const int first_row) {
+    constexpr int block_size = 256;
+    constexpr int warp_size  = 32;
+    const int g   = threadIdx.y / (block_size/warp_size);
+    const int t   = (threadIdx.y % (block_size/warp_size))*warp_size + threadIdx.x;
+    const int row = first_row + g;
+
+    __shared__ float inject_buf[2][warp_size];
+    if (t < warp_size) {
+        inject_buf[g][t] = 0.0f;
+    }
+    __syncthreads();
+
+    float sumf[ncols_dst] = {0.0f};
+    const bool row_ok = row < inject_nrows;
+    if (row_ok) {
+        const int    * x2 = (const int *) (inject_x + (int64_t) row*inject_stride_row);
+        const float2 * y2 = (const float2 *) inject_y;
+        const int ncols2 = inject_ncols/2;
+        const int stride_col_y2 = inject_stride_col_y/2;
+#pragma unroll 4
+        for (int col2 = t; col2 < ncols2; col2 += block_size) {
+            const int tmpx = x2[col2];
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const float2 tmpy = y2[j*stride_col_y2 + col2];
+                const float tmpx0 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[0]);
+                const float tmpx1 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[1]);
+                ggml_cuda_mad(sumf[j], tmpx0, tmpy.x);
+                ggml_cuda_mad(sumf[j], tmpx1, tmpy.y);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
+        inject_buf[g][t/warp_size] = sumf[j];
+        __syncthreads();
+        if (t < warp_size) {
+            sumf[j] = inject_buf[g][t];
+            sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
+        }
+        __syncthreads();
+    }
+
+    if (row_ok && t < ncols_dst) {
+        inject_dst[t*inject_stride_col_dst + row] = sumf[t];
+    }
+}
+
 // SCALE + SILU of the hc down projection, the hc up matvec and the gated hc_pre in one launch: each warp takes two
 // output elements, and its lanes split K like the one-warp small-K kernel of mul_mat_vec_q, so every value matches the unfused ops
+// blocks past the hc blocks compute the BF16 inject matvec of the same hc mix (none when inject_x is null)
 template <ggml_type type, int ncols_dst>
 __launch_bounds__(mmvq_hc_up_pre_warps*32, 1)
 static __global__ void mul_mat_vec_q_hc_up_pre(
         const float * lo, const void * vx_ptr, const float * xn, float * dst, block_q8_1 * dst_q8_1,
         const float lo_scale, const float lo_bias, const float pre_scale,
         const int ncols_x, const int n_embd, const int hc, const int stride_row_x,
-        const int64_t sx0, const int64_t sx1, const int64_t sx2, const int64_t sd0, const int64_t sd1) {
+        const int64_t sx0, const int64_t sx1, const int64_t sx2, const int64_t sd0, const int64_t sd1,
+        const nv_bfloat16 * inject_x, const float * inject_y, float * inject_dst, const int inject_nrows, const int inject_stride_row,
+        const int inject_stride_col_y, const int inject_stride_col_dst, const int inject_ncols) {
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr = get_vdr_mmvq(type);
@@ -1181,6 +1240,13 @@ static __global__ void mul_mat_vec_q_hc_up_pre(
 
     ggml_cuda_pdl_lc();
     ggml_cuda_pdl_sync();
+
+    const int n_hc_blocks = n_embd / mmvq_hc_up_pre_outputs;
+    if (blockIdx.x >= n_hc_blocks) {
+        mmvq_hc_inject_rows<ncols_dst>(inject_x, inject_y, inject_dst, inject_nrows, inject_stride_row,
+            inject_stride_col_y, inject_stride_col_dst, inject_ncols, (blockIdx.x - n_hc_blocks)*2);
+        return;
+    }
 
     constexpr int max_rounds = (ncols_dst*(mmvq_hc_up_pre_max_k/QK8_1) + mmvq_hc_up_pre_warps - 1) / mmvq_hc_up_pre_warps;
     const int n_y_blocks = ncols_dst*y_blocks_per_col;
@@ -2422,6 +2488,16 @@ static bool ggml_cuda_hc_up_pre_fusion() {
     return enabled;
 }
 
+bool ggml_cuda_hc_inject_fusion_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_HC_INJECT_FUSION");
+        const bool on = env == nullptr || std::atoi(env) != 0;
+        GGML_LOG_WARN("ggml_cuda: hc inject fusion: %s\n", on ? "on" : "off");
+        return on;
+    }();
+    return enabled;
+}
+
 bool ggml_cuda_hc_up_pre_check_enabled() {
     static const bool enabled = getenv("GGML_CUDA_HC_UP_PRE_CHECK") != nullptr && std::atoi(getenv("GGML_CUDA_HC_UP_PRE_CHECK"));
     return enabled;
@@ -2471,17 +2547,21 @@ static void mmvq_hc_up_pre_launch(
         const float * lo, const void * vx, const float * xn, float * dst, block_q8_1 * dst_q8_1,
         const float lo_scale, const float lo_bias, const float pre_scale,
         const int ncols_x, const int n_embd, const int hc, const int stride_row_x,
-        const int64_t sx0, const int64_t sx1, const int64_t sx2, const int64_t sd0, const int64_t sd1, cudaStream_t stream) {
-    const dim3 block_nums(n_embd / mmvq_hc_up_pre_outputs, 1, 1);
+        const int64_t sx0, const int64_t sx1, const int64_t sx2, const int64_t sd0, const int64_t sd1,
+        const nv_bfloat16 * inject_x, const float * inject_y, float * inject_dst, const int inject_nrows, const int inject_stride_row,
+        const int inject_stride_col_y, const int inject_stride_col_dst, const int inject_ncols, cudaStream_t stream) {
+    const int n_inject_blocks = inject_x ? (inject_nrows + 1)/2 : 0;
+    const dim3 block_nums(n_embd / mmvq_hc_up_pre_outputs + n_inject_blocks, 1, 1);
     const dim3 block_dims(32, mmvq_hc_up_pre_warps, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
     ggml_cuda_kernel_launch(mul_mat_vec_q_hc_up_pre<GGML_TYPE_IQ4_NL, c_ncols_dst>, launch_params,
-        lo, vx, xn, dst, dst_q8_1, lo_scale, lo_bias, pre_scale, ncols_x, n_embd, hc, stride_row_x, sx0, sx1, sx2, sd0, sd1);
+        lo, vx, xn, dst, dst_q8_1, lo_scale, lo_bias, pre_scale, ncols_x, n_embd, hc, stride_row_x, sx0, sx1, sx2, sd0, sd1,
+        inject_x, inject_y, inject_dst, inject_nrows, inject_stride_row, inject_stride_col_y, inject_stride_col_dst, inject_ncols);
 }
 
 // runs the unfused SCALE + SILU, hc up matvec and gated hc_pre into scratch buffers and compares them with the fused outputs
 static void mmvq_hc_up_pre_check(ggml_backend_cuda_context & ctx, const ggml_tensor * scale_node, const ggml_tensor * mm_node,
-        const ggml_tensor * pre_node, const block_q8_1 * fused_q8_1) {
+        const ggml_tensor * pre_node, const block_q8_1 * fused_q8_1, const ggml_tensor * inject_node) {
     cudaStream_t stream = ctx.stream();
 
     const ggml_tensor * lo    = scale_node->src[0];
@@ -2537,6 +2617,15 @@ static void mmvq_hc_up_pre_check(ggml_backend_cuda_context & ctx, const ggml_ten
 
     const int64_t n_diff = mmvq_count_differing_bits((const float *) pre_node->data, pre_ref, nt*n_embd, stream);
 
+    int64_t n_diff_inject = 0;
+    if (inject_node != nullptr) {
+        ggml_cuda_pool_alloc<float> inject_ref(ctx.pool(), ggml_nelements(inject_node));
+        ggml_tensor inject_unfused = *inject_node;
+        inject_unfused.data = inject_ref.get();
+        ggml_cuda_mul_mat_vec_f(ctx, inject_node->src[0], inject_node->src[1], nullptr, &inject_unfused);
+        n_diff_inject = mmvq_count_differing_bits((const float *) inject_node->data, inject_ref.get(), ggml_nelements(inject_node), stream);
+    }
+
     int64_t n_diff_q8_1 = 0;
     if (fused_q8_1 != nullptr) {
         std::vector<char> host_fused(pre_q8_1_bytes);
@@ -2556,13 +2645,15 @@ static void mmvq_hc_up_pre_check(ggml_backend_cuda_context & ctx, const ggml_ten
 
     static std::atomic<int64_t> n_checked{0};
     static std::atomic<int64_t> n_checked_ncols[5];
+    static std::atomic<int64_t> n_checked_inject{0};
     const int64_t n_seen = n_checked.fetch_add(1) + 1;
     const bool first_of_ncols = n_checked_ncols[nt].fetch_add(1) == 0;
-    if (n_diff != 0 || n_diff_q8_1 != 0 || n_seen % 1000 == 1 || first_of_ncols) {
-        GGML_LOG_WARN("hc_up_pre_check: ncols=%d K=%d n_embd=%d %" PRId64 " values differ, %" PRId64 " q8_1 bytes differ (%" PRId64 " checked)\n",
-                (int) nt, (int) ncols_x, (int) n_embd, n_diff, n_diff_q8_1, n_seen);
+    const int64_t n_seen_inject = n_checked_inject.fetch_add(inject_node != nullptr) + (inject_node != nullptr);
+    if (n_diff != 0 || n_diff_q8_1 != 0 || n_diff_inject != 0 || n_seen % 1000 == 1 || first_of_ncols) {
+        GGML_LOG_WARN("hc_up_pre_check: ncols=%d K=%d n_embd=%d %" PRId64 " values differ, %" PRId64 " q8_1 bytes differ, inject %" PRId64 " values differ (%" PRId64 " checked, %" PRId64 " with inject)\n",
+                (int) nt, (int) ncols_x, (int) n_embd, n_diff, n_diff_q8_1, n_diff_inject, n_seen, n_seen_inject);
     }
-    GGML_ASSERT(n_diff == 0 && n_diff_q8_1 == 0);
+    GGML_ASSERT(n_diff == 0 && n_diff_q8_1 == 0 && n_diff_inject == 0);
 }
 
 void ggml_cuda_op_mul_mat_vec_q_hc_up_pre(ggml_backend_cuda_context & ctx,
@@ -2581,12 +2672,33 @@ void ggml_cuda_op_mul_mat_vec_q_hc_up_pre(ggml_backend_cuda_context & ctx,
 
     block_q8_1 * dst_q8_1 = ctx.q8_1_prequantize_dst(pre_node);
 
+    const ggml_tensor * inject_node = ctx.hc_inject_deferred;
+    ctx.hc_inject_deferred = nullptr;
+    const nv_bfloat16 * inject_x   = nullptr;
+    const float *       inject_y   = nullptr;
+    float *             inject_dst = nullptr;
+    int inject_nrows = 0, inject_stride_row = 0, inject_stride_col_y = 0, inject_stride_col_dst = 0, inject_ncols = 0;
+    if (inject_node != nullptr) {
+        const ggml_tensor * inject_w = inject_node->src[0];
+        const ggml_tensor * inject_in = inject_node->src[1];
+        GGML_ASSERT(inject_w->type == GGML_TYPE_BF16 && inject_in->data == xn->data && inject_in->ne[1] == nt);
+        inject_x              = (const nv_bfloat16 *) inject_w->data;
+        inject_y              = (const float *) inject_in->data;
+        inject_dst            = (float *) inject_node->data;
+        inject_nrows          = inject_w->ne[1];
+        inject_stride_row     = inject_w->nb[1] / sizeof(nv_bfloat16);
+        inject_stride_col_y   = inject_in->nb[1] / sizeof(float);
+        inject_stride_col_dst = inject_node->nb[1] / sizeof(float);
+        inject_ncols          = inject_w->ne[0];
+    }
+
     const auto launch = [&](auto ncols_tag) {
         mmvq_hc_up_pre_launch<decltype(ncols_tag)::value>(
             (const float *) lo->data, w_up->data, (const float *) xn->data, (float *) pre_node->data, dst_q8_1,
             scale[0], scale[1], pre_scale, ncols_x, n_embd, hc, w_up->nb[1] / ggml_type_size(w_up->type),
             xn->nb[0] / sizeof(float), xn->nb[1] / sizeof(float), xn->nb[2] / sizeof(float),
-            pre_node->nb[0] / sizeof(float), pre_node->nb[1] / sizeof(float), ctx.stream());
+            pre_node->nb[0] / sizeof(float), pre_node->nb[1] / sizeof(float),
+            inject_x, inject_y, inject_dst, inject_nrows, inject_stride_row, inject_stride_col_y, inject_stride_col_dst, inject_ncols, ctx.stream());
     };
 
     switch (nt) {
@@ -2608,6 +2720,6 @@ void ggml_cuda_op_mul_mat_vec_q_hc_up_pre(ggml_backend_cuda_context & ctx,
     }
 
     if (ggml_cuda_hc_up_pre_check_enabled()) {
-        mmvq_hc_up_pre_check(ctx, scale_node, mm_node, pre_node, dst_q8_1);
+        mmvq_hc_up_pre_check(ctx, scale_node, mm_node, pre_node, dst_q8_1, inject_node);
     }
 }

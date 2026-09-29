@@ -22,6 +22,9 @@ bool ggml_cuda_mmvq_quant_prologue_check_enabled();
 // GGML_CUDA_HC_UP_PRE_CHECK=1 compares every fused hc up+pre launch against the unfused ops on the host, which a captured graph cannot do
 bool ggml_cuda_hc_up_pre_check_enabled();
 
+// GGML_CUDA_HC_INJECT_FUSION=0 keeps the BF16 inject matvec of the hc mix out of the hc up+pre launch
+bool ggml_cuda_hc_inject_fusion_enabled();
+
 // whether hc_up would run as the one-warp small-K kernel with a single K pass, so the hc up+pre kernel can match it
 bool ggml_cuda_mmvq_hc_up_pre_supported(const ggml_tensor * w_up, int64_t ncols_dst, int cc);
 
