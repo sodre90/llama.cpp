@@ -1,5 +1,6 @@
 #include "mmvq.cuh"
 #include "mmvf.cuh"
+#include "convert.cuh"
 #include "dsv4-hc.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
