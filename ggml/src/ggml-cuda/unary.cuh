@@ -1,6 +1,8 @@
 #pragma once
 #include "common.cuh"
 
+#include <type_traits>
+
 #define CUDA_NEG_BLOCK_SIZE 256
 #define CUDA_STEP_BLOCK_SIZE 256
 #define CUDA_GELU_BLOCK_SIZE 256
@@ -106,6 +108,36 @@ __device__ __forceinline__ float ggml_cuda_op_sigmoid_single(float x) {
 
 __device__ __forceinline__ float ggml_cuda_op_softplus_single(float x) {
     return (x > 20.0f) ? x : logf(1.0f + expf(x));
+}
+
+// see ggml_cuda_mm_fusion_args_host::row_segments; a kernel parameter of its own, so the other launches' arguments stay small
+struct mmvq_row_segments_args {
+    int32_t           n                                  = 0;
+    const void *      x[MMVQ_MAX_ROW_SEGMENTS]           = {};
+    float *           dst[MMVQ_MAX_ROW_SEGMENTS]         = {};
+    uint32_t          nrows[MMVQ_MAX_ROW_SEGMENTS]       = {};
+    uint32_t          first_block[MMVQ_MAX_ROW_SEGMENTS] = {};
+    mmvq_row_epilogue epilogue[MMVQ_MAX_ROW_SEGMENTS]    = {};
+    const float *     bias[MMVQ_MAX_ROW_SEGMENTS]        = {};
+    const float *     scale[MMVQ_MAX_ROW_SEGMENTS]       = {};
+};
+
+struct mmvq_no_row_segments {};
+
+template <bool row_segments>
+using mmvq_row_segments_param = std::conditional_t<row_segments, mmvq_row_segments_args, mmvq_no_row_segments>;
+
+// the same expressions as the graph's ADD, SOFTPLUS + MUL and SIGMOID kernels, so fusing them changes no bits
+static __device__ __forceinline__ float ggml_cuda_apply_row_epilogue(
+        const float x, const mmvq_row_epilogue epilogue, const float * bias, const float * scale, const int row) {
+    switch (epilogue) {
+        case MMVQ_ROW_EPILOGUE_SIGMOID:
+            return ggml_cuda_op_sigmoid_single(x);
+        case MMVQ_ROW_EPILOGUE_SOFTPLUS_BIAS_SCALE:
+            return ggml_cuda_op_softplus_single(x + bias[row]) * scale[row];
+        default:
+            return x;
+    }
 }
 
 __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {

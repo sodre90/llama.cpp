@@ -7856,8 +7856,10 @@ struct test_moe_reduce : public test_case {
 
 // MUL_MATs of one input of a few tokens, adjacent in the graph as qwen4exp's GDN projections (one mmvq launch on CUDA);
 // with_tails: the last two continue with qwen4exp's beta (sigmoid) and gate (softplus(x + dt) * a) right behind them
+// type_tail: the type of the last two matrices (F32 ones run as their own mmvf launch)
 struct test_mul_mat_vec_row_segments : public test_case {
     const ggml_type type;
+    const ggml_type type_tail;
     const int64_t k;
     const std::array<int64_t, 4> rows;
     const bool with_tails;
@@ -7865,7 +7867,7 @@ struct test_mul_mat_vec_row_segments : public test_case {
     std::vector<ggml_tensor *> outputs;
 
     std::string vars() override {
-        return VARS_TO_STR5(type, k, rows, with_tails, n_tokens);
+        return VARS_TO_STR6(type, type_tail, k, rows, with_tails, n_tokens);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -7875,16 +7877,17 @@ struct test_mul_mat_vec_row_segments : public test_case {
 
     bool run_whole_graph() override { return true; }
 
-    test_mul_mat_vec_row_segments(ggml_type type, int64_t k, std::array<int64_t, 4> rows, bool with_tails, int64_t n_tokens = 1)
-        : type(type), k(k), rows(rows), with_tails(with_tails), n_tokens(n_tokens) {}
+    test_mul_mat_vec_row_segments(ggml_type type, int64_t k, std::array<int64_t, 4> rows, bool with_tails, int64_t n_tokens = 1,
+            ggml_type type_tail = GGML_TYPE_COUNT)
+        : type(type), type_tail(type_tail == GGML_TYPE_COUNT ? type : type_tail), k(k), rows(rows), with_tails(with_tails), n_tokens(n_tokens) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
         ggml_set_name(input, "input");
 
         std::vector<ggml_tensor *> projections;
-        for (const int64_t n : rows) {
-            ggml_tensor * weight = ggml_new_tensor_2d(ctx, type, k, n);
+        for (size_t i = 0; i < rows.size(); ++i) {
+            ggml_tensor * weight = ggml_new_tensor_2d(ctx, i < 2 ? type : type_tail, k, rows[i]);
             ggml_tensor * projection = ggml_mul_mat(ctx, weight, input);
             if (mode == MODE_TEST) {
                 ggml_build_forward_expand(gf, projection);
@@ -12111,6 +12114,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t n_tokens : {2, 4}) {
             test_cases.emplace_back(new test_mul_mat_vec_row_segments(GGML_TYPE_Q8_0, 2560, {10240, 6144, 48, 48}, with_tails, n_tokens));
             test_cases.emplace_back(new test_mul_mat_vec_row_segments(GGML_TYPE_Q8_0, 256,  {33, 1, 7, 64}, with_tails, n_tokens));
+        }
+        for (int64_t n_tokens : {1, 2, 3, 4}) {
+            test_cases.emplace_back(new test_mul_mat_vec_row_segments(GGML_TYPE_IQ4_XS, 2560, {10240, 6144, 48, 48}, with_tails, n_tokens, GGML_TYPE_F32));
+            test_cases.emplace_back(new test_mul_mat_vec_row_segments(GGML_TYPE_IQ4_XS, 256, {33, 1, 7, 64}, with_tails, n_tokens, GGML_TYPE_F32));
         }
     }
 
