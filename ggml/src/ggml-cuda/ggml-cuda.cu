@@ -2845,6 +2845,9 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     if (ggml_cuda_mmvq_quant_prologue_check_enabled()) {
         return false;
     }
+    if (ggml_cuda_moe_fill_check_enabled()) {
+        return false;
+    }
 
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
