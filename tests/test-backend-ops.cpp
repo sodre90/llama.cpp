@@ -2441,6 +2441,60 @@ struct test_get_rows : public test_case {
     }
 };
 
+// GGML_OP_GET_ROWS -> optional GGML_OP_RESHAPE -> GGML_OP_CPY to F16, as the QSA gather builds K, V and the mask; the CUDA
+// backend gathers straight into F16. Rows of src are [n, m, n_stream], the indices [k, n_stream].
+struct test_get_rows_cast_f16 : public test_case {
+    const ggml_type type;
+    const int64_t n;
+    const int64_t m;
+    const int64_t k;
+    const int64_t n_stream;
+    const bool reshape;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, n, m, k, n_stream, reshape);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GET_ROWS_CAST_F16";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_get_rows_cast_f16(ggml_type type, int64_t n, int64_t m, int64_t k, int64_t n_stream, bool reshape)
+        : type(type), n(n), m(m), k(k), n_stream(n_stream), reshape(reshape) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * src = ggml_new_tensor_3d(ctx, type, n, m, n_stream);
+        ggml_set_name(src, "src");
+        ggml_tensor * rows = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, k, n_stream);
+        ggml_set_name(rows, "rows");
+
+        ggml_tensor * gathered = ggml_get_rows(ctx, src, rows);
+        if (reshape) {
+            gathered = ggml_reshape_4d(ctx, gathered, n, k, 1, n_stream);
+        }
+        ggml_tensor * out = ggml_cast(ctx, gathered, GGML_TYPE_F16);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int32_t & row : data) {
+                    row = rand() % m;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GET_ROWS_BACK
 struct test_get_rows_back : public test_case {
     const ggml_type type;
@@ -10146,6 +10200,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+
+    test_cases.emplace_back(new test_get_rows_cast_f16(GGML_TYPE_Q8_0, 512, 64, 16, 2, true));
+    test_cases.emplace_back(new test_get_rows_cast_f16(GGML_TYPE_Q4_0, 512, 64, 16, 2, true));
+    test_cases.emplace_back(new test_get_rows_cast_f16(GGML_TYPE_F32, 1, 64, 16, 2, true));
+    test_cases.emplace_back(new test_get_rows_cast_f16(GGML_TYPE_F32, 512, 64, 8, 1, false));
+    test_cases.emplace_back(new test_get_rows_cast_f16(GGML_TYPE_Q8_0, 128, 33, 5, 3, false));
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
             for (bool v : {false, true}) {

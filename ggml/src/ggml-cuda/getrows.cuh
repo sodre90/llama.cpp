@@ -12,4 +12,7 @@ void get_rows_cuda(
 
 void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+// GET_ROWS to F32 followed by a contiguous F32 -> F16 CPY: writes the F16 values into the CPY destination
+void ggml_cuda_op_get_rows_f16_cast(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * cpy);
+
 void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
