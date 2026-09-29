@@ -1086,12 +1086,16 @@ static __global__ void mul_mat_vec_q_moe(
     }
 }
 
-static constexpr int mmvq_hc_up_pre_warps  = 32;
-static constexpr int mmvq_hc_up_pre_max_k  = 512;
-static constexpr int mmvq_hc_up_pre_max_hc = 4;
+static constexpr int mmvq_hc_up_pre_warps   = 16;
+static constexpr int mmvq_hc_up_pre_outputs = 32;
+static constexpr int mmvq_hc_up_pre_max_k   = 512;
+static constexpr int mmvq_hc_up_pre_max_hc  = 4;
 
-// SCALE + SILU of the hc down projection, the hc up matvec and the gated hc_pre in one launch: each warp takes one
-// output element, and its lanes split K like the one-warp small-K kernel of mul_mat_vec_q, so every value matches the unfused ops
+static_assert(mmvq_hc_up_pre_outputs % mmvq_hc_up_pre_warps == 0, "outputs must divide evenly between warps");
+static constexpr int mmvq_hc_up_pre_outputs_per_warp = mmvq_hc_up_pre_outputs / mmvq_hc_up_pre_warps;
+
+// SCALE + SILU of the hc down projection, the hc up matvec and the gated hc_pre in one launch: each warp takes two
+// output elements, and its lanes split K like the one-warp small-K kernel of mul_mat_vec_q, so every value matches the unfused ops
 template <ggml_type type, int ncols_dst>
 __launch_bounds__(mmvq_hc_up_pre_warps*32, 1)
 static __global__ void mul_mat_vec_q_hc_up_pre(
@@ -1108,7 +1112,7 @@ static __global__ void mul_mat_vec_q_hc_up_pre(
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
     __shared__ __align__(16) char y_lds_bytes[ncols_dst*(mmvq_hc_up_pre_max_k/QK8_1)*sizeof(block_q8_1)];
-    __shared__ float out_lds[ncols_dst][warp_size];
+    __shared__ float out_lds[ncols_dst][mmvq_hc_up_pre_outputs];
     block_q8_1 * y_lds = (block_q8_1 *) y_lds_bytes;
 
     const int lane = threadIdx.x;
@@ -1119,63 +1123,81 @@ static __global__ void mul_mat_vec_q_hc_up_pre(
     ggml_cuda_pdl_lc();
     ggml_cuda_pdl_sync();
 
-    for (int b = warp; b < ncols_dst*y_blocks_per_col; b += mmvq_hc_up_pre_warps) {
-        const int j  = b / y_blocks_per_col;
-        const int kb = b % y_blocks_per_col;
-        const float y = ggml_cuda_scale_unary_single<ggml_cuda_op_silu_single>(lo_scale, lo[(int64_t) j*ncols_x + kb*QK8_1 + lane], lo_bias);
-        quantize_q8_1_element(y, y_lds + j*y_blocks_per_col, kb*QK8_1 + lane);
+    constexpr int max_rounds = (ncols_dst*(mmvq_hc_up_pre_max_k/QK8_1) + mmvq_hc_up_pre_warps - 1) / mmvq_hc_up_pre_warps;
+    const int n_y_blocks = ncols_dst*y_blocks_per_col;
+    float y_round[max_rounds];
+#pragma unroll
+    for (int r = 0; r < max_rounds; ++r) {
+        const int b = warp + r*mmvq_hc_up_pre_warps;
+        y_round[r] = b < n_y_blocks ? lo[(int64_t) (b / y_blocks_per_col)*ncols_x + (b % y_blocks_per_col)*QK8_1 + lane] : 0.0f;
+    }
+#pragma unroll
+    for (int r = 0; r < max_rounds; ++r) {
+        const int b = warp + r*mmvq_hc_up_pre_warps;
+        if (b < n_y_blocks) {
+            const float y = ggml_cuda_scale_unary_single<ggml_cuda_op_silu_single>(lo_scale, y_round[r], lo_bias);
+            quantize_q8_1_element(y, y_lds + (b / y_blocks_per_col)*y_blocks_per_col, (b % y_blocks_per_col)*QK8_1 + lane);
+        }
     }
     __syncthreads();
 
     const void * GGML_CUDA_RESTRICT vx = vx_ptr;
-    const int i = blockIdx.x*mmvq_hc_up_pre_warps + warp;
 
     // the streams sit inside the K loop, as the rows of a block do in mul_mat_vec_q, so their loads go out together
-    float tmp[mmvq_hc_up_pre_max_hc][ncols_dst] = {{0.0f}};
+    float tmp[mmvq_hc_up_pre_outputs_per_warp][mmvq_hc_up_pre_max_hc][ncols_dst] = {{{0.0f}}};
 #pragma unroll 1
     for (int kbx = lane / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1);
         const int kqs = vdr * (lane % (qi/vdr));
 
 #pragma unroll
-        for (int c = 0; c < mmvq_hc_up_pre_max_hc; ++c) {
-            if (c < hc) {
-                const int kbx_offset = (c*n_embd + i)*stride_row_x;
+        for (int o = 0; o < mmvq_hc_up_pre_outputs_per_warp; ++o) {
+            const int i_o = blockIdx.x*mmvq_hc_up_pre_outputs + o*mmvq_hc_up_pre_warps + warp;
 #pragma unroll
-                for (int j = 0; j < ncols_dst; ++j) {
-                    tmp[c][j] += vec_dot_q_cuda(vx, &y_lds[j*y_blocks_per_col + kby], kbx_offset + kbx, kqs);
+            for (int c = 0; c < mmvq_hc_up_pre_max_hc; ++c) {
+                if (c < hc) {
+                    const int kbx_offset = (c*n_embd + i_o)*stride_row_x;
+#pragma unroll
+                    for (int j = 0; j < ncols_dst; ++j) {
+                        tmp[o][c][j] += vec_dot_q_cuda(vx, &y_lds[j*y_blocks_per_col + kby], kbx_offset + kbx, kqs);
+                    }
                 }
             }
         }
     }
 
-    float gate[mmvq_hc_up_pre_max_hc][ncols_dst];
 #pragma unroll
-    for (int c = 0; c < mmvq_hc_up_pre_max_hc; ++c) {
-#pragma unroll
-        for (int j = 0; j < ncols_dst; ++j) {
-            gate[c][j] = warp_reduce_sum<warp_size>(tmp[c][j]);
-        }
-    }
+    for (int o = 0; o < mmvq_hc_up_pre_outputs_per_warp; ++o) {
+        const int i_o = blockIdx.x*mmvq_hc_up_pre_outputs + o*mmvq_hc_up_pre_warps + warp;
 
+        float gate[mmvq_hc_up_pre_max_hc][ncols_dst];
 #pragma unroll
-    for (int j = 0; j < ncols_dst; ++j) {
-        float sum = 0.0f;
+        for (int c = 0; c < mmvq_hc_up_pre_max_hc; ++c) {
 #pragma unroll
-        for (int ih = 0; ih < mmvq_hc_up_pre_max_hc; ++ih) {
-            if (ih < hc) {
-                sum = ggml_cuda_dsv4_hc_pre_gated_step(sum, xn[i*sx0 + ih*sx1 + j*sx2], gate[ih][j]);
+            for (int j = 0; j < ncols_dst; ++j) {
+                gate[c][j] = warp_reduce_sum<warp_size>(tmp[o][c][j]);
             }
         }
-        if (lane == 0) {
-            out_lds[j][warp] = pre_scale * sum;
+
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int ih = 0; ih < mmvq_hc_up_pre_max_hc; ++ih) {
+                if (ih < hc) {
+                    sum = ggml_cuda_dsv4_hc_pre_gated_step(sum, xn[i_o*sx0 + ih*sx1 + j*sx2], gate[ih][j]);
+                }
+            }
+            if (lane == 0) {
+                out_lds[j][o*mmvq_hc_up_pre_warps + warp] = pre_scale * sum;
+            }
         }
     }
     __syncthreads();
 
     if (warp < ncols_dst) {
         const float   out = out_lds[warp][lane];
-        const int64_t ir  = (int64_t) blockIdx.x*mmvq_hc_up_pre_warps + lane;
+        const int64_t ir  = (int64_t) blockIdx.x*mmvq_hc_up_pre_outputs + lane;
         dst[ir*sd0 + warp*sd1] = out;
         if (dst_q8_1 != nullptr) {
             quantize_q8_1_element(out, dst_q8_1, warp*(int64_t) n_embd + ir);
@@ -2201,7 +2223,7 @@ bool ggml_cuda_hc_up_pre_supported(const ggml_tensor * scale_node, const ggml_te
     const int64_t nt     = xn->ne[2];
 
     return ggml_cuda_mmvq_hc_up_pre_supported(mm_node->src[0], nt, cc) &&
-        n_embd % mmvq_hc_up_pre_warps == 0 && hc >= 1 && hc <= mmvq_hc_up_pre_max_hc && xn->ne[3] == 1 && xn->type == GGML_TYPE_F32 &&
+        n_embd % mmvq_hc_up_pre_outputs == 0 && hc >= 1 && hc <= mmvq_hc_up_pre_max_hc && xn->ne[3] == 1 && xn->type == GGML_TYPE_F32 &&
         pre_node->type == GGML_TYPE_F32 && ggml_is_contiguous(pre_node) && pre_node->ne[0] == n_embd && pre_node->ne[1] == nt &&
         lo->type == GGML_TYPE_F32 && ggml_is_contiguous(lo) && lo->ne[0] == mm_node->src[0]->ne[0] && lo->ne[1] == nt && lo->ne[2] == 1 && lo->ne[3] == 1 &&
         mm_node->type == GGML_TYPE_F32 && ggml_is_contiguous(mm_node) && mm_node->ne[0] == n_embd*hc && mm_node->ne[1] == nt;
@@ -2213,7 +2235,7 @@ static void mmvq_hc_up_pre_launch(
         const float lo_scale, const float lo_bias, const float pre_scale,
         const int ncols_x, const int n_embd, const int hc, const int stride_row_x,
         const int64_t sx0, const int64_t sx1, const int64_t sx2, const int64_t sd0, const int64_t sd1, cudaStream_t stream) {
-    const dim3 block_nums(n_embd / mmvq_hc_up_pre_warps, 1, 1);
+    const dim3 block_nums(n_embd / mmvq_hc_up_pre_outputs, 1, 1);
     const dim3 block_dims(32, mmvq_hc_up_pre_warps, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
     ggml_cuda_kernel_launch(mul_mat_vec_q_hc_up_pre<GGML_TYPE_IQ4_NL, c_ncols_dst>, launch_params,
