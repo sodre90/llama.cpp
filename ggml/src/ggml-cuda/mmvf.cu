@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
+#include <type_traits>
 
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false, bool row_segments = false>
 static __global__ void mul_mat_vec_f(
@@ -770,6 +772,126 @@ static __global__ void mul_mat_vec_f_q8_0_rows(
     dst[tid*stride_col_dst + row] = sumf[tid];
 }
 
+// Same math as mul_mat_vec_f_q8_0_rows for rows_per_block rows per block, so the key loads of all rows are in flight together.
+// Per (row, column) the reduction tree is unchanged: warp reduce, LDS across warps (unused entries zero), warp reduce.
+// The LDS holds warp_size floats per (row, column). Rows past nrows repeat the last row and are not stored.
+template <int ncols_dst, int block_size, int rows_per_block>
+static __global__ void mul_mat_vec_f_q8_0_rows_multi(
+        const char * x, const int32_t * rows, const float * y, float * dst,
+        const int ncols2, const int nrows, const int64_t stride_row_bytes, const int stride_col_y2, const int stride_col_dst,
+        const int64_t stride_channel_y, const int64_t stride_channel_dst) {
+    const int row0    = blockIdx.x*rows_per_block;
+    const int channel = blockIdx.y;
+    const int tid     = threadIdx.x;
+
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    ggml_cuda_pdl_sync();
+
+    const block_q8_0 * xr[rows_per_block];
+#pragma unroll
+    for (int r = 0; r < rows_per_block; ++r) {
+        xr[r] = (const block_q8_0 *) (x + rows[int64_t(channel)*nrows + min(row0 + r, nrows - 1)]*stride_row_bytes);
+    }
+    const float2 * y2 = (const float2 *) (y + channel*stride_channel_y);
+    dst += channel*stride_channel_dst;
+
+    extern __shared__ char data_mmv[];
+    float * buf_iw = (float *) data_mmv;
+
+    if (block_size > warp_size) {
+        for (int i = tid; i < rows_per_block*ncols_dst*warp_size; i += block_size) {
+            buf_iw[i] = 0.0f;
+        }
+        __syncthreads();
+    }
+
+    float sumf[rows_per_block][ncols_dst] = {};
+
+#pragma unroll 2
+    for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+        const int iqs = 2*(col2 % (QK8_0/2));
+
+        float d[rows_per_block];
+        float qs0[rows_per_block];
+        float qs1[rows_per_block];
+#pragma unroll
+        for (int r = 0; r < rows_per_block; ++r) {
+            const block_q8_0 & b = xr[r][col2/(QK8_0/2)];
+            d[r]   = b.d;
+            qs0[r] = b.qs[iqs + 0];
+            qs1[r] = b.qs[iqs + 1];
+        }
+
+        float2 tmpy[ncols_dst];
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            tmpy[j] = y2[j*stride_col_y2 + col2];
+        }
+
+#pragma unroll
+        for (int r = 0; r < rows_per_block; ++r) {
+            float2 tmpx;
+            tmpx.x = qs0[r];
+            tmpx.y = qs1[r];
+            tmpx.x *= d[r];
+            tmpx.y *= d[r];
+
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                ggml_cuda_mad(sumf[r][j], tmpx.x, tmpy[j].x);
+                ggml_cuda_mad(sumf[r][j], tmpx.y, tmpy[j].y);
+            }
+        }
+    }
+
+    ggml_cuda_pdl_lc();
+#pragma unroll
+    for (int r = 0; r < rows_per_block; ++r) {
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            sumf[r][j] = warp_reduce_sum<warp_size>(sumf[r][j]);
+            if (block_size > warp_size) {
+                buf_iw[(r*ncols_dst + j)*warp_size + tid/warp_size] = sumf[r][j];
+            }
+        }
+    }
+
+    if (block_size > warp_size) {
+        __syncthreads();
+        if (tid < warp_size) {
+#pragma unroll
+            for (int r = 0; r < rows_per_block; ++r) {
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    sumf[r][j] = warp_reduce_sum<warp_size>(buf_iw[(r*ncols_dst + j)*warp_size + tid]);
+                }
+            }
+        }
+    }
+
+    if (tid >= ncols_dst) {
+        return;
+    }
+
+#pragma unroll
+    for (int r = 0; r < rows_per_block; ++r) {
+        if (row0 + r < nrows) {
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                if (tid == j) {
+                    dst[j*stride_col_dst + row0 + r] = sumf[r][j];
+                }
+            }
+        }
+    }
+}
+
+static bool ggml_cuda_q8_rows_multi_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_Q8_ROWS_MULTI") == nullptr || std::atoi(getenv("GGML_CUDA_Q8_ROWS_MULTI"));
+    return enabled;
+}
+
 template <int ncols_dst>
 static void mul_mat_vec_f_q8_0_rows_cuda(
         const char * x, const int32_t * rows, const float * y, float * dst, const int64_t ncols, const int64_t nrows,
@@ -796,16 +918,37 @@ static void mul_mat_vec_f_q8_0_rows_cuda(
         }
     }
 
-    const ggml_cuda_kernel_launch_params launch_params = {dim3(nrows, nchannels, 1), dim3(block_size_best, 1, 1), (int) (warp_size*sizeof(float)), stream};
+    const bool multi = ggml_cuda_q8_rows_multi_enabled();
+    constexpr int rows_per_block = ncols_dst > 4 ? 4 : 8;
+    const ggml_cuda_kernel_launch_params launch_params = multi ?
+        ggml_cuda_kernel_launch_params{dim3((nrows + rows_per_block - 1)/rows_per_block, nchannels, 1), dim3(block_size_best, 1, 1),
+            (int) (rows_per_block*ncols_dst*warp_size*sizeof(float)), stream} :
+        ggml_cuda_kernel_launch_params{dim3(nrows, nchannels, 1), dim3(block_size_best, 1, 1), (int) (warp_size*sizeof(float)), stream};
+
+    if (multi) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+            GGML_LOG_WARN("ggml_cuda: q8_0 rows: %d rows per block\n", rows_per_block);
+        }
+    }
+
+    auto launch = [&](auto block_size_c) {
+        constexpr int block_size = decltype(block_size_c)::value;
+        if (multi) {
+            ggml_cuda_kernel_launch(mul_mat_vec_f_q8_0_rows_multi<ncols_dst, block_size, rows_per_block>, launch_params, x, rows, y, dst, (int) ncols/2, (int) nrows, stride_row_bytes, (int) stride_col_y/2, (int) stride_col_dst, stride_channel_y, stride_channel_dst);
+        } else {
+            ggml_cuda_kernel_launch(mul_mat_vec_f_q8_0_rows<ncols_dst, block_size>, launch_params, x, rows, y, dst, (int) ncols/2, (int) nrows, stride_row_bytes, (int) stride_col_y/2, (int) stride_col_dst, stride_channel_y, stride_channel_dst);
+        }
+    };
     switch (block_size_best) {
-        case  32: ggml_cuda_kernel_launch(mul_mat_vec_f_q8_0_rows<ncols_dst,  32>, launch_params, x, rows, y, dst, (int) ncols/2, (int) nrows, stride_row_bytes, (int) stride_col_y/2, (int) stride_col_dst, stride_channel_y, stride_channel_dst); break;
-        case  64: ggml_cuda_kernel_launch(mul_mat_vec_f_q8_0_rows<ncols_dst,  64>, launch_params, x, rows, y, dst, (int) ncols/2, (int) nrows, stride_row_bytes, (int) stride_col_y/2, (int) stride_col_dst, stride_channel_y, stride_channel_dst); break;
-        case  96: ggml_cuda_kernel_launch(mul_mat_vec_f_q8_0_rows<ncols_dst,  96>, launch_params, x, rows, y, dst, (int) ncols/2, (int) nrows, stride_row_bytes, (int) stride_col_y/2, (int) stride_col_dst, stride_channel_y, stride_channel_dst); break;
-        case 128: ggml_cuda_kernel_launch(mul_mat_vec_f_q8_0_rows<ncols_dst, 128>, launch_params, x, rows, y, dst, (int) ncols/2, (int) nrows, stride_row_bytes, (int) stride_col_y/2, (int) stride_col_dst, stride_channel_y, stride_channel_dst); break;
-        case 160: ggml_cuda_kernel_launch(mul_mat_vec_f_q8_0_rows<ncols_dst, 160>, launch_params, x, rows, y, dst, (int) ncols/2, (int) nrows, stride_row_bytes, (int) stride_col_y/2, (int) stride_col_dst, stride_channel_y, stride_channel_dst); break;
-        case 192: ggml_cuda_kernel_launch(mul_mat_vec_f_q8_0_rows<ncols_dst, 192>, launch_params, x, rows, y, dst, (int) ncols/2, (int) nrows, stride_row_bytes, (int) stride_col_y/2, (int) stride_col_dst, stride_channel_y, stride_channel_dst); break;
-        case 224: ggml_cuda_kernel_launch(mul_mat_vec_f_q8_0_rows<ncols_dst, 224>, launch_params, x, rows, y, dst, (int) ncols/2, (int) nrows, stride_row_bytes, (int) stride_col_y/2, (int) stride_col_dst, stride_channel_y, stride_channel_dst); break;
-        case 256: ggml_cuda_kernel_launch(mul_mat_vec_f_q8_0_rows<ncols_dst, 256>, launch_params, x, rows, y, dst, (int) ncols/2, (int) nrows, stride_row_bytes, (int) stride_col_y/2, (int) stride_col_dst, stride_channel_y, stride_channel_dst); break;
+        case  32: launch(std::integral_constant<int,  32>{}); break;
+        case  64: launch(std::integral_constant<int,  64>{}); break;
+        case  96: launch(std::integral_constant<int,  96>{}); break;
+        case 128: launch(std::integral_constant<int, 128>{}); break;
+        case 160: launch(std::integral_constant<int, 160>{}); break;
+        case 192: launch(std::integral_constant<int, 192>{}); break;
+        case 224: launch(std::integral_constant<int, 224>{}); break;
+        case 256: launch(std::integral_constant<int, 256>{}); break;
         default: GGML_ABORT("fatal error");
     }
 }
