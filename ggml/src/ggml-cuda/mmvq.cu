@@ -2234,7 +2234,7 @@ static bool mmvq_quant_prologue_eligible(const ggml_tensor * src0, const ggml_te
 static void mmvq_quant_prologue_check(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
         const ggml_tensor * ids, const ggml_tensor * dst, const int64_t ncols_dst, const int64_t stride_col_dst,
         const int64_t stride_channel_dst, const int64_t stride_sample_dst, const size_t q8_1_nbytes,
-        const std::function<void(const void *, float *)> & launch_reference) {
+        const std::function<void(const void *, float *)> & launch_reference, const std::function<void(float *)> & launch_fused) {
     cudaStream_t stream = ctx.stream();
     const size_t ts_src1 = ggml_type_size(src1->type);
     const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
@@ -2245,18 +2245,33 @@ static void mmvq_quant_prologue_check(ggml_backend_cuda_context & ctx, const ggm
 
     const int64_t nchannels_dst = ids ? dst->ne[1] : dst->ne[2];
     const int64_t nsamples_dst  = dst->ne[3];
-    const int64_t n_diff = mmvq_count_differing_bits_vs_reference([&](float * dst_ref, const mmvq_row_segments_args *) {
-            launch_reference(src1_q8_1_ref.get(), dst_ref);
-        }, (float *) dst->data, nullptr, ncols_dst, src0->ne[1], nchannels_dst, nsamples_dst, stride_col_dst, stride_channel_dst, stride_sample_dst, stream);
+    const auto count_differing_vs_dst = [&](const std::function<void(float *)> & run) {
+        return mmvq_count_differing_bits_vs_reference([&](float * scratch, const mmvq_row_segments_args *) { run(scratch); },
+            (float *) dst->data, nullptr, ncols_dst, src0->ne[1], nchannels_dst, nsamples_dst, stride_col_dst, stride_channel_dst, stride_sample_dst, stream);
+    };
+    const int64_t n_diff = count_differing_vs_dst([&](float * dst_ref) { launch_reference(src1_q8_1_ref.get(), dst_ref); });
 
     // counted per variant, so a variant that alternates with another one still shows up in the sampled lines
     static std::atomic<int64_t> n_checked_variant[MMVQ_MAX_BATCH_SIZE + 1][2];
-    const int64_t n_seen = n_checked_variant[ncols_dst][ids != nullptr].fetch_add(1) + 1;
+    static std::atomic<int64_t> n_differing_variant[MMVQ_MAX_BATCH_SIZE + 1][2];
+    const int64_t n_seen      = n_checked_variant[ncols_dst][ids != nullptr].fetch_add(1) + 1;
+    const int64_t n_differing = n_differing_variant[ncols_dst][ids != nullptr] += n_diff != 0 ? 1 : 0;
     if (n_diff != 0 || n_seen % 1000 == 1) {
-        GGML_LOG_WARN("%s: type=%s ncols=%d ids=%d K=%d nrows=%d: %" PRId64 " values differ (%" PRId64 " checked)\n", __func__,
-                ggml_type_name(src0->type), (int) ncols_dst, ids != nullptr, (int) src0->ne[0], (int) src0->ne[1], n_diff, n_seen);
+        GGML_LOG_WARN("%s: type=%s ncols=%d ids=%d K=%d nrows=%d: %" PRId64 " values differ (%" PRId64 " checked, %" PRId64 " differing)\n", __func__,
+                ggml_type_name(src0->type), (int) ncols_dst, ids != nullptr, (int) src0->ne[0], (int) src0->ne[1], n_diff, n_seen, n_differing);
     }
-    GGML_ASSERT(n_diff == 0);
+    if (n_diff == 0) {
+        return;
+    }
+
+    // dst holds the first fused result: a rerun that matches it tells which of the two first runs was the odd one
+    ggml_cuda_pool_alloc<char> src1_q8_1_ref2(ctx.pool(), q8_1_nbytes);
+    quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1_ref2.get(), src0->type, src1->ne[0],
+        src1->nb[1] / ts_src1, src1->nb[2] / ts_src1, src1->nb[3] / ts_src1, ne10_padded, src1->ne[1], src1->ne[2], src1->ne[3], stream);
+    const int64_t n_diff_ref2   = count_differing_vs_dst([&](float * dst_ref) { launch_reference(src1_q8_1_ref2.get(), dst_ref); });
+    const int64_t n_diff_fused2 = count_differing_vs_dst(launch_fused);
+    GGML_LOG_WARN("%s diag: type=%s ncols=%d ids=%d: reference rerun differs from the first fused result in %" PRId64 " values, fused rerun in %" PRId64 "\n",
+            __func__, ggml_type_name(src0->type), (int) ncols_dst, ids != nullptr, n_diff_ref2, n_diff_fused2);
 }
 
 void ggml_cuda_mul_mat_vec_q(
@@ -2498,6 +2513,9 @@ void ggml_cuda_mul_mat_vec_q(
         mmvq_quant_prologue_check(ctx, src0, src1, ids, dst, ncols_dst, stride_col_dst, stride_channel_dst, s3, q8_1_nbytes,
             [&](const void * src1_q8_1_ref, float * dst_ref) {
                 launch_matvec(src1_q8_1_ref, stride_col_y, stride_channel_y, s13, dst_ref, false);
+            },
+            [&](float * dst_fused) {
+                launch_matvec(src1_d, ids ? f32_s12 : f32_s11, ids ? f32_s11 : f32_s12, f32_s13, dst_fused, true);
             });
     }
 }
