@@ -3901,6 +3901,63 @@ static int ggml_cuda_hc_up_pre_index(const ggml_cgraph * cgraph, int node_idx, i
     return ggml_cuda_hc_up_pre_supported(cgraph->nodes[node_idx], mm, pre, cc) ? pre_idx : -1;
 }
 
+// the BF16 inject MUL_MAT of qwen4exp's hc mix that the hc up+pre launch a few nodes later can compute as extra blocks; returns
+// the index of that launch's SCALE node, or -1
+static int ggml_cuda_hc_inject_scale_index(const ggml_cgraph * cgraph, int node_idx, int cc) {
+    const ggml_tensor * node = cgraph->nodes[node_idx];
+    if (node->op != GGML_OP_MUL_MAT || ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC0_IS_HADAMARD || ggml_cuda_fusion_disabled() ||
+            !ggml_cuda_hc_inject_fusion_enabled()) {
+        return -1;
+    }
+
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * src1 = node->src[1];
+    const int64_t nt = src1->ne[1];
+    if (src0->type != GGML_TYPE_BF16 || src1->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32 || nt < 1 || nt > 4 ||
+            src0->ne[2] != 1 || src0->ne[3] != 1 || src0->nb[0] != sizeof(nv_bfloat16) || src0->ne[0] % 2 != 0 ||
+            !ggml_is_contiguous(src1) || !ggml_is_contiguous(node) || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+            node->ne[0] != src0->ne[1] || node->ne[1] != nt || node->ne[2] != 1 || node->ne[3] != 1 ||
+            !ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, nt) ||
+            ggml_cuda_mul_mat_vec_f_block_size(src0->ne[0], src0->ne[1]) != 256) {
+        return -1;
+    }
+
+    const int max_nodes = 8;
+    for (int j = node_idx + 1; j <= std::min(cgraph->n_nodes - 1, node_idx + max_nodes); ++j) {
+        const int pre_idx = ggml_cuda_hc_up_pre_index(cgraph, j, cc);
+        if (pre_idx < 0) {
+            continue;
+        }
+        const int out_nodes[] = { pre_idx };
+        if (!ggml_cuda_check_fusion_memory_ranges(cgraph, j, pre_idx - j + 1, out_nodes, 1)) {
+            return -1;
+        }
+
+        const ggml_tensor * xn = cgraph->nodes[pre_idx]->src[0];
+        const auto base = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+        if (base(xn) != base(src1) || xn->data != src1->data || xn->ne[2] != nt || xn->ne[1] != src0->ne[1] ||
+                xn->ne[0]*xn->ne[1] != src0->ne[0]) {
+            return -1;
+        }
+
+        // nothing between the inject and the launch may read its output
+        for (int k = node_idx + 1; k <= pre_idx; ++k) {
+            for (const ggml_tensor * src : cgraph->nodes[k]->src) {
+                if (src != nullptr && (src == node || src->view_src == node)) {
+                    return -1;
+                }
+            }
+        }
+        return j;
+    }
+    return -1;
+}
+
+static bool ggml_cuda_hc_inject_defer(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int node_idx) {
+    return cuda_ctx->hc_inject_deferred == nullptr && cuda_ctx->stream_context().concurrent_events.empty() &&
+           ggml_cuda_hc_inject_scale_index(cgraph, node_idx, ggml_cuda_info().devices[cuda_ctx->device].cc) >= 0;
+}
+
 // SIGMOID of one gate value per row -> MUL into the rows -> ADD of a same-shape tensor
 static bool ggml_cuda_should_fuse_sigmoid_mul_add(const ggml_cgraph * cgraph, int node_idx) {
     const std::initializer_list<enum ggml_op> ops = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
@@ -5521,6 +5578,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 cuda_ctx->q8_1_reuse.slots[k].src = nullptr;
             }
             cuda_ctx->gdn_state_gather = nullptr;
+            cuda_ctx->hc_inject_deferred = nullptr;
             cuda_ctx->conv_state_fold = {};
             cuda_ctx->mmvf_q8_0_gather   = nullptr;
             cuda_ctx->mmvf_q8_0_consumer = nullptr;
@@ -5570,6 +5628,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 if (ggml_cuda_gdn_can_read_state_rows(cgraph, i)) {
                     cuda_ctx->gdn_state_gather = node;
+                    continue;
+                }
+
+                if (ggml_cuda_hc_inject_defer(cuda_ctx, cgraph, i)) {
+                    cuda_ctx->hc_inject_deferred = node;
+                    // nothing reads the inject before the launch that writes it, so its q8_1 slots can go now
+                    ggml_cuda_q8_1_reuse_drop_overwritten(cuda_ctx, cgraph, i, i);
                     continue;
                 }
 
@@ -5654,6 +5719,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(node);
                }
             }
+            GGML_ASSERT(cuda_ctx->hc_inject_deferred == nullptr);
         }
 
 #ifdef USE_CUDA_GRAPH
@@ -5976,7 +6042,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         // the fused hc up+pre reads the down projection and the normed streams when it runs, so its output must not take over their memory
         const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
         int n_hc_up_pre = 0;
+        int n_hc_inject = 0;
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            n_hc_inject += ggml_cuda_hc_inject_scale_index(cgraph, i, cc) >= 0;
             const int pre_idx = ggml_cuda_hc_up_pre_index(cgraph, i, cc);
             if (pre_idx < 0) {
                 continue;
@@ -5991,7 +6059,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         static int n_hc_up_pre_logged = 0;
         static int n_hc_up_pre_last   = 0;
         if (n_hc_up_pre != n_hc_up_pre_last && n_hc_up_pre_logged < 10) {
-            GGML_LOG_WARN("ggml_cuda: hc up+pre fused: %d matched\n", n_hc_up_pre);
+            GGML_LOG_WARN("ggml_cuda: hc up+pre fused: %d matched, %d injects deferred\n", n_hc_up_pre, n_hc_inject);
             ++n_hc_up_pre_logged;
             n_hc_up_pre_last = n_hc_up_pre;
         }
