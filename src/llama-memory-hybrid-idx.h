@@ -146,9 +146,10 @@ public:
     //   scope_cells I32 [ratio, n_blk, n_seq]  cells of each listed block
     //   scope_bias  F32 [n_blk, n_t, n_seq]    the per-block bias of each query, -inf past the list
     // Returns n_blk for this ubatch, padded so graph reuse holds, and sets n_seq; 0 when the ubatch
-    // cannot be scoped or scoping would score more blocks than the whole pool
+    // cannot be scoped or scoping would score more blocks than the whole pool. n_vis_min > 0 (token
+    // chunks): also 0 unless every query sees that many pooled blocks, else the fillers picked differ
     uint32_t qsa_scope_n_blocks(const llama_ubatch & ubatch, uint32_t n_kv, uint32_t ratio,
-                                uint32_t n_seq_vis, uint32_t & n_seq) const;
+                                uint32_t n_seq_vis, int64_t n_vis_min, uint32_t & n_seq) const;
 
     // The model's indexer pool size.
     uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
@@ -321,6 +322,9 @@ private:
     void qsa_sync(qsa_input_state & st, const llama_kv_cells & cells, const llama_ubatch * ubatch,
                   int64_t n_kv, int64_t r, int64_t n_seq_vis, bool keep, bool need_blk_of, bool blk_bias) const;
 
+    // the causal index of token i of the ubatch, as the bias and the visibility tables rank it
+    int64_t qsa_query_index(const qsa_input_state & st, const llama_kv_cells & cells, const llama_ubatch & ubatch, int64_t i) const;
+
     // clamp helpers, one per llama_memory_i operation that can invalidate rows
     void pooled_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
     void pooled_reset(llama_seq_id seq_id);   // -1 resets every sequence
@@ -416,7 +420,7 @@ public:
                        ggml_tensor * scope_bias  = nullptr) const;
 
     // [TAG_QSA_SEQ_SCOPE] see the memory class; 0 as well with more than one stream
-    uint32_t qsa_scope_n_blocks(const llama_ubatch & ubatch, uint32_t ratio, uint32_t n_seq_vis, uint32_t & n_seq) const;
+    uint32_t qsa_scope_n_blocks(const llama_ubatch & ubatch, uint32_t ratio, uint32_t n_seq_vis, int64_t n_vis_min, uint32_t & n_seq) const;
 
     // [TAG_QSA_POOLED_CACHE] true when store rows are keyed on (seq_id, position block) rather
     // than the position block alone, which a unified pool requires - see the memory class
