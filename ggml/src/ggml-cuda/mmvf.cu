@@ -892,6 +892,170 @@ static bool ggml_cuda_q8_rows_multi_enabled() {
     return enabled;
 }
 
+template <int pos>
+static __device__ __forceinline__ uint32_t q8_rows_thread_bits(const uint2 * rw) {
+    constexpr int shift = 8*(pos % 8);
+    const uint32_t word = shift < 32 ? rw[pos/8].x : rw[pos/8].y;
+    return word >> (shift % 32);
+}
+
+// partial of virtual lane t of mul_mat_vec_f_q8_0_rows for every column
+template <int ncols_dst, int t>
+static __device__ __forceinline__ void q8_rows_thread_partial(const uint2 * rw, const float2 * ys, float * out) {
+    constexpr int kb  = t / (QK8_0/2);
+    constexpr int iqs = 2*(t % (QK8_0/2));
+    const float d = __half2float(__ushort_as_half((unsigned short) q8_rows_thread_bits<34*kb>(rw)));
+
+    float2 tmpx;
+    tmpx.x = (float) (int) (int8_t) q8_rows_thread_bits<34*kb + 2 + iqs>(rw);
+    tmpx.y = (float) (int) (int8_t) q8_rows_thread_bits<34*kb + 3 + iqs>(rw);
+    tmpx.x *= d;
+    tmpx.y *= d;
+
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        const float2 tmpy = ys[j*64 + t];
+        float p = 0.0f;
+        ggml_cuda_mad(p, tmpx.x, tmpy.x);
+        ggml_cuda_mad(p, tmpx.y, tmpy.y);
+        out[j] = p;
+    }
+}
+
+// b[i] = (v[i] + v[i+16]) + (v[i+8] + v[i+24]) within warp w
+template <int ncols_dst, int w, int i>
+static __device__ __forceinline__ void q8_rows_thread_b(const uint2 * rw, const float2 * ys, float * out) {
+    float p0[ncols_dst];
+    float p1[ncols_dst];
+    float a0[ncols_dst];
+    q8_rows_thread_partial<ncols_dst, 32*w + i>(rw, ys, p0);
+    q8_rows_thread_partial<ncols_dst, 32*w + i + 16>(rw, ys, p1);
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        a0[j] = p0[j] + p1[j];
+    }
+    q8_rows_thread_partial<ncols_dst, 32*w + i + 8>(rw, ys, p0);
+    q8_rows_thread_partial<ncols_dst, 32*w + i + 24>(rw, ys, p1);
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        out[j] = a0[j] + (p0[j] + p1[j]);
+    }
+}
+
+// c[i] = b[i] + b[i+4]
+template <int ncols_dst, int w, int i>
+static __device__ __forceinline__ void q8_rows_thread_c(const uint2 * rw, const float2 * ys, float * out) {
+    float b1[ncols_dst];
+    q8_rows_thread_b<ncols_dst, w, i>(rw, ys, out);
+    q8_rows_thread_b<ncols_dst, w, i + 4>(rw, ys, b1);
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        out[j] = out[j] + b1[j];
+    }
+}
+
+// S = (c[0] + c[2]) + (c[1] + c[3])
+template <int ncols_dst, int w>
+static __device__ __forceinline__ void q8_rows_thread_warp_sum(const uint2 * rw, const float2 * ys, float * out) {
+    float c1[ncols_dst];
+    float c2[ncols_dst];
+    q8_rows_thread_c<ncols_dst, w, 0>(rw, ys, out);
+    q8_rows_thread_c<ncols_dst, w, 2>(rw, ys, c1);
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        out[j] = out[j] + c1[j];
+    }
+    q8_rows_thread_c<ncols_dst, w, 1>(rw, ys, c1);
+    q8_rows_thread_c<ncols_dst, w, 3>(rw, ys, c2);
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        out[j] = out[j] + (c1[j] + c2[j]);
+    }
+}
+
+// v[i] += v[i+offset] for offset 16, 8, 4, 2, 1: lane 0 of warp_reduce_sum
+template <int offset>
+static __device__ __forceinline__ void q8_rows_thread_tree32(float * v) {
+    if constexpr (offset > 0) {
+#pragma unroll
+        for (int i = 0; i < offset; ++i) {
+            v[i] = v[i] + v[i + offset];
+        }
+        q8_rows_thread_tree32<offset/2>(v);
+    }
+}
+
+// One thread per row. Replays in registers the partials of the 64 threads and both reduction trees of
+// mul_mat_vec_f_q8_0_rows (block_size 64, ncols2 64, warp_size 32), so the bits match. y is staged in LDS.
+template <int ncols_dst>
+static __global__ void mul_mat_vec_f_q8_0_rows_thread(
+        const char * x, const int32_t * rows, const float * y, float * dst,
+        const int nrows, const int64_t stride_row_bytes, const int stride_col_y2, const int stride_col_dst,
+        const int64_t stride_channel_y, const int64_t stride_channel_dst) {
+    const int tid     = threadIdx.x;
+    const int row     = blockIdx.x*64 + tid;
+    const int channel = blockIdx.y;
+
+    ggml_cuda_pdl_sync();
+
+    const float2 * y2 = (const float2 *) (y + channel*stride_channel_y);
+    dst += channel*stride_channel_dst;
+
+    extern __shared__ char data_mmv[];
+    float2 * ys = (float2 *) data_mmv;
+
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        ys[j*64 + tid] = y2[j*stride_col_y2 + tid];
+    }
+    __syncthreads();
+
+    float res[ncols_dst] = {};
+
+    if (row < nrows) {
+        const uint2 * xr = (const uint2 *) (x + rows[int64_t(channel)*nrows + row]*stride_row_bytes);
+        uint2 rw[17];
+#pragma unroll
+        for (int i = 0; i < 17; ++i) {
+            rw[i] = xr[i];
+        }
+
+        float s0[ncols_dst];
+        float s1[ncols_dst];
+        q8_rows_thread_warp_sum<ncols_dst, 0>(rw, ys, s0);
+        q8_rows_thread_warp_sum<ncols_dst, 1>(rw, ys, s1);
+
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            float v[32];
+            v[0] = s0[j];
+            v[1] = s1[j];
+#pragma unroll
+            for (int i = 2; i < 32; ++i) {
+                v[i] = 0.0f;
+            }
+            q8_rows_thread_tree32<16>(v);
+            res[j] = v[0];
+        }
+    }
+
+    ggml_cuda_pdl_lc();
+
+    if (row >= nrows) {
+        return;
+    }
+
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        dst[j*stride_col_dst + row] = res[j];
+    }
+}
+
+static bool ggml_cuda_q8_rows_thread_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_Q8_ROWS_THREAD") == nullptr || std::atoi(getenv("GGML_CUDA_Q8_ROWS_THREAD"));
+    return enabled;
+}
+
 template <int ncols_dst>
 static void mul_mat_vec_f_q8_0_rows_cuda(
         const char * x, const int32_t * rows, const float * y, float * dst, const int64_t ncols, const int64_t nrows,
@@ -916,6 +1080,18 @@ static void mul_mat_vec_f_q8_0_rows_cuda(
             niter_best      = niter;
             block_size_best = block_size;
         }
+    }
+
+    if (ggml_cuda_q8_rows_thread_enabled() && ncols == 128 && block_size_best == 64 && warp_size == 32 &&
+            stride_row_bytes % 8 == 0 && ((uintptr_t) x % 8) == 0) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+            GGML_LOG_WARN("ggml_cuda: q8_0 rows: one row per thread\n");
+        }
+        const ggml_cuda_kernel_launch_params thread_params{dim3((nrows + 63)/64, nchannels, 1), dim3(64, 1, 1),
+            (int) (ncols_dst*64*sizeof(float2)), stream};
+        ggml_cuda_kernel_launch(mul_mat_vec_f_q8_0_rows_thread<ncols_dst>, thread_params, x, rows, y, dst, (int) nrows, stride_row_bytes, (int) stride_col_y/2, (int) stride_col_dst, stride_channel_y, stride_channel_dst);
+        return;
     }
 
     const bool multi = ggml_cuda_q8_rows_multi_enabled();
