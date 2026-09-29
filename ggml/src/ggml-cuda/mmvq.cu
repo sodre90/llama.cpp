@@ -1165,6 +1165,38 @@ static void mmvq_multi_rows_check_report(const ggml_type type, const int ncols_x
     GGML_ASSERT(n_diff == 0);
 }
 
+bool ggml_cuda_q8_1_preq_check_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_Q8_1_PREQ_CHECK") != nullptr && std::atoi(getenv("GGML_CUDA_Q8_1_PREQ_CHECK"));
+    return enabled;
+}
+
+// only the data blocks of each row are compared, as mul_mat_vec_q never reads the padding blocks
+static void mmvq_q8_1_preq_check(const ggml_tensor * src1, const void * cached, const void * fresh, const int64_t ne10,
+        const int64_t ne10_padded, const int64_t rows, cudaStream_t stream) {
+    const size_t row_stride = ne10_padded/QK8_1*sizeof(block_q8_1);
+    const size_t row_bytes  = ne10/QK8_1*sizeof(block_q8_1);
+    std::vector<char> host_cached(rows*row_stride);
+    std::vector<char> host_fresh(rows*row_stride);
+    CUDA_CHECK(cudaMemcpyAsync(host_cached.data(), cached, host_cached.size(), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(host_fresh.data(),  fresh,  host_fresh.size(),  cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    int64_t n_diff = 0;
+    for (int64_t r = 0; r < rows; ++r) {
+        for (size_t b = 0; b < row_bytes; ++b) {
+            n_diff += host_cached[r*row_stride + b] != host_fresh[r*row_stride + b];
+        }
+    }
+
+    static std::atomic<int64_t> n_checked{0};
+    const int64_t n_seen = n_checked.fetch_add(1) + 1;
+    if (n_diff != 0 || n_seen % 1000 == 1) {
+        GGML_LOG_WARN("%s: %s [%" PRId64 ", %" PRId64 "] ne10_padded %" PRId64 " %" PRId64 " bytes differ (%" PRId64 " checked)\n", __func__,
+                src1->name, ne10, rows, ne10_padded, n_diff, n_seen);
+    }
+    GGML_ASSERT(n_diff == 0);
+}
+
 template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, int rows_override = 0>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -1800,6 +1832,13 @@ void ggml_cuda_mul_mat_vec_q(
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
         quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+    } else if (ggml_cuda_q8_1_preq_check_enabled()) {
+        const int64_t s11 = src1->nb[1] / ts_src1;
+        const int64_t s12 = src1->nb[2] / ts_src1;
+        const int64_t s13 = src1->nb[3] / ts_src1;
+        ggml_cuda_pool_alloc<char> fresh_q8_1(ctx.pool(), q8_1_nbytes);
+        quantize_row_q8_1_cuda(src1_d, nullptr, fresh_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        mmvq_q8_1_preq_check(src1, src1_q8_1, fresh_q8_1.get(), ne10, ne10_padded, ne11*ne12*ne13, stream);
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;

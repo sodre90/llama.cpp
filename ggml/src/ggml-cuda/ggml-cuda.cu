@@ -2854,6 +2854,9 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     if (ggml_cuda_mmvq_multi_rows_check_enabled()) {
         return false;
     }
+    if (ggml_cuda_q8_1_preq_check_enabled()) {
+        return false;
+    }
 
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
@@ -5266,8 +5269,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+static bool ggml_cuda_q8_1_preq_padded_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_Q8_1_PREQ_PADDED") == nullptr || std::atoi(getenv("GGML_CUDA_Q8_1_PREQ_PADDED"));
+    return enabled;
+}
+
+static int ggml_cuda_q8_1_reuse_slots() {
+    static const int n_slots = getenv("GGML_CUDA_Q8_1_REUSE_SLOTS") != nullptr && std::atoi(getenv("GGML_CUDA_Q8_1_REUSE_SLOTS")) == 2 ? 2 : 3;
+    return n_slots;
+}
+
 static void ggml_cuda_q8_1_reuse_drop_overwritten(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int first, int last) {
-    for (auto & slot : cuda_ctx->q8_1_reuse.slots) {
+    auto & reuse = cuda_ctx->q8_1_reuse;
+    for (int k = 0; k < reuse.n_slots; ++k) {
+        auto & slot = reuse.slots[k];
         if (slot.src == nullptr) {
             continue;
         }
@@ -5303,9 +5318,9 @@ static void ggml_cuda_q8_1_reuse_plan(ggml_backend_cuda_context * cuda_ctx, cons
         const ggml_tensor * src1 = mm->src[1];
         const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
         const size_t  nbytes = ggml_nrows(src1)*ne10_padded*sizeof(block_q8_1)/QK8_1;
-        // the producer writes the rows back to back, as quantize_q8_1 does only when no row needs padding
+        // a producer that writes the rows back to back does not fit rows that need padding
         if (src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) || src1->ne[0] % QK8_1 != 0 ||
-            (ggml_nrows(src1) > 1 && ne10_padded != src1->ne[0]) || nbytes > reuse.size) {
+            (ggml_nrows(src1) > 1 && ne10_padded != src1->ne[0] && !ggml_cuda_q8_1_preq_padded_enabled()) || nbytes > reuse.size) {
             return;
         }
 
@@ -5317,6 +5332,8 @@ static void ggml_cuda_q8_1_reuse_plan(ggml_backend_cuda_context * cuda_ctx, cons
         reuse.want_dst    = base;
         reuse.want_src1   = src1;
         reuse.want_nbytes = nbytes;
+        reuse.want_ne10        = src1->ne[0];
+        reuse.want_ne10_padded = ne10_padded;
         return;
     }
 }
@@ -5429,8 +5446,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
-            for (auto & slot : cuda_ctx->q8_1_reuse.slots) {
-                slot.src = nullptr;
+            for (int k = 0; k < cuda_ctx->q8_1_reuse.n_slots; ++k) {
+                cuda_ctx->q8_1_reuse.slots[k].src = nullptr;
             }
             cuda_ctx->gdn_state_gather = nullptr;
             cuda_ctx->conv_state_fold = {};
@@ -5630,8 +5647,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (reuse.slots[0].buf == nullptr) {
         // outside any capture; sized for token generation, larger batches quantize into the pool as before
         reuse.size = 1 << 19;
-        CUDA_CHECK(ggml_cuda_device_malloc(&reuse.slots[0].buf, 2*reuse.size, cuda_ctx->device));
-        reuse.slots[1].buf = (char *) reuse.slots[0].buf + reuse.size;
+        reuse.n_slots = ggml_cuda_q8_1_reuse_slots();
+        CUDA_CHECK(ggml_cuda_device_malloc(&reuse.slots[0].buf, reuse.n_slots*reuse.size, cuda_ctx->device));
+        for (int k = 1; k < reuse.n_slots; ++k) {
+            reuse.slots[k].buf = (char *) reuse.slots[0].buf + k*reuse.size;
+        }
+        static std::atomic<bool> reuse_logged{false};
+        if (!reuse_logged.exchange(true)) {
+            GGML_LOG_WARN("ggml_cuda: q8_1 reuse: %d slots, padded producer rows %s\n", reuse.n_slots,
+                    ggml_cuda_q8_1_preq_padded_enabled() ? "on" : "off");
+        }
     }
 
     bool use_cuda_graph             = false;
