@@ -15,6 +15,18 @@ void ggml_cuda_op_dsv4_hc_post_gated(ggml_backend_cuda_context & ctx, ggml_tenso
 void ggml_cuda_op_dsv4_hc_post_gated_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
         const ggml_tensor * scale_node, const ggml_tensor * scale2_node, const ggml_tensor * norm_node, ggml_tensor * mul_node);
 
+// the same launch writing to the given buffers instead of the nodes' data; q8_1_d may be null, and is not taken from the reuse plan
+void ggml_cuda_op_dsv4_hc_post_gated_rms_norm_to(ggml_backend_cuda_context & ctx, const ggml_tensor * dst,
+        const ggml_tensor * scale_node, const ggml_tensor * scale2_node, const ggml_tensor * norm_node, const ggml_tensor * mul_node,
+        float * post_d, float * norm_d, block_q8_1 * q8_1_d);
+
+// GGML_CUDA_HC_POST_NORM_CHECK=1 compares every fused hc_post + norm launch against the unfused ops on the host, which a captured graph cannot do
+bool ggml_cuda_hc_post_norm_check_enabled();
+
+// runs the fused launch into scratch buffers, then the unfused ops into the nodes, and compares the two
+void ggml_cuda_dsv4_hc_post_rms_norm_check(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const ggml_tensor * scale_node, const ggml_tensor * scale2_node, ggml_tensor * norm_node, ggml_tensor * mul_node);
+
 // one stream of the gated mean in dsv4_hc_pre_f32, shared with the hc up+pre matvec so both round the same
 static __device__ __forceinline__ float ggml_cuda_dsv4_hc_pre_gated_step(const float sum, const float xv, const float gate) {
     const float wv = 1.0f / (1.0f + expf(-gate));

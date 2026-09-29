@@ -10,9 +10,11 @@
 #include <cinttypes>
 #include <climits>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <string>
 #include <numeric>
 #include <type_traits>
 #include <vector>
@@ -1519,6 +1521,45 @@ bool ggml_cuda_q8_1_preq_check_enabled() {
     return enabled;
 }
 
+bool ggml_cuda_q8_1_reuse_debug_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_Q8_1_REUSE_DEBUG") != nullptr && std::atoi(getenv("GGML_CUDA_Q8_1_REUSE_DEBUG"));
+    return enabled;
+}
+
+// logs a launch that quantizes src1 itself, with what the reuse slots held instead
+static void mmvq_q8_1_reuse_log_miss(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, const ggml_tensor * src0,
+        const ggml_tensor * src1, const ggml_tensor * ids, const bool has_fusion, const size_t q8_1_nbytes, const int64_t ncols_dst,
+        const bool reusable) {
+    static std::atomic<int> n_logged[9];
+    if (ncols_dst < 1 || ncols_dst > 8 || n_logged[ncols_dst].fetch_add(1) >= 100) {
+        return;
+    }
+
+    auto & reuse = ctx.q8_1_reuse;
+    const bool operands = has_fusion || (dst->src[1] == src1 && dst->src[0] == src0 && (!ids || dst->src[2] == ids));
+    std::string line = "q8_1_reuse_debug: miss ncols=" + std::to_string(ncols_dst) + " dst=" + dst->name + " src1=" + src1->name;
+    char buf[256];
+    snprintf(buf, sizeof(buf), " data=%p ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] q8_1_nbytes=%zu reusable=%d",
+            src1->data, src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3], q8_1_nbytes, (int) reusable);
+    line += buf;
+    if (!reusable) {
+        snprintf(buf, sizeof(buf), " (enabled=%d stream_no=%d size_ok=%d operands=%d)",
+                (int) reuse.enabled, (int) ctx.curr_stream_no, (int) (q8_1_nbytes <= reuse.size), (int) operands);
+        line += buf;
+    }
+    for (int k = 0; k < reuse.n_slots; ++k) {
+        const ggml_tensor * slot_src = reuse.slots[k].src;
+        if (slot_src == nullptr) {
+            snprintf(buf, sizeof(buf), " | slot %d: -", k);
+        } else {
+            snprintf(buf, sizeof(buf), " | slot %d: %s data=%p ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] nbytes=%zu",
+                    k, slot_src->name, slot_src->data, slot_src->ne[0], slot_src->ne[1], slot_src->ne[2], slot_src->ne[3], reuse.slots[k].nbytes);
+        }
+        line += buf;
+    }
+    GGML_LOG_WARN("%s\n", line.c_str());
+}
+
 // only the data blocks of each row are compared, as mul_mat_vec_q never reads the padding blocks
 static void mmvq_q8_1_preq_check(const ggml_tensor * src1, const void * cached, const void * fresh, const int64_t ne10,
         const int64_t ne10_padded, const int64_t rows, cudaStream_t stream) {
@@ -2358,6 +2399,9 @@ void ggml_cuda_mul_mat_vec_q(
     const auto * cached = reusable ? reuse.find(src1, q8_1_nbytes) : nullptr;
     const int64_t ncols_dst = ids ? ne2 : ne1;
     const bool quant_prologue = !cached && segments.n == 0 && mmvq_quant_prologue_eligible(src0, src1, ids, ncols_dst);
+    if (!cached && !quant_prologue && ggml_cuda_q8_1_reuse_debug_enabled()) {
+        mmvq_q8_1_reuse_log_miss(ctx, dst, src0, src1, ids, fusion != nullptr, q8_1_nbytes, ncols_dst, reusable);
+    }
     char * src1_q8_1 = quant_prologue ? nullptr :
         (char *) (cached ? cached->buf : reusable ? reuse.claim(src1, q8_1_nbytes)->buf : src1_q8_1_alloc.alloc(q8_1_nbytes));
     if (!cached && !quant_prologue) {

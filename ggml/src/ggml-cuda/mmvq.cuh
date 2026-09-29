@@ -16,6 +16,9 @@ bool ggml_cuda_mmvq_trim_warps_check_enabled();
 // GGML_CUDA_Q8_1_PREQ_CHECK=1 compares every reused q8_1 copy against a fresh quantization on the host, which a captured graph cannot do
 bool ggml_cuda_q8_1_preq_check_enabled();
 
+// GGML_CUDA_Q8_1_REUSE_DEBUG=1 logs the launches that quantize src1 although the reuse slots could have held it, and the slots dropped by overwrites
+bool ggml_cuda_q8_1_reuse_debug_enabled();
+
 // GGML_CUDA_MMVQ_QUANT_PROLOGUE_CHECK=1 compares every launch that quantizes src1 in the kernel against the quantize + matvec kernels on the host, which a captured graph cannot do
 bool ggml_cuda_mmvq_quant_prologue_check_enabled();
 

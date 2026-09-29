@@ -10266,6 +10266,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post_rms_norm(2560, 1));
     test_cases.emplace_back(new test_dsv4_hc_post_rms_norm(4096, 1));
     test_cases.emplace_back(new test_dsv4_hc_post_rms_norm(2560, 1, true));
+    test_cases.emplace_back(new test_dsv4_hc_post_rms_norm(2560, 2));
+    test_cases.emplace_back(new test_dsv4_hc_post_rms_norm(2560, 4));
+    test_cases.emplace_back(new test_dsv4_hc_post_rms_norm(2560, 4, true));
     test_cases.emplace_back(new test_sigmoid_mul_add({2560, 1, 1, 1}));
     test_cases.emplace_back(new test_sigmoid_mul_add({2560, 3, 1, 1}, true));
     test_cases.emplace_back(new test_sigmoid_mul_add({10, 5, 4, 3}));

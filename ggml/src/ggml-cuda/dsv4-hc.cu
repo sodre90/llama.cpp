@@ -1,5 +1,14 @@
 #include "common.cuh"
 #include "dsv4-hc.cuh"
+#include "norm.cuh"
+#include "quantize.cuh"
+
+#include <atomic>
+#include <cinttypes>
+#include <cstdlib>
+#include <functional>
+#include <numeric>
+#include <vector>
 
 
 static constexpr int DSV4_HC = 4;
@@ -423,8 +432,9 @@ void ggml_cuda_op_dsv4_hc_post_gated(ggml_backend_cuda_context & ctx, ggml_tenso
     dsv4_hc_post(ctx, dst, scale_node->src[0], &gate);
 }
 
-void ggml_cuda_op_dsv4_hc_post_gated_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
-        const ggml_tensor * scale_node, const ggml_tensor * scale2_node, const ggml_tensor * norm_node, ggml_tensor * mul_node) {
+static void dsv4_hc_post_gated_rms_norm(ggml_backend_cuda_context & ctx, const ggml_tensor * dst,
+        const ggml_tensor * scale_node, const ggml_tensor * scale2_node, const ggml_tensor * norm_node, const ggml_tensor * mul_node,
+        float * post_d, float * norm_d, block_q8_1 * q8_1_d) {
     const ggml_tensor * x        = dst->src[0];
     const ggml_tensor * residual = dst->src[1];
     const ggml_tensor * logits   = scale_node->src[0];
@@ -451,7 +461,7 @@ void ggml_cuda_op_dsv4_hc_post_gated_rms_norm(ggml_backend_cuda_context & ctx, g
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 32*sizeof(float), ctx.stream());
         ggml_cuda_kernel_launch(kernel, launch_params,
                 gate, (const float *) x->data, (const float *) residual->data, (const float *) logits->data,
-                (const float *) gamma->data, (float *) dst->data, (float *) mul_node->data, ctx.q8_1_prequantize_dst(mul_node),
+                (const float *) gamma->data, post_d, norm_d, q8_1_d,
                 n_embd,
                 x->nb[1] / sizeof(float),
                 residual->nb[1] / sizeof(float), residual->nb[2] / sizeof(float),
@@ -464,5 +474,80 @@ void ggml_cuda_op_dsv4_hc_post_gated_rms_norm(ggml_backend_cuda_context & ctx, g
         launch(dsv4_hc_post_rms_norm_f32<256>, 256);
     } else {
         launch(dsv4_hc_post_rms_norm_f32<1024>, 1024);
+    }
+}
+
+void ggml_cuda_op_dsv4_hc_post_gated_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const ggml_tensor * scale_node, const ggml_tensor * scale2_node, const ggml_tensor * norm_node, ggml_tensor * mul_node) {
+    dsv4_hc_post_gated_rms_norm(ctx, dst, scale_node, scale2_node, norm_node, mul_node,
+            (float *) dst->data, (float *) mul_node->data, ctx.q8_1_prequantize_dst(mul_node));
+}
+
+void ggml_cuda_op_dsv4_hc_post_gated_rms_norm_to(ggml_backend_cuda_context & ctx, const ggml_tensor * dst,
+        const ggml_tensor * scale_node, const ggml_tensor * scale2_node, const ggml_tensor * norm_node, const ggml_tensor * mul_node,
+        float * post_d, float * norm_d, block_q8_1 * q8_1_d) {
+    dsv4_hc_post_gated_rms_norm(ctx, dst, scale_node, scale2_node, norm_node, mul_node, post_d, norm_d, q8_1_d);
+}
+
+bool ggml_cuda_hc_post_norm_check_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_HC_POST_NORM_CHECK") != nullptr && std::atoi(getenv("GGML_CUDA_HC_POST_NORM_CHECK"));
+    return enabled;
+}
+
+template <typename T>
+static int64_t dsv4_hc_count_differing(const T * a, const T * b, const size_t n, cudaStream_t stream) {
+    std::vector<T> host_a(n);
+    std::vector<T> host_b(n);
+    CUDA_CHECK(cudaMemcpyAsync(host_a.data(), a, n*sizeof(T), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(host_b.data(), b, n*sizeof(T), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return std::inner_product(host_a.begin(), host_a.end(), host_b.begin(), (int64_t) 0, std::plus<int64_t>(), std::not_equal_to<T>());
+}
+
+void ggml_cuda_dsv4_hc_post_rms_norm_check(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const ggml_tensor * scale_node, const ggml_tensor * scale2_node, ggml_tensor * norm_node, ggml_tensor * mul_node) {
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t n_tokens = dst->src[0]->ne[1];
+    const int64_t ne10     = mul_node->ne[0]*mul_node->ne[1];
+    GGML_ASSERT(n_tokens >= 1 && n_tokens <= MMVQ_MAX_ROW_SEGMENT_COLS);
+
+    // the fused kernel writes the q8_1 rows back to back, which is the layout mul_mat_vec_q reads only without row padding
+    const bool   check_q8_1  = ne10 % QK8_1 == 0 && GGML_PAD(ne10, MATRIX_ROW_PADDING) == ne10;
+    const size_t q8_1_nbytes = check_q8_1 ? n_tokens*ne10/QK8_1*sizeof(block_q8_1) : 0;
+
+    ggml_cuda_pool_alloc<float> post_fused(ctx.pool(), ggml_nelements(dst));
+    ggml_cuda_pool_alloc<float> norm_fused(ctx.pool(), ggml_nelements(mul_node));
+    ggml_cuda_pool_alloc<char>  q8_1_fused(ctx.pool());
+    ggml_cuda_pool_alloc<char>  q8_1_ref(ctx.pool());
+    if (check_q8_1) {
+        q8_1_fused.alloc(q8_1_nbytes);
+        q8_1_ref.alloc(q8_1_nbytes);
+    }
+
+    ggml_cuda_op_dsv4_hc_post_gated_rms_norm_to(ctx, dst, scale_node, scale2_node, norm_node, mul_node,
+            post_fused.get(), norm_fused.get(), check_q8_1 ? (block_q8_1 *) q8_1_fused.get() : nullptr);
+
+    ggml_cuda_op_dsv4_hc_post_gated(ctx, dst, scale_node, scale2_node);
+    ggml_cuda_op_rms_norm_fused(ctx, norm_node, mul_node);
+
+    if (check_q8_1) {
+        quantize_row_q8_1_cuda((const float *) mul_node->data, nullptr, q8_1_ref.get(), GGML_TYPE_Q8_0, ne10, ne10, n_tokens*ne10, n_tokens*ne10,
+                ne10, n_tokens, 1, 1, stream);
+    }
+
+    const int64_t n_diff_post = dsv4_hc_count_differing<uint32_t>((const uint32_t *) dst->data, (const uint32_t *) post_fused.get(), ggml_nelements(dst), stream);
+    const int64_t n_diff_norm = dsv4_hc_count_differing<uint32_t>((const uint32_t *) mul_node->data, (const uint32_t *) norm_fused.get(), ggml_nelements(mul_node), stream);
+    const int64_t n_diff_q8_1 = check_q8_1 ? dsv4_hc_count_differing<char>(q8_1_ref.get(), q8_1_fused.get(), q8_1_nbytes, stream) : 0;
+
+    static std::atomic<int64_t> n_checked_ncols[MMVQ_MAX_ROW_SEGMENT_COLS + 1];
+    const int64_t n_seen = n_checked_ncols[n_tokens].fetch_add(1) + 1;
+    const bool differs = n_diff_post != 0 || n_diff_norm != 0 || n_diff_q8_1 != 0;
+    if (differs || n_seen <= 3 || n_seen % 1000 == 0) {
+        GGML_LOG_WARN("hc_post_norm_check: ncols=%d %" PRId64 " post values differ, %" PRId64 " norm values differ, %" PRId64 " q8_1 bytes differ (%" PRId64 " checks)\n",
+                (int) n_tokens, n_diff_post, n_diff_norm, n_diff_q8_1, n_seen);
+    }
+    if (differs) {
+        GGML_ABORT("hc_post_norm_check: fused output differs from the unfused ops");
     }
 }
