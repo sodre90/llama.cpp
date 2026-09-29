@@ -1189,8 +1189,10 @@ static void mmvq_q8_1_preq_check(const ggml_tensor * src1, const void * cached, 
     }
 
     static std::atomic<int64_t> n_checked{0};
+    static std::atomic<bool>    padded_rows_logged{false};
     const int64_t n_seen = n_checked.fetch_add(1) + 1;
-    if (n_diff != 0 || n_seen % 1000 == 1) {
+    const bool first_padded_rows = rows > 1 && ne10_padded != ne10 && !padded_rows_logged.exchange(true);
+    if (n_diff != 0 || n_seen % 1000 == 1 || first_padded_rows) {
         GGML_LOG_WARN("%s: %s [%" PRId64 ", %" PRId64 "] ne10_padded %" PRId64 " %" PRId64 " bytes differ (%" PRId64 " checked)\n", __func__,
                 src1->name, ne10, rows, ne10_padded, n_diff, n_seen);
     }
