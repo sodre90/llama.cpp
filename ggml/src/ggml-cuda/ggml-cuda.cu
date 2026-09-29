@@ -5407,6 +5407,11 @@ static int ggml_cuda_q8_1_reuse_slots() {
     return n_slots;
 }
 
+static bool ggml_cuda_q8_1_reuse_match_rows() {
+    static const bool enabled = getenv("GGML_CUDA_Q8_1_REUSE_ROWS") == nullptr || std::atoi(getenv("GGML_CUDA_Q8_1_REUSE_ROWS"));
+    return enabled;
+}
+
 static void ggml_cuda_q8_1_reuse_drop_overwritten(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int first, int last) {
     auto & reuse = cuda_ctx->q8_1_reuse;
     for (int k = 0; k < reuse.n_slots; ++k) {
@@ -5785,14 +5790,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         // outside any capture; sized for token generation, larger batches quantize into the pool as before
         reuse.size = 1 << 19;
         reuse.n_slots = ggml_cuda_q8_1_reuse_slots();
+        reuse.match_rows = ggml_cuda_q8_1_reuse_match_rows();
         CUDA_CHECK(ggml_cuda_device_malloc(&reuse.slots[0].buf, reuse.n_slots*reuse.size, cuda_ctx->device));
         for (int k = 1; k < reuse.n_slots; ++k) {
             reuse.slots[k].buf = (char *) reuse.slots[0].buf + k*reuse.size;
         }
         static std::atomic<bool> reuse_logged{false};
         if (!reuse_logged.exchange(true)) {
-            GGML_LOG_WARN("ggml_cuda: q8_1 reuse: %d slots, padded producer rows %s\n", reuse.n_slots,
-                    ggml_cuda_q8_1_preq_padded_enabled() ? "on" : "off");
+            GGML_LOG_WARN("ggml_cuda: q8_1 reuse: %d slots, padded producer rows %s, rows match %s\n", reuse.n_slots,
+                    ggml_cuda_q8_1_preq_padded_enabled() ? "on" : "off", reuse.match_rows ? "on" : "off");
         }
     }
 
