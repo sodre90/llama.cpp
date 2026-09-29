@@ -134,13 +134,12 @@ static __global__ void dsv4_hc_pre_f32(
     float sum = 0.0f;
     for (int64_t ih = 0; ih < hc; ++ih) {
         const float xv = x[i0*sx0 + ih*sx1 + it*sx2];
-        float wv;
         if constexpr (gated) {
-            wv = 1.0f / (1.0f + expf(-weights[i0*sw0 + ih*sw1 + it*sw2]));
+            sum = ggml_cuda_dsv4_hc_pre_gated_step(sum, xv, weights[i0*sw0 + ih*sw1 + it*sw2]);
         } else {
-            wv = weights[ih*sw0 + it*sw1];
+            const float wv = weights[ih*sw0 + it*sw1];
+            sum += xv * wv;
         }
-        sum += xv * wv;
     }
 
     const float out = scale * sum;
@@ -353,6 +352,19 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float),
             scale);
+}
+
+void ggml_cuda_dsv4_hc_pre_gated_raw(const float * x, const float * gate, float * dst, block_q8_1 * dst_q8_1,
+        int64_t n_embd, int64_t hc, int64_t n_tokens, int64_t sx0, int64_t sx1, int64_t sx2,
+        int64_t sw0, int64_t sw1, int64_t sw2, int64_t sd0, int64_t sd1, float scale, cudaStream_t stream) {
+    const int block_size = 256;
+    const int64_t nr = n_embd * n_tokens;
+    const dim3 block_dims(block_size, 1, 1);
+    const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
+
+    ggml_cuda_kernel_launch(dsv4_hc_pre_f32<true>, launch_params,
+            x, gate, dst, dst_q8_1, n_embd, hc, n_tokens, sx0, sx1, sx2, sw0, sw1, sw2, sd0, sd1, scale);
 }
 
 static void dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * post, const dsv4_hc_post_gate * gate) {
