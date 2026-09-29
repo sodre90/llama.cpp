@@ -4,6 +4,7 @@
 #include "vecdotq.cuh"
 
 #include <atomic>
+#include <cinttypes>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
