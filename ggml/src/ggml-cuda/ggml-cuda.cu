@@ -2062,8 +2062,9 @@ static bool ggml_cuda_mmvq_bad_padding_clear(const ggml_tensor * src0) {
 
 // the launch config and the GLU math are the unfused ones, so the bits match
 static bool ggml_cuda_should_fuse_mul_mat_vec_q_glu_multi(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu) {
-    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    if (!GGML_CUDA_CC_IS_RDNA4(cc) || ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size != 32) {
+    const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    if (!GGML_CUDA_CC_IS_RDNA4(cc) || warp_size != 32) {
         return false;
     }
     if (up->op != GGML_OP_MUL_MAT || gate->op != GGML_OP_MUL_MAT) {
@@ -2088,6 +2089,12 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q_glu_multi(const ggml_tensor * up
         return false;
     }
     if (ggml_cuda_mmvq_bad_padding_clear(up_w) || ggml_cuda_mmvq_bad_padding_clear(gate_w)) {
+        return false;
+    }
+    // the unfused matmuls must dispatch to mmvq too, else the fusion changes the kernel family
+    if (ggml_cuda_should_use_mmvf(up_w->type, cc, up_w->ne, up_w->nb, src1->ne[1]) ||
+            ggml_cuda_should_use_mmf(up_w->type, cc, warp_size, up_w->ne, up_w->nb, src1->ne[1], /*mul_mat_id =*/ false) ||
+            !ggml_cuda_should_use_mmvq(up_w->type, cc, src1->ne[1])) {
         return false;
     }
 
