@@ -2189,6 +2189,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // the cache's zero slot. The two outputs sum to the exact result.
     const llama_moe_cache_layer * mcache = nullptr;
     ggml_tensor * mc_slot_ids = nullptr;
+    ggml_tensor * mc_routed_ids = selected_experts;
     if (n_tokens <= LLAMA_MOE_CACHE_MAX_TOKENS && !gate_up_exps && gate_exps && down_exps &&
         !up_exps_b && !gate_exps_b && !down_exps_b &&
         !up_exps_s && !gate_exps_s && !down_exps_s &&
@@ -2208,7 +2209,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ASSERT(n_expert_used*n_tokens <= mcache->routing->ne[0]);
             ggml_tensor * routing = ggml_view_2d(ctx0, mcache->routing, n_expert_used, n_tokens,
                     n_expert_used*ggml_element_size(mcache->routing), mcache->routing_row*mcache->routing->nb[1]);
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, selected_experts, routing));
+            ggml_tensor * routed = ggml_cpy(ctx0, selected_experts, routing);
+            if (mcache->device_policy) {
+                routed->src[2] = mcache->dev_state;
+                routed->src[3] = mcache->dev_table;
+                mc_routed_ids  = routed;
+            }
+            ggml_build_forward_expand(gf, routed);
         } else {
             // dev_table has no token axis, so ggml_get_rows needs the ids flat
             ggml_tensor * flat_experts = ggml_is_contiguous(selected_experts)
@@ -2227,7 +2234,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     const auto cache_mul_mat_id = [&](ggml_tensor * cache, const ggml_tensor * host_src, ggml_tensor * b) {
         return mcache->reads_host_experts
-            ? llama_moe_cache_mul_mat_id(ctx0, *mcache, cache, host_src, b, selected_experts)
+            ? llama_moe_cache_mul_mat_id(ctx0, *mcache, cache, host_src, b, mc_routed_ids)
             : ggml_mul_mat_id(ctx0, cache, b, mc_slot_ids);
     };
 

@@ -1770,6 +1770,8 @@ struct ggml_cuda_mm_fusion_args_device {
     char          * fill_gate            = nullptr;
     uint32_t        fill_nrows           = 0;
     uint32_t        fill_pairs_per_token = 0;
+    // expert -> cache slot its fill goes to (-1: none), replaces the pair index channel
+    const int32_t * fill_slot            = nullptr;
 };
 
 struct ggml_cuda_kernel_launch_params {

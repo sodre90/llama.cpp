@@ -636,7 +636,10 @@ static __device__ __forceinline__ bool mmvq_expert_missed(const ggml_cuda_mm_fus
 
 // the channel of fill_x a missed expert is copied to, -1: read it in place
 static __device__ __forceinline__ int32_t mmvq_fill_channel(
-        const ggml_cuda_mm_fusion_args_device & fusion, const uint32_t channel_dst, const uint32_t token_idx) {
+        const ggml_cuda_mm_fusion_args_device & fusion, const uint32_t expert, const uint32_t channel_dst, const uint32_t token_idx) {
+    if (fusion.fill_slot != nullptr) {
+        return fusion.fill_slot[expert];
+    }
     return fusion.fill_x != nullptr ? (int32_t) (channel_dst + token_idx*fusion.fill_pairs_per_token) : -1;
 }
 
@@ -882,7 +885,7 @@ static __global__ void mul_mat_vec_q(
     const void * x_weights = vx_ptr;
     uint32_t channel_w = ncols_dst == 1 && ids ? mmvq_expert_channel(fusion, channel_x, x_weights, vgate) : channel_x;
     if (ncols_dst == 1 && ids && mmvq_expert_missed(fusion, x_weights)) {
-        const int32_t fill_channel = mmvq_fill_channel(fusion, channel_dst, 0);
+        const int32_t fill_channel = mmvq_fill_channel(fusion, channel_x, channel_dst, 0);
         if (fill_channel >= 0) {
             constexpr size_t block_bytes = ggml_cuda_type_traits<type>::bs;
             constexpr int    nthreads    = nwarps*warp_size;
@@ -1129,7 +1132,7 @@ static __global__ void mul_mat_vec_q_moe(
     const void * x_weights = vx_ptr;
     uint32_t channel_w = mmvq_expert_channel(fusion, channel_x, x_weights, vgate);
     if (mmvq_expert_missed(fusion, x_weights)) {
-        const int32_t fill_channel = mmvq_fill_channel(fusion, channel_dst, token_idx);
+        const int32_t fill_channel = mmvq_fill_channel(fusion, channel_x, channel_dst, token_idx);
         if (fill_channel >= 0) {
             constexpr size_t block_bytes = ggml_cuda_type_traits<type>::bs;
             mmvq_fill_rows(fusion, fusion.fill_x, x_weights, block_bytes, channel_x, fill_channel, row0, c_rows_per_block,
@@ -2577,7 +2580,15 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t f32_s13 = src1->nb[3] / ts_src1;
 
     ggml_cuda_pool_alloc<char> fill_scratch(ctx.pool());
-    if (ids && fusion_local.x_host != nullptr && ggml_cuda_moe_fill_scratch()) {
+    if (ids && fusion_local.x_host != nullptr && x_node->src[4] != nullptr) {
+        GGML_ASSERT(!fusion_local.gate_host || gate_node->src[4] == x_node->src[4]);
+        GGML_ASSERT(!fusion_local.gate_host || fusion_local.gate == gate_node->src[0]->data);
+        fusion_local.fill_slot            = (const int32_t *) x_node->src[4]->data;
+        fusion_local.fill_x               = (char *) src0->data;
+        fusion_local.fill_gate            = fusion_local.gate_host ? (char *) fusion_local.gate : nullptr;
+        fusion_local.fill_nrows           = ne01;
+        fusion_local.fill_pairs_per_token = ids->ne[0];
+    } else if (ids && fusion_local.x_host != nullptr && ggml_cuda_moe_fill_scratch()) {
         const size_t n_pairs       = ids->ne[0]*ids->ne[1];
         const size_t region_bytes  = n_pairs*src0->nb[2];
         fill_scratch.alloc(fusion_local.gate_host ? 2*region_bytes : region_bytes);
@@ -2589,6 +2600,7 @@ void ggml_cuda_mul_mat_vec_q(
     ggml_cuda_mm_fusion_args_device fusion_without_fill = fusion_local;
     fusion_without_fill.fill_x    = nullptr;
     fusion_without_fill.fill_gate = nullptr;
+    fusion_without_fill.fill_slot = nullptr;
 
     if (segments.n > 0) {
         const auto launch_segments = [&](auto type_tag) {
