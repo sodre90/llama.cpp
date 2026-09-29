@@ -2238,26 +2238,189 @@ static bool ggml_cuda_moe_fill_scratch() {
     return enabled;
 }
 
-bool ggml_cuda_moe_fill_check_enabled() {
-    static const bool enabled = getenv("GGML_CUDA_MOE_FILL_CHECK") != nullptr && std::atoi(getenv("GGML_CUDA_MOE_FILL_CHECK"));
-    return enabled;
+static int ggml_cuda_moe_fill_check_mode() {
+    static const int mode = getenv("GGML_CUDA_MOE_FILL_CHECK") != nullptr ? std::atoi(getenv("GGML_CUDA_MOE_FILL_CHECK")) : 0;
+    return mode;
 }
 
-// reruns the launch without fill into scratch and compares that with the filled result in dst
+bool ggml_cuda_moe_fill_check_enabled() {
+    return ggml_cuda_moe_fill_check_mode() != 0;
+}
+
+static uint32_t mmvq_float_bits(const float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static std::vector<float> mmvq_copy_floats_to_host(const float * device, const size_t n, cudaStream_t stream) {
+    std::vector<float> host(n);
+    CUDA_CHECK(cudaMemcpyAsync(host.data(), device, n*sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return host;
+}
+
+static int32_t mmvq_copy_int_to_host(const int32_t * device_array, const int64_t index) {
+    int32_t value = 0;
+    CUDA_CHECK(cudaMemcpy(&value, device_array + index, sizeof(value), cudaMemcpyDeviceToHost));
+    return value;
+}
+
+struct mmvq_fill_diag_entry {
+    int64_t idx;
+    int     token;
+    int     channel;
+    int     row;
+    int     expert;
+    int     table;
+    int     fill;
+    bool    scratch;
+};
+
+// -1 when the row lies in no comparable cache
+static int mmvq_cache_row_equals_host(const char * cache, const char * host, const int64_t slot, const int64_t expert, const int64_t row,
+        const ggml_tensor * src0) {
+    if (cache == nullptr || host == nullptr || slot < 0) {
+        return -1;
+    }
+    std::vector<char> cached_row(src0->nb[1]);
+    CUDA_CHECK(cudaMemcpy(cached_row.data(), cache + slot*src0->nb[2] + row*src0->nb[1], src0->nb[1], cudaMemcpyDeviceToHost));
+    return memcmp(cached_row.data(), host + expert*src0->nb[2] + row*src0->nb[1], src0->nb[1]) == 0;
+}
+
+// decomposes the first differing values into (token, channel, row, expert), reruns both launches and compares the cached rows with the host rows
+static void mmvq_moe_fill_diag(cudaStream_t stream, const ggml_tensor * src0, const ggml_tensor * ids, const ggml_tensor * dst,
+        const int64_t ncols_dst, const int64_t stride_col_dst, const int64_t stride_channel_dst, const size_t n, const float * ref,
+        const ggml_cuda_mm_fusion_args_device & fusion, const std::function<void(float *)> & launch_with_fill,
+        const std::function<void(float *)> & launch_without_fill) {
+    const char * type_name = ggml_type_name(src0->type);
+    const std::vector<float> filled = mmvq_copy_floats_to_host((const float *) dst->data, n, stream);
+    const std::vector<float> ref_host = mmvq_copy_floats_to_host(ref, n, stream);
+
+    std::vector<int64_t> indices;
+    for (size_t k = 0; k < n && indices.size() < 8; ++k) {
+        if (mmvq_float_bits(filled[k]) != mmvq_float_bits(ref_host[k])) {
+            indices.push_back(k);
+        }
+    }
+
+    if (dst->ne[3] != 1 || ids == nullptr || ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t)) {
+        for (const int64_t idx : indices) {
+            GGML_LOG_WARN("moe fill diag: type=%s ncols=%d idx=%" PRId64 " (not decomposed) filled=%08x ref=%08x\n",
+                    type_name, (int) ncols_dst, idx, mmvq_float_bits(filled[idx]), mmvq_float_bits(ref_host[idx]));
+        }
+        return;
+    }
+
+    std::vector<int32_t> ids_host(ggml_nbytes(ids)/sizeof(int32_t));
+    CUDA_CHECK(cudaMemcpy(ids_host.data(), ids->data, ids_host.size()*sizeof(int32_t), cudaMemcpyDeviceToHost));
+    const int64_t ids_stride = ids->nb[1]/sizeof(int32_t);
+    const int64_t nchannels  = dst->ne[1];
+    const bool device_fill   = fusion.fill_slot != nullptr;
+
+    std::vector<mmvq_fill_diag_entry> entries;
+    for (const int64_t idx : indices) {
+        mmvq_fill_diag_entry entry = {idx, -1, -1, -1, -1, -1, -1, !device_fill};
+        for (int64_t t = 0; t < ncols_dst && entry.token < 0; ++t) {
+            for (int64_t c = 0; c < nchannels; ++c) {
+                const int64_t row = idx - t*stride_col_dst - c*stride_channel_dst;
+                if (row >= 0 && row < src0->ne[1]) {
+                    entry.token   = t;
+                    entry.channel = c;
+                    entry.row     = row;
+                    break;
+                }
+            }
+        }
+        if (entry.token >= 0) {
+            entry.expert = ids_host[entry.channel + entry.token*ids_stride];
+            entry.table  = fusion.expert_slot != nullptr ? mmvq_copy_int_to_host(fusion.expert_slot, entry.expert) : -1;
+            entry.fill   = device_fill ? mmvq_copy_int_to_host(fusion.fill_slot, entry.expert) : entry.channel + entry.token*(int) fusion.fill_pairs_per_token;
+        }
+        entries.push_back(entry);
+        GGML_LOG_WARN("moe fill diag: type=%s ncols=%d idx=%" PRId64 " token=%d channel=%d row=%d expert=%d table=%d K=%d fill=%d%s "
+                "filled=%08x ref=%08x (%g vs %g)\n",
+                type_name, (int) ncols_dst, idx, entry.token, entry.channel, entry.row, entry.expert, entry.table, (int) fusion.n_expert_slots,
+                entry.fill, entry.scratch ? " scratch=1" : "",
+                mmvq_float_bits(filled[idx]), mmvq_float_bits(ref_host[idx]), filled[idx], ref_host[idx]);
+    }
+
+    float * fill2 = nullptr;
+    float * ref2  = nullptr;
+    CUDA_CHECK(cudaMalloc(&fill2, n*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ref2, n*sizeof(float)));
+    CUDA_CHECK(cudaMemcpyAsync(fill2, dst->data, n*sizeof(float), cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(ref2, dst->data, n*sizeof(float), cudaMemcpyDeviceToDevice, stream));
+    launch_with_fill(fill2);
+    launch_without_fill(ref2);
+    const std::vector<float> fill2_host = mmvq_copy_floats_to_host(fill2, n, stream);
+    const std::vector<float> ref2_host  = mmvq_copy_floats_to_host(ref2, n, stream);
+    CUDA_CHECK(cudaFree(fill2));
+    CUDA_CHECK(cudaFree(ref2));
+
+    for (const mmvq_fill_diag_entry & entry : entries) {
+        const size_t k = entry.idx;
+        GGML_LOG_WARN("moe fill diag rerun: idx=%" PRId64 " fill2=%08x ref2=%08x fill2==filled %d fill2==ref %d ref2==ref %d\n",
+                entry.idx, mmvq_float_bits(fill2_host[k]), mmvq_float_bits(ref2_host[k]),
+                mmvq_float_bits(fill2_host[k]) == mmvq_float_bits(filled[k]), mmvq_float_bits(fill2_host[k]) == mmvq_float_bits(ref_host[k]),
+                mmvq_float_bits(ref2_host[k]) == mmvq_float_bits(ref_host[k]));
+    }
+
+    for (const mmvq_fill_diag_entry & entry : entries) {
+        int up_equal   = -1;
+        int gate_equal = -1;
+        if (device_fill && entry.token >= 0 && entry.table >= fusion.n_expert_slots && entry.fill >= 0) {
+            up_equal = mmvq_cache_row_equals_host((const char *) src0->data, (const char *) fusion.x_host, entry.fill, entry.expert, entry.row, src0);
+            if (fusion.gate_host != nullptr && fusion.fill_gate != nullptr) {
+                gate_equal = mmvq_cache_row_equals_host(fusion.fill_gate, (const char *) fusion.gate_host, entry.fill, entry.expert, entry.row, src0);
+            }
+        }
+        GGML_LOG_WARN("moe fill diag bytes: idx=%" PRId64 " up row equal=%d gate row equal=%d\n", entry.idx, up_equal, gate_equal);
+    }
+}
+
+// reruns the launch without fill into scratch and compares that with the filled result in dst; mode 2 also compares two reference runs
 static void mmvq_moe_fill_check(cudaStream_t stream, const ggml_tensor * src0, const ggml_tensor * ids, const ggml_tensor * dst,
         const int64_t ncols_dst, const int64_t stride_col_dst, const int64_t stride_channel_dst, const int64_t stride_sample_dst,
+        const ggml_cuda_mm_fusion_args_device & fusion, const std::function<void(float *)> & launch_with_fill,
         const std::function<void(float *)> & launch_without_fill) {
-    const int64_t n_diff = mmvq_count_differing_bits_vs_reference([&](float * scratch, const mmvq_row_segments_args *) { launch_without_fill(scratch); },
-        (float *) dst->data, nullptr, ncols_dst, src0->ne[1], ids ? dst->ne[1] : dst->ne[2], dst->ne[3], stride_col_dst, stride_channel_dst, stride_sample_dst, stream);
+    const int64_t nchannels_dst = ids ? dst->ne[1] : dst->ne[2];
+    const size_t n = (dst->ne[3] - 1)*stride_sample_dst + (nchannels_dst - 1)*stride_channel_dst + (ncols_dst - 1)*stride_col_dst + src0->ne[1];
+
+    float * ref = nullptr;
+    CUDA_CHECK(cudaMalloc(&ref, n*sizeof(float)));
+    CUDA_CHECK(cudaMemcpyAsync(ref, dst->data, n*sizeof(float), cudaMemcpyDeviceToDevice, stream));
+    launch_without_fill(ref);
+    const int64_t n_diff = mmvq_count_differing_bits((const float *) dst->data, ref, n, stream);
+
+    int64_t n_control_diff = 0;
+    if (ggml_cuda_moe_fill_check_mode() == 2) {
+        float * control = nullptr;
+        CUDA_CHECK(cudaMalloc(&control, n*sizeof(float)));
+        CUDA_CHECK(cudaMemcpyAsync(control, dst->data, n*sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        launch_without_fill(control);
+        n_control_diff = mmvq_count_differing_bits(ref, control, n, stream);
+        CUDA_CHECK(cudaFree(control));
+    }
 
     static std::atomic<int64_t> n_checked_variant[MMVQ_MAX_BATCH_SIZE + 1];
     static std::atomic<int64_t> n_differing_variant[MMVQ_MAX_BATCH_SIZE + 1];
-    const int64_t n_seen      = n_checked_variant[ncols_dst].fetch_add(1) + 1;
-    const int64_t n_differing = n_differing_variant[ncols_dst] += n_diff != 0 ? 1 : 0;
-    if (n_diff != 0 || n_seen % 1000 == 1) {
-        GGML_LOG_WARN("moe fill check: type=%s ncols=%d K=%d nrows=%d: %" PRId64 " values differ (%" PRId64 " checked, %" PRId64 " differing)\n",
-                ggml_type_name(src0->type), (int) ncols_dst, (int) src0->ne[0], (int) src0->ne[1], n_diff, n_seen, n_differing);
+    static std::atomic<int64_t> n_control_differing_variant[MMVQ_MAX_BATCH_SIZE + 1];
+    const int64_t n_seen            = n_checked_variant[ncols_dst].fetch_add(1) + 1;
+    const int64_t n_differing       = n_differing_variant[ncols_dst] += n_diff != 0 ? 1 : 0;
+    const int64_t n_control_differing = n_control_differing_variant[ncols_dst] += n_control_diff != 0 ? 1 : 0;
+    if (n_control_diff != 0) {
+        GGML_LOG_WARN("moe fill control: type=%s ncols=%d: %" PRId64 " values differ between two reference runs\n",
+                ggml_type_name(src0->type), (int) ncols_dst, n_control_diff);
     }
+    if (n_diff != 0 || n_seen % 1000 == 1) {
+        GGML_LOG_WARN("moe fill check: type=%s ncols=%d K=%d nrows=%d: %" PRId64 " values differ (%" PRId64 " checked, %" PRId64 " differing, control %" PRId64 " differing)\n",
+                ggml_type_name(src0->type), (int) ncols_dst, (int) src0->ne[0], (int) src0->ne[1], n_diff, n_seen, n_differing, n_control_differing);
+    }
+    if (n_diff != 0) {
+        mmvq_moe_fill_diag(stream, src0, ids, dst, ncols_dst, stride_col_dst, stride_channel_dst, n, ref, fusion, launch_with_fill, launch_without_fill);
+    }
+    CUDA_CHECK(cudaFree(ref));
 }
 
 // the small-K decision of mul_mat_vec_q_switch_ncols_dst for one column, which RDNA4 applies to every column
@@ -2640,7 +2803,9 @@ void ggml_cuda_mul_mat_vec_q(
     if (!quant_prologue) {
         launch_matvec(fusion_local, src1_q8_1, stride_col_y, stride_channel_y, s13, dst_d, false);
         if (fill_check) {
-            mmvq_moe_fill_check(stream, src0, ids, dst, ncols_dst, stride_col_dst, stride_channel_dst, s3, [&](float * dst_ref) {
+            mmvq_moe_fill_check(stream, src0, ids, dst, ncols_dst, stride_col_dst, stride_channel_dst, s3, fusion_local, [&](float * dst_out) {
+                launch_matvec(fusion_local, src1_q8_1, stride_col_y, stride_channel_y, s13, dst_out, false);
+            }, [&](float * dst_ref) {
                 launch_matvec(fusion_without_fill, src1_q8_1, stride_col_y, stride_channel_y, s13, dst_ref, false);
             });
         }
@@ -2650,7 +2815,9 @@ void ggml_cuda_mul_mat_vec_q(
     launch_matvec(fusion_local, src1_d, ids ? f32_s12 : f32_s11, ids ? f32_s11 : f32_s12, f32_s13, dst_d, true);
 
     if (fill_check) {
-        mmvq_moe_fill_check(stream, src0, ids, dst, ncols_dst, stride_col_dst, stride_channel_dst, s3, [&](float * dst_ref) {
+        mmvq_moe_fill_check(stream, src0, ids, dst, ncols_dst, stride_col_dst, stride_channel_dst, s3, fusion_local, [&](float * dst_out) {
+            launch_matvec(fusion_local, src1_d, ids ? f32_s12 : f32_s11, ids ? f32_s11 : f32_s12, f32_s13, dst_out, true);
+        }, [&](float * dst_ref) {
             launch_matvec(fusion_without_fill, src1_d, ids ? f32_s12 : f32_s11, ids ? f32_s11 : f32_s12, f32_s13, dst_ref, true);
         });
     }
