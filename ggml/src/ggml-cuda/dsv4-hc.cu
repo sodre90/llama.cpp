@@ -529,6 +529,8 @@ void ggml_cuda_dsv4_hc_post_rms_norm_check(ggml_backend_cuda_context & ctx, ggml
             post_fused.get(), norm_fused.get(), check_q8_1 ? (block_q8_1 *) q8_1_fused.get() : nullptr);
 
     ggml_cuda_op_dsv4_hc_post_gated(ctx, dst, scale_node, scale2_node);
+    // compare post before the norm runs: the norm output may take over post's memory
+    const int64_t n_diff_post = dsv4_hc_count_differing<uint32_t>((const uint32_t *) dst->data, (const uint32_t *) post_fused.get(), ggml_nelements(dst), stream);
     ggml_cuda_op_rms_norm_fused(ctx, norm_node, mul_node);
 
     if (check_q8_1) {
@@ -536,7 +538,6 @@ void ggml_cuda_dsv4_hc_post_rms_norm_check(ggml_backend_cuda_context & ctx, ggml
                 ne10, n_tokens, 1, 1, stream);
     }
 
-    const int64_t n_diff_post = dsv4_hc_count_differing<uint32_t>((const uint32_t *) dst->data, (const uint32_t *) post_fused.get(), ggml_nelements(dst), stream);
     const int64_t n_diff_norm = dsv4_hc_count_differing<uint32_t>((const uint32_t *) mul_node->data, (const uint32_t *) norm_fused.get(), ggml_nelements(mul_node), stream);
     const int64_t n_diff_q8_1 = check_q8_1 ? dsv4_hc_count_differing<char>(q8_1_ref.get(), q8_1_fused.get(), q8_1_nbytes, stream) : 0;
 
