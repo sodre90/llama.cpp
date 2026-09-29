@@ -3959,10 +3959,6 @@ static int ggml_cuda_hc_inject_scale_index(const ggml_cgraph * cgraph, int node_
         if (pre_idx < 0) {
             continue;
         }
-        const int out_nodes[] = { pre_idx };
-        if (!ggml_cuda_check_fusion_memory_ranges(cgraph, j, pre_idx - j + 1, out_nodes, 1)) {
-            return -1;
-        }
 
         const ggml_tensor * xn = cgraph->nodes[pre_idx]->src[0];
         const auto base = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
@@ -3984,9 +3980,19 @@ static int ggml_cuda_hc_inject_scale_index(const ggml_cgraph * cgraph, int node_
     return -1;
 }
 
+// graph_optimize also calls the index above, before the buffers exist, so the memory ranges are checked only here
 static bool ggml_cuda_hc_inject_defer(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int node_idx) {
-    return cuda_ctx->hc_inject_deferred == nullptr && cuda_ctx->stream_context().concurrent_events.empty() &&
-           ggml_cuda_hc_inject_scale_index(cgraph, node_idx, ggml_cuda_info().devices[cuda_ctx->device].cc) >= 0;
+    if (cuda_ctx->hc_inject_deferred != nullptr || !cuda_ctx->stream_context().concurrent_events.empty()) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    const int scale_idx = ggml_cuda_hc_inject_scale_index(cgraph, node_idx, cc);
+    if (scale_idx < 0) {
+        return false;
+    }
+    const int pre_idx = ggml_cuda_hc_up_pre_index(cgraph, scale_idx, cc);
+    const int out_nodes[] = { pre_idx };
+    return ggml_cuda_check_fusion_memory_ranges(cgraph, scale_idx, pre_idx - scale_idx + 1, out_nodes, 1);
 }
 
 // SIGMOID of one gate value per row -> MUL into the rows -> ADD of a same-shape tensor
