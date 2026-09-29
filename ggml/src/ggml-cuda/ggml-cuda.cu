@@ -70,6 +70,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/qsa-score.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2835,6 +2836,9 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     if (ggml_cuda_moe_reduce_add_check_enabled()) {
         return false;
     }
+    if (ggml_cuda_qsa_score_check_enabled()) {
+        return false;
+    }
     if (ggml_cuda_mmvq_quant_prologue_check_enabled()) {
         return false;
     }
@@ -4617,6 +4621,232 @@ static bool ggml_cuda_get_rows_f16_cast_keeps_reads(const ggml_tensor * gather, 
     return true;
 }
 
+static const ggml_tensor * ggml_cuda_view_root(const ggml_tensor * t) {
+    while (t->view_src) {
+        t = t->view_src;
+    }
+    return t;
+}
+
+static bool ggml_cuda_qsa_score_is_head_view(const ggml_tensor * t, const ggml_tensor * relu, const int64_t h) {
+    return t->op == GGML_OP_VIEW && t->view_src == relu && t->view_offs == (size_t) h*relu->nb[1] &&
+        t->type == GGML_TYPE_F32 && t->ne[0] == relu->ne[0] && t->ne[1] == relu->ne[2] && t->ne[2] == relu->ne[3] && t->ne[3] == 1 &&
+        t->nb[0] == sizeof(float) && t->nb[1] == relu->nb[2] && t->nb[2] == relu->nb[3];
+}
+
+static bool ggml_cuda_qsa_score_is_f32_shape(const ggml_tensor * t, const int64_t ne0, const int64_t ne1, const int64_t ne2) {
+    return t->type == GGML_TYPE_F32 && t->ne[0] == ne0 && t->ne[1] == ne1 && t->ne[2] == ne2 && t->ne[3] == 1;
+}
+
+// RELU of the per-head block scores, the head sum, and the ADD of the bias that top-k reads: from node i, either a bias tensor
+// or the device rule that builds it (REPEAT, SUB, ADD, CLAMP, ADD, SCALE, CLAMP, SCALE, ADD) between them.
+// Returns the index of the final ADD, or -1. Reads no tensor data, it also runs before the buffers exist.
+static int ggml_cuda_match_qsa_score_epilogue(const ggml_cgraph * cgraph, int i, ggml_cuda_qsa_score_epilogue & e) {
+    if (!ggml_cuda_qsa_score_fusion_enabled()) {
+        return -1;
+    }
+
+    const ggml_tensor * relu = cgraph->nodes[i];
+    if (relu->op != GGML_OP_UNARY || ggml_get_unary_op(relu) != GGML_UNARY_OP_RELU || relu->type != GGML_TYPE_F32 || !ggml_is_contiguous(relu)) {
+        return -1;
+    }
+    const ggml_tensor * score = relu->src[0];
+    if (score == nullptr || score->type != GGML_TYPE_F32 || !ggml_is_contiguous(score) || !ggml_are_same_shape(score, relu)) {
+        return -1;
+    }
+
+    const int64_t nb      = relu->ne[0];
+    const int64_t n_heads = relu->ne[1];
+    const int64_t n_t     = relu->ne[2];
+    const int64_t ns      = relu->ne[3];
+    if (n_heads < 2 || n_heads > 8 || n_t > 65535 || ns > 65535) {
+        return -1;
+    }
+
+    const ggml_tensor * sums[8] = {};
+    int64_t n_sums = 0;
+    const ggml_tensor * rep = nullptr, * sub = nullptr, * add_t = nullptr, * cl_t = nullptr, * forced = nullptr;
+    const ggml_tensor * sc1 = nullptr, * sc2 = nullptr, * cl_f = nullptr, * bsum = nullptr;
+    const ggml_tensor * start = nullptr, * q = nullptr, * m = nullptr, * spare = nullptr, * bias = nullptr;
+
+    int fin_idx = -1;
+    const int last = std::min(cgraph->n_nodes - 1, i + 48);
+    for (int j = i + 1; j <= last && fin_idx < 0; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        if (n->type != GGML_TYPE_F32 || !ggml_is_contiguous(n) || !ggml_cuda_qsa_score_is_f32_shape(n, nb, n_t, ns)) {
+            return -1;
+        }
+
+        switch (n->op) {
+            case GGML_OP_REPEAT:
+                if (rep != nullptr || !ggml_cuda_qsa_score_is_f32_shape(n->src[0], nb, 1, ns)) {
+                    return -1;
+                }
+                rep   = n;
+                start = n->src[0];
+                break;
+            case GGML_OP_SUB:
+                if (sub != nullptr || rep == nullptr || n->src[0] != rep || !ggml_cuda_qsa_score_is_f32_shape(n->src[1], 1, n_t, ns)) {
+                    return -1;
+                }
+                sub = n;
+                q   = n->src[1];
+                break;
+            case GGML_OP_CLAMP:
+                if (cl_t == nullptr && add_t != nullptr && n->src[0] == add_t) {
+                    cl_t = n;
+                } else if (cl_f == nullptr && sub != nullptr && n->src[0] == sub) {
+                    cl_f = n;
+                } else {
+                    return -1;
+                }
+                break;
+            case GGML_OP_SCALE:
+                if (sc1 == nullptr && forced != nullptr && n->src[0] == forced) {
+                    sc1 = n;
+                } else if (sc2 == nullptr && cl_f != nullptr && n->src[0] == cl_f) {
+                    sc2 = n;
+                } else {
+                    return -1;
+                }
+                if (ggml_get_op_params_f32(n, 1) != 0.0f) {
+                    return -1;
+                }
+                break;
+            case GGML_OP_ADD: {
+                const bool head_sum_next = n_sums < n_heads - 1 && n->src[1] != nullptr &&
+                    (n_sums == 0 ? n->src[0] != nullptr && ggml_cuda_qsa_score_is_head_view(n->src[0], relu, 0) : n->src[0] == sums[n_sums - 1]) &&
+                    ggml_cuda_qsa_score_is_head_view(n->src[1], relu, n_sums + 1);
+                if (head_sum_next) {
+                    sums[n_sums++] = n;
+                } else if (sub != nullptr && add_t == nullptr && n->src[0] == sub && ggml_cuda_qsa_score_is_f32_shape(n->src[1], 1, n_t, ns)) {
+                    add_t = n;
+                    m     = n->src[1];
+                } else if (cl_t != nullptr && forced == nullptr && n->src[0] == cl_t && ggml_cuda_qsa_score_is_f32_shape(n->src[1], nb, 1, ns)) {
+                    forced = n;
+                    spare  = n->src[1];
+                } else if (sc1 != nullptr && sc2 != nullptr && bsum == nullptr && n->src[0] == sc1 && n->src[1] == sc2) {
+                    bsum = n;
+                } else if (n_sums == n_heads - 1 && n->src[0] == sums[n_sums - 1] && n->src[1] != nullptr) {
+                    if (rep != nullptr && n->src[1] != bsum) {
+                        return -1;
+                    }
+                    if (rep == nullptr && !ggml_cuda_qsa_score_is_f32_shape(n->src[1], nb, n_t, ns)) {
+                        return -1;
+                    }
+                    bias    = rep == nullptr ? n->src[1] : nullptr;
+                    fin_idx = j;
+                } else {
+                    return -1;
+                }
+                break;
+            }
+            default:
+                return -1;
+        }
+    }
+    if (fin_idx < 0) {
+        return -1;
+    }
+
+    const bool device_rule = rep != nullptr;
+    if (device_rule && (sub == nullptr || add_t == nullptr || cl_t == nullptr || forced == nullptr || sc1 == nullptr || cl_f == nullptr || sc2 == nullptr || bsum == nullptr)) {
+        return -1;
+    }
+
+    for (int j = i; j < fin_idx; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return -1;
+        }
+        int32_t n_uses = 0;
+        for (int k = j + 1; k <= fin_idx; ++k) {
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                n_uses += cgraph->nodes[k]->src[s] == node;
+            }
+        }
+        if (ggml_node_get_use_count(cgraph, j) != n_uses) {
+            return -1;
+        }
+    }
+
+    for (const ggml_tensor * input : { start, q, m, spare, bias }) {
+        if (input == nullptr) {
+            continue;
+        }
+        const ggml_tensor * root = ggml_cuda_view_root(input);
+        for (int j = i; j <= fin_idx; ++j) {
+            if (cgraph->nodes[j] == root) {
+                return -1;
+            }
+        }
+    }
+
+    e = {};
+    e.score   = score;
+    e.fin     = cgraph->nodes[fin_idx];
+    e.fin_idx = fin_idx;
+    e.start   = start;
+    e.q       = q;
+    e.m       = m;
+    e.spare   = spare;
+    e.bias    = bias;
+    if (device_rule) {
+        e.future_min   = ggml_get_op_params_f32(cl_f, 0);
+        e.future_max   = ggml_get_op_params_f32(cl_f, 1);
+        e.tail_min     = ggml_get_op_params_f32(cl_t, 0);
+        e.tail_max     = ggml_get_op_params_f32(cl_t, 1);
+        e.forced_scale = ggml_get_op_params_f32(sc1, 0);
+        e.future_scale = ggml_get_op_params_f32(sc2, 0);
+    }
+    return fin_idx;
+}
+
+// the fused launch writes fin while it reads the scores and the bias inputs
+static bool ggml_cuda_qsa_score_keeps_reads(const ggml_cuda_qsa_score_epilogue & e) {
+    const char * dst_begin = (const char *) e.fin->data;
+    const char * dst_end   = dst_begin + ggml_nbytes(e.fin);
+    for (const ggml_tensor * src : { e.score, e.start, e.q, e.m, e.spare, e.bias }) {
+        if (src == nullptr) {
+            continue;
+        }
+        const char * src_begin = (const char *) src->data;
+        const char * src_end   = src_begin + ggml_nbytes(src);
+        if (dst_begin < src_end && src_begin < dst_end) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// runs the fused launch, or the unfused nodes with the fused result checked against them; returns the nodes to skip, 0 on overlap
+static int ggml_cuda_qsa_score_run(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i, const ggml_cuda_qsa_score_epilogue & e) {
+    if (!ggml_cuda_qsa_score_keeps_reads(e)) {
+        ++cuda_ctx->qsa_score_fallbacks;
+        return 0;
+    }
+    ++cuda_ctx->qsa_score_launches[e.device_rule() ? 0 : 1];
+
+    if (!ggml_cuda_qsa_score_check_enabled()) {
+        ggml_cuda_op_qsa_score_epilogue(*cuda_ctx, e, (float *) e.fin->data);
+        return e.fin_idx - i;
+    }
+
+    ggml_cuda_pool_alloc<float> fused(cuda_ctx->pool(), ggml_nelements(e.fin));
+    ggml_cuda_op_qsa_score_epilogue(*cuda_ctx, e, fused.get());
+    for (int j = i; j <= e.fin_idx; ++j) {
+        ggml_tensor * node = cgraph->nodes[j];
+        if (!ggml_cuda_is_view_or_noop(node) && (node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            GGML_ASSERT(ggml_cuda_compute_forward(*cuda_ctx, node));
+        }
+    }
+    ggml_cuda_qsa_score_check(*cuda_ctx, e, fused.get());
+    return e.fin_idx - i;
+}
+
 static void ggml_cuda_q8_1_reuse_plan(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int node_idx);
 
 // try and fuse nodes and return the number of nodes to skip
@@ -4771,6 +5001,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (ggml_cuda_get_rows_f16_cast_keeps_reads(node, cpy)) {
                 ggml_cuda_op_get_rows_f16_cast(*cuda_ctx, node, cpy);
                 return count - 1;
+            }
+        }
+        if (node->op == GGML_OP_UNARY) {
+            ggml_cuda_qsa_score_epilogue e;
+            if (ggml_cuda_match_qsa_score_epilogue(cgraph, i, e) >= 0) {
+                if (const int skip = ggml_cuda_qsa_score_run(cuda_ctx, cgraph, i, e); skip > 0) {
+                    return skip;
+                }
             }
         }
     }
@@ -5685,6 +5923,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->gdn_state_gather = nullptr;
             cuda_ctx->hc_inject_deferred = nullptr;
             cuda_ctx->moe_reduce_deferred_idx = -1;
+            cuda_ctx->qsa_score_launches[0] = cuda_ctx->qsa_score_launches[1] = cuda_ctx->qsa_score_fallbacks = 0;
             cuda_ctx->conv_state_fold = {};
             cuda_ctx->mmvf_q8_0_gather   = nullptr;
             cuda_ctx->mmvf_q8_0_consumer = nullptr;
@@ -5834,6 +6073,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
             GGML_ASSERT(cuda_ctx->hc_inject_deferred == nullptr);
             GGML_ASSERT(cuda_ctx->moe_reduce_deferred_idx < 0);
+
+            static int n_qsa_score_logged = 0;
+            static int n_qsa_score_last[3] = {0, 0, 0};
+            const int n_qsa_score[3] = { cuda_ctx->qsa_score_launches[0], cuda_ctx->qsa_score_launches[1], cuda_ctx->qsa_score_fallbacks };
+            if (!std::equal(n_qsa_score, n_qsa_score + 3, n_qsa_score_last) && n_qsa_score_logged < 20) {
+                GGML_LOG_WARN("ggml_cuda: qsa score epilogue: %d device-rule + %d bias launches, %d fell back\n",
+                        n_qsa_score[0], n_qsa_score[1], n_qsa_score[2]);
+                ++n_qsa_score_logged;
+                std::copy(n_qsa_score, n_qsa_score + 3, n_qsa_score_last);
+            }
         }
 
 #ifdef USE_CUDA_GRAPH
@@ -6182,6 +6431,32 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             params->add_alloc_dep(params->user_data, pre->src[0]->view_src ? pre->src[0]->view_src : pre->src[0], pre);
             ++n_hc_up_pre;
             i = pre_idx;
+        }
+
+        // the fused score epilogue reads the bias inputs when it runs, so fin must not take over their memory
+        int n_qsa_score[2] = {0, 0};
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_cuda_qsa_score_epilogue e;
+            const int fin_idx = ggml_cuda_match_qsa_score_epilogue(cgraph, i, e);
+            if (fin_idx < 0) {
+                continue;
+            }
+            for (const ggml_tensor * input : { e.start, e.q, e.m, e.spare, e.bias }) {
+                if (input != nullptr) {
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(ggml_cuda_view_root(input)), e.fin);
+                }
+            }
+            ++n_qsa_score[e.device_rule() ? 0 : 1];
+            i = fin_idx;
+        }
+
+        static int n_qsa_score_logged = 0;
+        static int n_qsa_score_last[2] = {0, 0};
+        if ((n_qsa_score[0] != n_qsa_score_last[0] || n_qsa_score[1] != n_qsa_score_last[1]) && n_qsa_score_logged < 10) {
+            GGML_LOG_WARN("ggml_cuda: qsa score epilogue: %d device-rule, %d bias matched\n", n_qsa_score[0], n_qsa_score[1]);
+            ++n_qsa_score_logged;
+            n_qsa_score_last[0] = n_qsa_score[0];
+            n_qsa_score_last[1] = n_qsa_score[1];
         }
 
         static int n_moe_reduce_add_logged = 0;

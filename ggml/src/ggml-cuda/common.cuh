@@ -1558,6 +1558,10 @@ struct ggml_backend_cuda_context {
     // the index of a MoE weighted reduction left unexecuted, whose sum the next fused sigmoid_mul_add launch computes inline, or -1
     int moe_reduce_deferred_idx = -1;
 
+    // fused QSA score epilogue launches in the current graph (device rule, plain bias) and the matches that ran unfused
+    int qsa_score_launches[2] = {0, 0};
+    int qsa_score_fallbacks   = 0;
+
     // a GET_ROWS of Q8_0 rows left unexecuted, and the one-token F32 matvec that reads the rows in place instead
     const ggml_tensor * mmvf_q8_0_gather   = nullptr;
     const ggml_tensor * mmvf_q8_0_consumer = nullptr;
