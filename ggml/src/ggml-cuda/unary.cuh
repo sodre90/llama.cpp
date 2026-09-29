@@ -106,6 +106,13 @@ void ggml_cuda_scale_silu_raw(const float * x, float * dst, block_q8_1 * dst_q8_
 // add = addend + x * sigmoid(gate), one gate value per row of x
 void ggml_cuda_op_sigmoid_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * sigmoid_node, ggml_tensor * mul_node, ggml_tensor * add_node);
 
+// the same with the addend computed inline as the MoE weighted reduction of experts, expert_scale (may be null) and weights
+void ggml_cuda_op_moe_reduce_sigmoid_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * sigmoid_node, ggml_tensor * mul_node, ggml_tensor * add_node,
+        const ggml_tensor * addend, const ggml_tensor * experts, const ggml_tensor * expert_scale, const ggml_tensor * weights);
+
+bool ggml_cuda_moe_reduce_add_fusion_enabled();
+bool ggml_cuda_moe_reduce_add_check_enabled();
+
 __device__ __forceinline__ float ggml_cuda_op_sigmoid_single(float x) {
     return 1.0f / (1.0f + expf(-x));
 }

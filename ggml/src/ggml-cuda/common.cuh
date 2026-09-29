@@ -1555,6 +1555,9 @@ struct ggml_backend_cuda_context {
     // a BF16 MUL_MAT left unexecuted, whose rows the next fused hc up+pre launch computes
     const ggml_tensor * hc_inject_deferred = nullptr;
 
+    // the index of a MoE weighted reduction left unexecuted, whose sum the next fused sigmoid_mul_add launch computes inline, or -1
+    int moe_reduce_deferred_idx = -1;
+
     // a GET_ROWS of Q8_0 rows left unexecuted, and the one-token F32 matvec that reads the rows in place instead
     const ggml_tensor * mmvf_q8_0_gather   = nullptr;
     const ggml_tensor * mmvf_q8_0_consumer = nullptr;
