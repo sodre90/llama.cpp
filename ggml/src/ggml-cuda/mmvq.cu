@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <numeric>
 #include <type_traits>
 #include <vector>
 
@@ -1121,6 +1122,12 @@ static int ggml_cuda_mmvq_multi_rows() {
     return rows;
 }
 
+// few-row matrices would drop into the few-waves regime, where fewer blocks hide less latency
+static int64_t ggml_cuda_mmvq_multi_rows_min_rows() {
+    static const int64_t min_rows = getenv("GGML_CUDA_MMVQ_MULTI_ROWS_MIN_ROWS") ? std::atoll(getenv("GGML_CUDA_MMVQ_MULTI_ROWS_MIN_ROWS")) : 2048;
+    return min_rows;
+}
+
 bool ggml_cuda_mmvq_multi_rows_check_enabled() {
     static const bool enabled = getenv("GGML_CUDA_MMVQ_MULTI_ROWS_CHECK") != nullptr && std::atoi(getenv("GGML_CUDA_MMVQ_MULTI_ROWS_CHECK"));
     return enabled;
@@ -1407,11 +1414,13 @@ static void mul_mat_vec_q_switch_ncols_dst(
             const int rows = ggml_cuda_mmvq_multi_rows();
             const bool divisible = segments ?
                 std::all_of(segments->nrows, segments->nrows + segments->n, [&](uint32_t n) { return n % rows == 0; }) : nrows_x % rows == 0;
-            if (table_id == MMVQ_PARAMETERS_RDNA4 && divisible && rows == 4) {
+            const int64_t total_rows = segments ? std::accumulate(segments->nrows, segments->nrows + segments->n, (int64_t) 0) : (int64_t) nrows_x;
+            const bool enough_rows = total_rows >= ggml_cuda_mmvq_multi_rows_min_rows();
+            if (table_id == MMVQ_PARAMETERS_RDNA4 && divisible && enough_rows && rows == 4) {
                 launch(std::false_type{}, std::integral_constant<int, 4>{});
                 return;
             }
-            if (table_id == MMVQ_PARAMETERS_RDNA4 && divisible && rows == 2) {
+            if (table_id == MMVQ_PARAMETERS_RDNA4 && divisible && enough_rows && rows == 2) {
                 launch(std::false_type{}, std::integral_constant<int, 2>{});
                 return;
             }
