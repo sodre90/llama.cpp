@@ -131,6 +131,14 @@ static bool ggml_cuda_row_segments_ext_enabled() {
     return enabled;
 }
 
+static bool ggml_cuda_gather_cast_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_CUDA_GATHER_CAST");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static void ggml_cuda_debug_print_tensor(const char * role, const ggml_tensor * t) {
     if (t == nullptr) {
         return;
@@ -4337,6 +4345,52 @@ static int ggml_cuda_match_mul_mat_vec_row_segments(const ggml_cgraph * cgraph, 
     return count;
 }
 
+// GET_ROWS of Q8_0, Q4_0 or F32 rows to F32, then an optional RESHAPE, then a contiguous CPY to F16 from node i: the gather can
+// write the F16 values itself, they come from the same float -> half conversion. Returns how many nodes that is, 0 when none.
+static int ggml_cuda_match_get_rows_f16_cast(const ggml_cgraph * cgraph, const int i) {
+    if (!ggml_cuda_gather_cast_enabled()) {
+        return 0;
+    }
+    const ggml_tensor * gather = cgraph->nodes[i];
+    if (gather->op != GGML_OP_GET_ROWS || gather->type != GGML_TYPE_F32 || gather->src[1]->type != GGML_TYPE_I32 ||
+        !ggml_is_contiguous(gather) || gather->src[1]->ne[3] != 1 || gather->src[0]->nb[0] != ggml_type_size(gather->src[0]->type)) {
+        return 0;
+    }
+    const ggml_type src_type = gather->src[0]->type;
+    if (src_type != GGML_TYPE_Q8_0 && src_type != GGML_TYPE_Q4_0 && src_type != GGML_TYPE_F32) {
+        return 0;
+    }
+
+    const bool has_reshape = i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_RESHAPE;
+    const int  count       = has_reshape ? 3 : 2;
+    if (i + count > cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * cpy = cgraph->nodes[i + count - 1];
+    if (cpy->op != GGML_OP_CPY || cpy->src[0] != cgraph->nodes[i + count - 2] || cpy->src[1] != cpy ||
+        cpy->type != GGML_TYPE_F16 || !ggml_is_contiguous(cpy) || ggml_nelements(cpy) != ggml_nelements(gather)) {
+        return 0;
+    }
+
+    const bool can_fuse = has_reshape ? ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_CPY }, { i + 2 })
+                                      : ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GET_ROWS, GGML_OP_CPY }, { i + 1 });
+    return can_fuse ? count : 0;
+}
+
+// the fused launch writes the F16 output while it reads the rows and their indices
+static bool ggml_cuda_get_rows_f16_cast_keeps_reads(const ggml_tensor * gather, const ggml_tensor * cpy) {
+    const char * dst_begin = (const char *) cpy->data;
+    const char * dst_end   = dst_begin + ggml_nbytes(cpy);
+    for (const ggml_tensor * src : { gather->src[0], gather->src[1] }) {
+        const char * src_begin = (const char *) src->data;
+        const char * src_end   = src_begin + ggml_nbytes(src);
+        if (dst_begin < src_end && src_begin < dst_end) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4482,6 +4536,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
         ggml_cuda_op_rope_fused(*cuda_ctx, rope, set_rows);
         return 2;
+    }
+
+    if (cuda_ctx->stream_context().concurrent_events.empty()) {
+        if (const int count = ggml_cuda_match_get_rows_f16_cast(cgraph, i); count > 0) {
+            ggml_tensor * cpy = cgraph->nodes[i + count - 1];
+            if (ggml_cuda_get_rows_f16_cast_keeps_reads(node, cpy)) {
+                ggml_cuda_op_get_rows_f16_cast(*cuda_ctx, node, cpy);
+                return count - 1;
+            }
+        }
     }
 
     // Snake activation: y = x + sin(a*x)^2 * inv_b
@@ -5754,6 +5818,17 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
             params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[1], cgraph->nodes[i + n_fused - 1]);
             i += n_fused - 1;
+        }
+
+        // the fused gather writes the F16 copy while it reads the rows and their indices, so the copy must not take over them
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const int count = ggml_cuda_match_get_rows_f16_cast(cgraph, i);
+            if (count == 0) {
+                continue;
+            }
+            params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[0], cgraph->nodes[i + count - 1]);
+            params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[1], cgraph->nodes[i + count - 1]);
+            i += count - 1;
         }
 
         // a folded conv history reads x and the rows only when the conv runs, so its outputs must not take over them

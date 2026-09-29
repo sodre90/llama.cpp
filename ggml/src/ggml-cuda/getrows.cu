@@ -2,6 +2,7 @@
 #include "dequantize.cuh"
 #include "convert.cuh"
 
+#include <atomic>
 #include <cinttypes>
 #include <cstring>
 #include <vector>
@@ -585,6 +586,37 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     get_rows_cuda(src0->data, src0->type, (const int32_t *) src1->data, dst->data, dst->type,
         ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+}
+
+void ggml_cuda_op_get_rows_f16_cast(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * cpy) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    GGML_ASSERT(src1->type == GGML_TYPE_I32);
+    GGML_ASSERT(ne13 == 1);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && cpy->type == GGML_TYPE_F16);
+    GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(cpy));
+
+    GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));
+    GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));
+
+    if (ggml_cuda_check_get_rows_enabled()) {
+        ggml_cuda_check_get_rows_indices(dst, ctx.stream());
+    }
+
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+        GGML_LOG_WARN("ggml_cuda: get_rows + f16 cast fused\n");
+    }
+
+    const size_t nb1_f16 = ne0*sizeof(half);
+    const size_t nb2_f16 = ne1*nb1_f16;
+    const size_t nb3_f16 = ne2*nb2_f16;
+
+    get_rows_cuda(src0->data, src0->type, (const int32_t *) src1->data, cpy->data, GGML_TYPE_F16,
+        ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1_f16, nb2_f16, nb3_f16, ctx.stream());
 }
 
 void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
