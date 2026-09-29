@@ -1500,6 +1500,7 @@ struct ggml_backend_cuda_context {
         int    next    = 0; // the slot the next quantization overwrites
         size_t size    = 0; // of each slot
         bool   enabled = false;
+        bool   match_rows = false;
 
         // set per node by the graph walk: the tensor whose producer may also write its q8_1 copy, and the src1 of the
         // mul_mat_vec_q that reads it next
@@ -1523,10 +1524,16 @@ struct ggml_backend_cuda_context {
             return true;
         }
 
+        // contiguous views with the same rows quantize to the same q8_1 bytes
+        static bool same_rows(const ggml_tensor * a, const ggml_tensor * b) {
+            return a->data == b->data && a->type == b->type && a->ne[0] == b->ne[0] && ggml_nrows(a) == ggml_nrows(b) &&
+                   ggml_is_contiguous(a) && ggml_is_contiguous(b);
+        }
+
         slot * find(const ggml_tensor * src, size_t nbytes) {
             for (int k = 0; k < n_slots; ++k) {
                 slot & s = slots[k];
-                if (s.src != nullptr && s.nbytes == nbytes && same_elements(s.src, src)) {
+                if (s.src != nullptr && s.nbytes == nbytes && (same_elements(s.src, src) || (match_rows && same_rows(s.src, src)))) {
                     return &s;
                 }
             }
