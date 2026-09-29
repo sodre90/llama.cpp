@@ -2823,6 +2823,9 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     if (ggml_cuda_mmvq_multi_rows_check_enabled()) {
         return false;
     }
+    if (ggml_cuda_mmvq_trim_warps_check_enabled()) {
+        return false;
+    }
     if (ggml_cuda_q8_1_preq_check_enabled()) {
         return false;
     }
