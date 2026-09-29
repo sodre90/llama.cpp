@@ -33,6 +33,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/moe-cache.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -2347,6 +2348,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_CPY:
             ggml_cuda_cpy(ctx, dst->src[0], dst->src[1]);
+            if (dst->src[2] != nullptr) {
+                ggml_cuda_moe_cache_assign(ctx, dst);
+            }
             break;
         case GGML_OP_CONT:
             ggml_cuda_dup(ctx, dst);
@@ -4145,7 +4149,7 @@ static int ggml_cuda_topk_moe_ids_copy(const ggml_cgraph * cgraph, int node_idx,
         if (ggml_cuda_is_view_or_noop(node)) {
             continue;
         }
-        if (node->op != GGML_OP_CPY || node->src[0] != ids || node->type != GGML_TYPE_I32 ||
+        if (node->op != GGML_OP_CPY || node->src[2] != nullptr || node->src[0] != ids || node->type != GGML_TYPE_I32 ||
             !ggml_is_contiguous(node) || !ggml_are_same_shape(node, ids)) {
             return -1;
         }

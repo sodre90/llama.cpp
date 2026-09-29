@@ -2095,6 +2095,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
+        llama_moe_cache_ubatch_begin(sched.get(), ubatch.n_tokens);
+
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
         if (!res) {

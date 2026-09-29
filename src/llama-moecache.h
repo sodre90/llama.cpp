@@ -29,6 +29,8 @@
 // place over the host link, so a decode step is one device graph instead of
 // a device/CPU hand-off per layer. The graph copies its routing to the device,
 // and llama_moe_cache_step() reads it back to drive the LRU.
+// LLAMA_MOE_CACHE_DEVICE=1 moves the policy to the device: a kernel after the routing copy picks victims and
+// the matvec kernels fill them while computing; llama_moe_cache_step() only mirrors the device state.
 //
 // Enabled via llama_context_params.n_moe_cache_slots (CLI: --moe-expert-cache).
 
@@ -73,6 +75,12 @@ struct llama_moe_cache_layer {
     // (row routing_row), for llama_moe_cache_step() to observe; entries it did not write are -1
     ggml_tensor * routing     = nullptr;
     int32_t       routing_row = 0;
+
+    // device policy (LLAMA_MOE_CACHE_DEVICE): I32 state of this layer (layout in llama-moecache.cpp) and the
+    // view of its fill_slot part, which the cache mul_mat_ids read
+    bool          device_policy = false;
+    ggml_tensor * dev_state     = nullptr;
+    ggml_tensor * fill_slot     = nullptr;
 };
 
 // build the cache for every host-resident expert layer of the model.
@@ -98,6 +106,10 @@ bool llama_moe_cache_expert_rows(const ggml_tensor * weight, const ggml_tensor *
 // ubatch, 0 = off). The new mapping is published by the next llama_moe_cache_step().
 void llama_moe_cache_warm_from_staging(const ggml_tensor * weight, const ggml_tensor * staged,
         const int32_t * ids, int64_t ne0, int64_t ne1, size_t s0, size_t s1, ggml_backend_t backend, void * user_data);
+
+// device policy: call before each ubatch of a decode. A ubatch too large for the cache matvecs stages experts
+// from the host table, so it first mirrors what earlier ubatches of the same decode changed on the device
+void llama_moe_cache_ubatch_begin(ggml_backend_sched_t sched, int64_t n_tokens);
 
 // apply throttled LRU updates; call between graph executions only. Waits for sched's graph when the routing
 // has to be read back from the device
