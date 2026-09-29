@@ -1531,7 +1531,7 @@ static void mmvq_q8_1_reuse_log_miss(ggml_backend_cuda_context & ctx, const ggml
         const ggml_tensor * src1, const ggml_tensor * ids, const bool has_fusion, const size_t q8_1_nbytes, const int64_t ncols_dst,
         const bool reusable) {
     static std::atomic<int> n_logged[9];
-    if (ncols_dst < 1 || ncols_dst > 8 || n_logged[ncols_dst].fetch_add(1) >= 100) {
+    if (ncols_dst < 1 || ncols_dst > 8 || n_logged[ncols_dst].fetch_add(1) >= 1000) {
         return;
     }
 

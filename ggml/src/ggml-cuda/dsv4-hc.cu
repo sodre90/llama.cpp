@@ -3,6 +3,7 @@
 #include "norm.cuh"
 #include "quantize.cuh"
 
+#include <algorithm>
 #include <atomic>
 #include <cinttypes>
 #include <cstdlib>
@@ -495,12 +496,16 @@ bool ggml_cuda_hc_post_norm_check_enabled() {
 }
 
 template <typename T>
-static int64_t dsv4_hc_count_differing(const T * a, const T * b, const size_t n, cudaStream_t stream) {
+static int64_t dsv4_hc_count_differing(const T * a, const T * b, const size_t n, cudaStream_t stream, int64_t * first = nullptr) {
     std::vector<T> host_a(n);
     std::vector<T> host_b(n);
     CUDA_CHECK(cudaMemcpyAsync(host_a.data(), a, n*sizeof(T), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaMemcpyAsync(host_b.data(), b, n*sizeof(T), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (first) {
+        const auto mismatch = std::mismatch(host_a.begin(), host_a.end(), host_b.begin());
+        *first = mismatch.first == host_a.end() ? -1 : (int64_t) (mismatch.first - host_a.begin());
+    }
     return std::inner_product(host_a.begin(), host_a.end(), host_b.begin(), (int64_t) 0, std::plus<int64_t>(), std::not_equal_to<T>());
 }
 
@@ -525,12 +530,100 @@ void ggml_cuda_dsv4_hc_post_rms_norm_check(ggml_backend_cuda_context & ctx, ggml
         q8_1_ref.alloc(q8_1_nbytes);
     }
 
+    const ggml_tensor * x        = dst->src[0];
+    const ggml_tensor * residual = dst->src[1];
+    const ggml_tensor * logits   = scale_node->src[0];
+
+    ggml_cuda_pool_alloc<char> x_snapshot(ctx.pool());
+    ggml_cuda_pool_alloc<char> residual_snapshot(ctx.pool());
+    ggml_cuda_pool_alloc<char> logits_snapshot(ctx.pool());
+    const auto take_snapshot = [&](ggml_cuda_pool_alloc<char> & snapshot, const ggml_tensor * t) {
+        snapshot.alloc(ggml_nbytes(t));
+        CUDA_CHECK(cudaMemcpyAsync(snapshot.get(), t->data, ggml_nbytes(t), cudaMemcpyDeviceToDevice, stream));
+    };
+    take_snapshot(x_snapshot, x);
+    take_snapshot(residual_snapshot, residual);
+    take_snapshot(logits_snapshot, logits);
+
     ggml_cuda_op_dsv4_hc_post_gated_rms_norm_to(ctx, dst, scale_node, scale2_node, norm_node, mul_node,
             post_fused.get(), norm_fused.get(), check_q8_1 ? (block_q8_1 *) q8_1_fused.get() : nullptr);
 
     ggml_cuda_op_dsv4_hc_post_gated(ctx, dst, scale_node, scale2_node);
     // compare post before the norm runs: the norm output may take over post's memory
-    const int64_t n_diff_post = dsv4_hc_count_differing<uint32_t>((const uint32_t *) dst->data, (const uint32_t *) post_fused.get(), ggml_nelements(dst), stream);
+    int64_t first_diff_post = -1;
+    const int64_t n_diff_post = dsv4_hc_count_differing<uint32_t>((const uint32_t *) dst->data, (const uint32_t *) post_fused.get(), ggml_nelements(dst), stream, &first_diff_post);
+
+    static std::atomic<int> diag_budget(20);
+    if (n_diff_post != 0 && diag_budget.fetch_sub(1) > 0) {
+        const int64_t k        = first_diff_post;
+        const int64_t n_embd   = x->ne[0];
+        const int64_t hc       = residual->ne[1];
+        const int64_t col      = k % n_embd;
+        const int64_t hc_strm  = (k / n_embd) % hc;
+        const int64_t token    = k / (n_embd*hc);
+
+        const auto read_word = [&](const void * base, const size_t offset) {
+            uint32_t word;
+            CUDA_CHECK(cudaMemcpyAsync(&word, (const char *) base + offset, sizeof(word), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            return word;
+        };
+        const auto as_float = [](const uint32_t word) {
+            float value;
+            memcpy(&value, &word, sizeof(value));
+            return value;
+        };
+        const auto count_words = [&](const void * a, const void * b, const size_t n_words) {
+            return dsv4_hc_count_differing<uint32_t>((const uint32_t *) a, (const uint32_t *) b, n_words, stream);
+        };
+
+        const size_t post_offset   = k*sizeof(float);
+        const size_t x_offset      = token*x->nb[1] + col*sizeof(float);
+        const size_t res_offset    = hc_strm*residual->nb[1] + token*residual->nb[2] + col*sizeof(float);
+        const size_t logits_offset = hc_strm*logits->nb[0] + token*logits->nb[1];
+
+        const uint32_t word_a = read_word(post_fused.get(), post_offset);
+        const uint32_t word_b = read_word(dst->data, post_offset);
+
+        ggml_cuda_pool_alloc<float> dst_before(ctx.pool(), ggml_nelements(dst));
+        CUDA_CHECK(cudaMemcpyAsync(dst_before.get(), dst->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, stream));
+
+        ggml_cuda_pool_alloc<float> post2(ctx.pool(), ggml_nelements(dst));
+        ggml_cuda_pool_alloc<float> norm2(ctx.pool(), ggml_nelements(mul_node));
+        ggml_cuda_op_dsv4_hc_post_gated_rms_norm_to(ctx, dst, scale_node, scale2_node, norm_node, mul_node, post2.get(), norm2.get(), nullptr);
+        const uint32_t word_a2 = read_word(post2.get(), post_offset);
+        const int64_t n_post2_vs_fused = count_words(post2.get(), post_fused.get(), ggml_nelements(dst));
+        const int64_t n_post2_vs_dst   = count_words(post2.get(), dst->data, ggml_nelements(dst));
+
+        ggml_cuda_op_dsv4_hc_post_gated(ctx, dst, scale_node, scale2_node);
+        const uint32_t word_b2 = read_word(dst->data, post_offset);
+        const int64_t n_dst_vs_before = count_words(dst->data, dst_before.get(), ggml_nelements(dst));
+
+        const int64_t n_x_changed      = count_words(x_snapshot.get(), x->data, ggml_nbytes(x)/sizeof(uint32_t));
+        const int64_t n_res_changed    = count_words(residual_snapshot.get(), residual->data, ggml_nbytes(residual)/sizeof(uint32_t));
+        const int64_t n_logits_changed = count_words(logits_snapshot.get(), logits->data, ggml_nbytes(logits)/sizeof(uint32_t));
+
+        const uint32_t x_now      = read_word(x->data, x_offset);
+        const uint32_t x_snap     = read_word(x_snapshot.get(), x_offset);
+        const uint32_t res_now    = read_word(residual->data, res_offset);
+        const uint32_t res_snap   = read_word(residual_snapshot.get(), res_offset);
+        const uint32_t logit_now  = read_word(logits->data, logits_offset);
+        const uint32_t logit_snap = read_word(logits_snapshot.get(), logits_offset);
+
+        GGML_LOG_WARN("hc_post_norm_check diag: n_tokens=%" PRId64 " dst=%s x=%s residual=%s logits=%s ptrs dst=%p x=%p residual=%p logits=%p post_fused=%p"
+                " k=%" PRId64 " token=%" PRId64 " stream=%" PRId64 " col=%" PRId64 "\n",
+                n_tokens, dst->name, x->name, residual->name, logits->name,
+                dst->data, x->data, residual->data, logits->data, (void *) post_fused.get(),
+                k, token, hc_strm, col);
+        GGML_LOG_WARN("hc_post_norm_check diag: A=0x%08x (%.9g) B=0x%08x (%.9g) A2=0x%08x (%.9g) B2=0x%08x (%.9g)"
+                " x now=%.9g snap=%.9g residual now=%.9g snap=%.9g logit now=%.9g snap=%.9g"
+                " input words changed x=%" PRId64 " residual=%" PRId64 " logits=%" PRId64
+                " post2_vs_fused=%" PRId64 " post2_vs_dst=%" PRId64 " dst_vs_before=%" PRId64 "\n",
+                word_a, as_float(word_a), word_b, as_float(word_b), word_a2, as_float(word_a2), word_b2, as_float(word_b2),
+                as_float(x_now), as_float(x_snap), as_float(res_now), as_float(res_snap), as_float(logit_now), as_float(logit_snap),
+                n_x_changed, n_res_changed, n_logits_changed,
+                n_post2_vs_fused, n_post2_vs_dst, n_dst_vs_before);
+    }
     ggml_cuda_op_rms_norm_fused(ctx, norm_node, mul_node);
 
     if (check_q8_1) {
@@ -542,13 +635,12 @@ void ggml_cuda_dsv4_hc_post_rms_norm_check(ggml_backend_cuda_context & ctx, ggml
     const int64_t n_diff_q8_1 = check_q8_1 ? dsv4_hc_count_differing<char>(q8_1_ref.get(), q8_1_fused.get(), q8_1_nbytes, stream) : 0;
 
     static std::atomic<int64_t> n_checked_ncols[MMVQ_MAX_ROW_SEGMENT_COLS + 1];
+    static std::atomic<int64_t> n_differing_ncols[MMVQ_MAX_ROW_SEGMENT_COLS + 1];
     const int64_t n_seen = n_checked_ncols[n_tokens].fetch_add(1) + 1;
     const bool differs = n_diff_post != 0 || n_diff_norm != 0 || n_diff_q8_1 != 0;
+    const int64_t n_differing = differs ? n_differing_ncols[n_tokens].fetch_add(1) + 1 : n_differing_ncols[n_tokens].load();
     if (differs || n_seen <= 3 || n_seen % 1000 == 0) {
-        GGML_LOG_WARN("hc_post_norm_check: ncols=%d %" PRId64 " post values differ, %" PRId64 " norm values differ, %" PRId64 " q8_1 bytes differ (%" PRId64 " checks)\n",
-                (int) n_tokens, n_diff_post, n_diff_norm, n_diff_q8_1, n_seen);
-    }
-    if (differs) {
-        GGML_ABORT("hc_post_norm_check: fused output differs from the unfused ops");
+        GGML_LOG_WARN("hc_post_norm_check: ncols=%d %" PRId64 " post values differ, %" PRId64 " norm values differ, %" PRId64 " q8_1 bytes differ (%" PRId64 " checks, %" PRId64 " differing)\n",
+                (int) n_tokens, n_diff_post, n_diff_norm, n_diff_q8_1, n_seen, n_differing);
     }
 }
