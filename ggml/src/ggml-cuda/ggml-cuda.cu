@@ -2863,6 +2863,9 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     if (ggml_cuda_hc_up_pre_check_enabled()) {
         return false;
     }
+    if (ggml_cuda_moe_reduce_add_check_enabled()) {
+        return false;
+    }
     if (ggml_cuda_mmvq_quant_prologue_check_enabled()) {
         return false;
     }
@@ -3995,8 +3998,8 @@ static bool ggml_cuda_hc_inject_defer(ggml_backend_cuda_context * cuda_ctx, cons
     return ggml_cuda_check_fusion_memory_ranges(cgraph, scale_idx, pre_idx - scale_idx + 1, out_nodes, 1);
 }
 
-// SIGMOID of one gate value per row -> MUL into the rows -> ADD of a same-shape tensor
-static bool ggml_cuda_should_fuse_sigmoid_mul_add(const ggml_cgraph * cgraph, int node_idx) {
+// SIGMOID of one gate value per row -> MUL into the rows -> ADD of a same-shape tensor, without the memory checks
+static bool ggml_cuda_match_sigmoid_mul_add(const ggml_cgraph * cgraph, int node_idx) {
     const std::initializer_list<enum ggml_op> ops = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
     if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
         return false;
@@ -4018,10 +4021,21 @@ static bool ggml_cuda_should_fuse_sigmoid_mul_add(const ggml_cgraph * cgraph, in
             return false;
         }
     }
-    if (gate->ne[0] != 1 || gate->ne[1] != x->ne[1] || gate->ne[2] != x->ne[2] || gate->ne[3] != x->ne[3] ||
-        !ggml_are_same_shape(x, addend) || !ggml_are_same_shape(x, add)) {
+    return gate->ne[0] == 1 && gate->ne[1] == x->ne[1] && gate->ne[2] == x->ne[2] && gate->ne[3] == x->ne[3] &&
+        ggml_are_same_shape(x, addend) && ggml_are_same_shape(x, add);
+}
+
+static bool ggml_cuda_should_fuse_sigmoid_mul_add(const ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_cuda_match_sigmoid_mul_add(cgraph, node_idx)) {
         return false;
     }
+
+    const ggml_tensor * sigmoid = cgraph->nodes[node_idx];
+    const ggml_tensor * mul     = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * add     = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * gate    = sigmoid->src[0];
+    const ggml_tensor * x       = mul->src[0] == sigmoid ? mul->src[1] : mul->src[0];
+    const ggml_tensor * addend  = add->src[0] == mul     ? add->src[1] : add->src[0];
 
     // each element is read before it is written, so the ADD may run in place over x or the addend,
     // but not over the gates that every element of a row reads
@@ -4033,6 +4047,74 @@ static bool ggml_cuda_should_fuse_sigmoid_mul_add(const ggml_cgraph * cgraph, in
     return !overlaps(add, gate) &&
         (!overlaps(add, x)      || add->data == x->data) &&
         (!overlaps(add, addend) || add->data == addend->data);
+}
+
+// the index of the sigmoid_mul_add that adds the MoE weighted reduction at node_idx a few nodes later, or -1
+static int ggml_cuda_moe_reduce_add_sigmoid_index(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_moe_weighted_reduction_match & match) {
+    if (ggml_cuda_fusion_disabled() || !ggml_cuda_moe_reduce_add_fusion_enabled() ||
+            !ggml_cuda_match_moe_weighted_reduction(cgraph, node_idx, match)) {
+        return -1;
+    }
+
+    const int max_nodes = 24;
+    const int first     = node_idx + match.node_count;
+    for (int j = first; j < std::min(cgraph->n_nodes - 2, first + max_nodes); ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (node->op == GGML_OP_UNARY && ggml_cuda_match_sigmoid_mul_add(cgraph, j)) {
+            const ggml_tensor * mul    = cgraph->nodes[j + 1];
+            const ggml_tensor * add    = cgraph->nodes[j + 2];
+            const ggml_tensor * x      = mul->src[0] == node ? mul->src[1] : mul->src[0];
+            const ggml_tensor * addend = add->src[0] == mul  ? add->src[1] : add->src[0];
+            if (addend == match.dst && x != match.dst && node->src[0] != match.dst) {
+                return j;
+            }
+        }
+        // nothing else may read the reduction's output
+        for (const ggml_tensor * src : node->src) {
+            if (src != nullptr && (src == match.dst || src->view_src == match.dst)) {
+                return -1;
+            }
+        }
+    }
+    return -1;
+}
+
+// the node count of the MoE weighted reduction at node_idx when it can be left unexecuted for the sigmoid_mul_add launch, or 0
+static int ggml_cuda_moe_reduce_add_defer(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int node_idx) {
+    if (cuda_ctx->moe_reduce_deferred_idx >= 0 || !cuda_ctx->stream_context().concurrent_events.empty() ||
+            cgraph->nodes[node_idx]->op != GGML_OP_MUL) {
+        return 0;
+    }
+
+    ggml_cuda_moe_weighted_reduction_match match;
+    // graph_optimize also calls the index above, before the buffers exist, so the memory checks are only here
+    const int sigmoid_idx = ggml_cuda_moe_reduce_add_sigmoid_index(cgraph, node_idx, match);
+    if (sigmoid_idx < 0 || !ggml_cuda_should_fuse_sigmoid_mul_add(cgraph, sigmoid_idx)) {
+        return 0;
+    }
+
+    const int output_idx = node_idx + match.node_count - 1;
+    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, match.node_count, &output_idx, 1)) {
+        return 0;
+    }
+
+    // the launch reads the reduction's inputs after the nodes in between ran, so none of them may write over the inputs
+    const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a_begin = (const char *) a->data;
+        const char * b_begin = (const char *) b->data;
+        return a_begin < b_begin + ggml_nbytes(b) && b_begin < a_begin + ggml_nbytes(a);
+    };
+    for (int k = node_idx + match.node_count; k <= sigmoid_idx + 2; ++k) {
+        const ggml_tensor * node = cgraph->nodes[k];
+        if (ggml_cuda_is_view_or_noop(node)) {
+            continue;
+        }
+        if (overlaps(node, match.experts) || overlaps(node, match.weights) ||
+                (match.expert_scale != nullptr && overlaps(node, match.expert_scale))) {
+            return 0;
+        }
+    }
+    return match.node_count;
 }
 
 // the node index of a CPY of the fused top-k ids that follows them past views, such as the MoE expert cache's
@@ -5376,6 +5458,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_should_fuse_sigmoid_mul_add(cgraph, i)) {
+        if (cuda_ctx->moe_reduce_deferred_idx >= 0) {
+            ggml_cuda_moe_weighted_reduction_match match;
+            GGML_ASSERT(ggml_cuda_match_moe_weighted_reduction(cgraph, cuda_ctx->moe_reduce_deferred_idx, match));
+            const ggml_tensor * mul = cgraph->nodes[i + 1];
+            const ggml_tensor * add = cgraph->nodes[i + 2];
+            if ((add->src[0] == mul ? add->src[1] : add->src[0]) == match.dst) {
+                ggml_cuda_op_moe_reduce_sigmoid_mul_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2],
+                    match.dst, match.experts, match.expert_scale, match.weights);
+                cuda_ctx->moe_reduce_deferred_idx = -1;
+                return 2;
+            }
+        }
         ggml_cuda_op_sigmoid_mul_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
     }
@@ -5622,6 +5716,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
             cuda_ctx->gdn_state_gather = nullptr;
             cuda_ctx->hc_inject_deferred = nullptr;
+            cuda_ctx->moe_reduce_deferred_idx = -1;
             cuda_ctx->conv_state_fold = {};
             cuda_ctx->mmvf_q8_0_gather   = nullptr;
             cuda_ctx->mmvf_q8_0_consumer = nullptr;
@@ -5678,6 +5773,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     cuda_ctx->hc_inject_deferred = node;
                     // nothing reads the inject before the launch that writes it, so its q8_1 slots can go now
                     ggml_cuda_q8_1_reuse_drop_overwritten(cuda_ctx, cgraph, i, i);
+                    continue;
+                }
+
+                if (const int moe_reduce_nodes = ggml_cuda_moe_reduce_add_defer(cuda_ctx, cgraph, i)) {
+                    cuda_ctx->moe_reduce_deferred_idx = i;
+                    ggml_cuda_q8_1_reuse_drop_overwritten(cuda_ctx, cgraph, i, i + moe_reduce_nodes - 1);
+                    i += moe_reduce_nodes - 1;
                     continue;
                 }
 
@@ -5763,6 +5865,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                }
             }
             GGML_ASSERT(cuda_ctx->hc_inject_deferred == nullptr);
+            GGML_ASSERT(cuda_ctx->moe_reduce_deferred_idx < 0);
         }
 
 #ifdef USE_CUDA_GRAPH
@@ -5964,6 +6067,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 break;
             }
         }
+        int n_moe_reduce_add = 0;
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             ggml_cuda_moe_weighted_reduction_match match;
             if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
@@ -5972,6 +6076,18 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 if (match.expert_scale != nullptr) {
                     params->add_alloc_dep(
                         params->user_data, const_cast<ggml_tensor *>(match.expert_scale), match.dst);
+                }
+                ggml_cuda_moe_weighted_reduction_match reduce_add_match;
+                const int sigmoid_idx = ggml_cuda_moe_reduce_add_sigmoid_index(cgraph, i, reduce_add_match);
+                if (sigmoid_idx >= 0) {
+                    // the fused launch reads the reduction's inputs when the ADD runs
+                    ggml_tensor * add = cgraph->nodes[sigmoid_idx + 2];
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), add);
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.weights), add);
+                    if (match.expert_scale != nullptr) {
+                        params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.expert_scale), add);
+                    }
+                    ++n_moe_reduce_add;
                 }
                 i += match.node_count - 1;
             }
@@ -6098,6 +6214,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             params->add_alloc_dep(params->user_data, pre->src[0]->view_src ? pre->src[0]->view_src : pre->src[0], pre);
             ++n_hc_up_pre;
             i = pre_idx;
+        }
+
+        static int n_moe_reduce_add_logged = 0;
+        static int n_moe_reduce_add_last   = 0;
+        if (n_moe_reduce_add != n_moe_reduce_add_last && n_moe_reduce_add_logged < 10) {
+            GGML_LOG_WARN("ggml_cuda: moe reduce+add fused: %d matched\n", n_moe_reduce_add);
+            ++n_moe_reduce_add_logged;
+            n_moe_reduce_add_last = n_moe_reduce_add;
         }
 
         static int n_hc_up_pre_logged = 0;

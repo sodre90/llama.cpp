@@ -1,5 +1,11 @@
 #include "unary.cuh"
 #include "convert.cuh"
+#include "moe-weighted-reduction.cuh"
+
+#include <atomic>
+#include <cinttypes>
+#include <functional>
+#include <numeric>
 
 static __device__ __forceinline__ float op_abs(float x) {
     return fabsf(x);
@@ -842,4 +848,108 @@ void ggml_cuda_op_sigmoid_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor *
     ggml_cuda_kernel_launch(sigmoid_mul_add_kernel, launch_params,
             (const float *) gate->data, (const float *) x->data, (const float *) addend->data, (float *) add_node->data,
             (int) x->ne[0], k);
+}
+
+static __global__ void moe_reduce_sigmoid_mul_add_kernel(const float * experts, const float * expert_scale, const float * weights,
+                                                         const float * gate, const float * x, float * dst,
+                                                         const int ne0, const int k, const int n_expert_used) {
+    ggml_cuda_pdl_lc();
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    const int   token = i / ne0;
+    const int   col   = i - token*ne0;
+    const float sum   = moe_weighted_reduction_sum(experts, expert_scale, weights, token, col, ne0, n_expert_used);
+    dst[i] = __fadd_rn(sum, __fmul_rn(x[i], op_sigmoid(gate[token])));
+}
+
+bool ggml_cuda_moe_reduce_add_fusion_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MOE_REDUCE_ADD_FUSION");
+        const bool on = env == nullptr || std::atoi(env) != 0;
+        GGML_LOG_WARN("ggml_cuda: moe reduce+add fusion: %s\n", on ? "on" : "off");
+        return on;
+    }();
+    return enabled;
+}
+
+bool ggml_cuda_moe_reduce_add_check_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_MOE_REDUCE_ADD_CHECK") != nullptr && std::atoi(getenv("GGML_CUDA_MOE_REDUCE_ADD_CHECK"));
+    return enabled;
+}
+
+static int64_t moe_reduce_add_count_differing_bits(const float * a, const float * b, const size_t n, cudaStream_t stream) {
+    std::vector<uint32_t> host_a(n);
+    std::vector<uint32_t> host_b(n);
+    CUDA_CHECK(cudaMemcpyAsync(host_a.data(), a, n*sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(host_b.data(), b, n*sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return std::inner_product(host_a.begin(), host_a.end(), host_b.begin(), (int64_t) 0, std::plus<int64_t>(), std::not_equal_to<uint32_t>());
+}
+
+// the unfused result, computed before the fused launch because the ADD may run in place over x
+static void moe_reduce_sigmoid_mul_add_reference(ggml_backend_cuda_context & ctx, const ggml_tensor * addend, const ggml_tensor * experts,
+        const ggml_tensor * expert_scale, const ggml_tensor * weights, const ggml_tensor * gate, const ggml_tensor * x, float * reference) {
+    const int64_t n = ggml_nelements(x);
+    ggml_cuda_pool_alloc<float> reduced(ctx.pool(), n);
+
+    ggml_tensor reduced_node = *addend;
+    reduced_node.data = reduced.get();
+    ggml_cuda_op_moe_weighted_reduction(ctx, experts, expert_scale, weights, &reduced_node);
+
+    const int k = (int) n;
+    const int num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(sigmoid_mul_add_kernel, launch_params,
+            (const float *) gate->data, (const float *) x->data, (const float *) reduced.get(), reference, (int) x->ne[0], k);
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+}
+
+static void moe_reduce_sigmoid_mul_add_compare(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * add_node, const float * reference) {
+    const int64_t n_diff = moe_reduce_add_count_differing_bits((const float *) add_node->data, reference, ggml_nelements(add_node), ctx.stream());
+
+    static std::atomic<int64_t> n_checked{0};
+    const int64_t n_seen = n_checked.fetch_add(1) + 1;
+    if (n_diff != 0 || n_seen % 1000 == 1) {
+        GGML_LOG_WARN("moe_reduce_add_check: ntok=%d n_embd=%d %" PRId64 " values differ (%" PRId64 " checked)\n",
+                (int) x->ne[1], (int) x->ne[0], n_diff, n_seen);
+    }
+    GGML_ASSERT(n_diff == 0);
+}
+
+void ggml_cuda_op_moe_reduce_sigmoid_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * sigmoid_node, ggml_tensor * mul_node, ggml_tensor * add_node,
+        const ggml_tensor * addend, const ggml_tensor * experts, const ggml_tensor * expert_scale, const ggml_tensor * weights) {
+    const ggml_tensor * gate = sigmoid_node->src[0];
+    const ggml_tensor * x    = mul_node->src[0] == sigmoid_node ? mul_node->src[1] : mul_node->src[0];
+
+    GGML_ASSERT(ggml_is_contiguous(gate) && ggml_is_contiguous(x) && ggml_is_contiguous(add_node));
+    GGML_ASSERT(gate->ne[0] == 1 && ggml_nrows(gate) == ggml_nrows(x));
+    GGML_ASSERT(experts->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(expert_scale == nullptr || expert_scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(experts) && ggml_is_contiguous(weights) && (expert_scale == nullptr || ggml_is_contiguous(expert_scale)));
+    GGML_ASSERT(x->ne[0] == experts->ne[0] && addend->ne[0] == experts->ne[0]);
+    GGML_ASSERT(ggml_nrows(x) == experts->ne[2]*experts->ne[3] && ggml_are_same_shape(x, addend));
+
+    const bool check = ggml_cuda_moe_reduce_add_check_enabled();
+    ggml_cuda_pool_alloc<float> reference(ctx.pool());
+    if (check) {
+        reference.alloc(ggml_nelements(add_node));
+        moe_reduce_sigmoid_mul_add_reference(ctx, addend, experts, expert_scale, weights, gate, x, reference.get());
+    }
+
+    const int k = ggml_nelements(add_node);
+    const int num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(moe_reduce_sigmoid_mul_add_kernel, launch_params,
+            (const float *) experts->data, expert_scale ? (const float *) expert_scale->data : (const float *) nullptr, (const float *) weights->data,
+            (const float *) gate->data, (const float *) x->data, (float *) add_node->data,
+            (int) x->ne[0], k, (int) experts->ne[1]);
+
+    if (check) {
+        moe_reduce_sigmoid_mul_add_compare(ctx, x, add_node, reference.get());
+    }
 }
