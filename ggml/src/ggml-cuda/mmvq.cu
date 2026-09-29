@@ -3,6 +3,7 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
+#include <atomic>
 #include <cstdint>
 #include <type_traits>
 
@@ -617,36 +618,6 @@ static __device__ __forceinline__ uint32_t mmvq_expert_channel(
     return expert;
 }
 
-// see ggml_cuda_mm_fusion_args_host::row_segments; a kernel parameter of its own, so the other launches' arguments stay small
-struct mmvq_row_segments_args {
-    int32_t           n                                  = 0;
-    const void *      x[MMVQ_MAX_ROW_SEGMENTS]           = {};
-    float *           dst[MMVQ_MAX_ROW_SEGMENTS]         = {};
-    uint32_t          nrows[MMVQ_MAX_ROW_SEGMENTS]       = {};
-    uint32_t          first_block[MMVQ_MAX_ROW_SEGMENTS] = {};
-    mmvq_row_epilogue epilogue[MMVQ_MAX_ROW_SEGMENTS]    = {};
-    const float *     bias[MMVQ_MAX_ROW_SEGMENTS]        = {};
-    const float *     scale[MMVQ_MAX_ROW_SEGMENTS]       = {};
-};
-
-struct mmvq_no_row_segments {};
-
-template <bool row_segments>
-using mmvq_row_segments_param = std::conditional_t<row_segments, mmvq_row_segments_args, mmvq_no_row_segments>;
-
-// the same expressions as the graph's ADD, SOFTPLUS + MUL and SIGMOID kernels, so fusing them changes no bits
-static __device__ __forceinline__ float mmvq_apply_row_epilogue(
-        const float x, const mmvq_row_epilogue epilogue, const float * bias, const float * scale, const int row) {
-    switch (epilogue) {
-        case MMVQ_ROW_EPILOGUE_SIGMOID:
-            return ggml_cuda_op_sigmoid_single(x);
-        case MMVQ_ROW_EPILOGUE_SOFTPLUS_BIAS_SCALE:
-            return ggml_cuda_op_softplus_single(x + bias[row]) * scale[row];
-        default:
-            return x;
-    }
-}
-
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool row_segments = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
@@ -916,7 +887,7 @@ static __global__ void mul_mat_vec_q(
                     }
                 }
                 if constexpr (row_segments) {
-                    result = mmvq_apply_row_epilogue(result, epilogue, epilogue_bias, epilogue_scale, row0 + i);
+                    result = ggml_cuda_apply_row_epilogue(result, epilogue, epilogue_bias, epilogue_scale, row0 + i);
                     dst[j*nrows_dst + i] = result;
                 } else {
                     dst[j*stride_col_dst + i] = result;
@@ -1095,7 +1066,7 @@ static __global__ void mul_mat_vec_q_moe(
 }
 
 static constexpr bool mmvq_row_segments_supported(ggml_type type) {
-    return type == GGML_TYPE_Q8_0;
+    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_XS;
 }
 
 bool ggml_cuda_mmvq_row_segments_supported(ggml_type type) {
@@ -1729,11 +1700,27 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     if (segments.n > 0) {
-        mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q8_0>(
-            src0->data, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
-            ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
-            ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
-            ne03,              ne3,           s03, s13,              s3,               ids_stride, stream, &segments);
+        const auto launch_segments = [&](auto type_tag) {
+            mul_mat_vec_q_switch_ncols_dst<decltype(type_tag)::value>(
+                src0->data, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
+                ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
+                ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+                ne03,              ne3,           s03, s13,              s3,               ids_stride, stream, &segments);
+        };
+        static std::atomic<bool> iq4_xs_logged{false};
+        switch (src0->type) {
+            case GGML_TYPE_Q8_0:
+                launch_segments(std::integral_constant<ggml_type, GGML_TYPE_Q8_0>{});
+                break;
+            case GGML_TYPE_IQ4_XS:
+                if (!iq4_xs_logged.exchange(true)) {
+                    GGML_LOG_WARN("ggml_cuda: row segments: IQ4_XS matvecs fused\n");
+                }
+                launch_segments(std::integral_constant<ggml_type, GGML_TYPE_IQ4_XS>{});
+                break;
+            default:
+                GGML_ABORT("unsupported type for row segments: %s", ggml_type_name(src0->type));
+        }
         return;
     }
 

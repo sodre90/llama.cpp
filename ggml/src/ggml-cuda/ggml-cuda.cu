@@ -123,6 +123,14 @@ static bool ggml_cuda_fusion_disabled() {
     return disabled;
 }
 
+static bool ggml_cuda_row_segments_ext_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_CUDA_ROW_SEGMENTS_EXT");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static void ggml_cuda_debug_print_tensor(const char * role, const ggml_tensor * t) {
     if (t == nullptr) {
         return;
@@ -4175,13 +4183,29 @@ static bool ggml_cuda_is_plain_mul_mat_vec_q(const ggml_tensor * node, const int
     const ggml_tensor * src1 = node->src[1];
     const int64_t max_cols = GGML_CUDA_CC_IS_RDNA4(cc) ? MMVQ_MAX_ROW_SEGMENT_COLS : 1;
     return node->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(node, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
-           ggml_cuda_mmvq_row_segments_supported(src0->type) && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+           ggml_cuda_mmvq_row_segments_supported(src0->type) && (src0->type == GGML_TYPE_Q8_0 || ggml_cuda_row_segments_ext_enabled()) &&
+           src0->ne[2] == 1 && src0->ne[3] == 1 &&
            src0->buffer && ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
            src1->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 && ggml_nrows(node) == node->ne[1] &&
            node->ne[1] <= max_cols && ggml_is_contiguous(node) &&
            !ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]) &&
            !ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id =*/ false) &&
            ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1]);
+}
+
+// a MUL_MAT of one token (on RDNA4 up to MMVQ_MAX_ROW_SEGMENT_COLS) on an F32 matrix that ggml_cuda_mul_mat would hand to
+// ggml_cuda_mul_mat_vec_f unfused
+static bool ggml_cuda_is_plain_mul_mat_vec_f(const ggml_tensor * node, const int cc) {
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * src1 = node->src[1];
+    const int64_t max_cols = GGML_CUDA_CC_IS_RDNA4(cc) ? MMVQ_MAX_ROW_SEGMENT_COLS : 1;
+    return ggml_cuda_row_segments_ext_enabled() && node->op == GGML_OP_MUL_MAT &&
+           ggml_get_op_params_i32(node, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
+           src0->type == GGML_TYPE_F32 && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+           src0->buffer && ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+           src1->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 && ggml_nrows(node) == node->ne[1] &&
+           node->ne[1] <= max_cols && ggml_is_contiguous(node) &&
+           ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
 }
 
 // the elementwise tail of a row segment, when the graph continues with it right after the matvecs:
@@ -4250,19 +4274,27 @@ static void ggml_cuda_row_segment_out_nodes(const ggml_cgraph * cgraph, const in
 
 // adjacent MUL_MATs of a few tokens from node i that share src1 and the weight layout, plus the elementwise tails
 // that follow them: one launch covers them all. Returns how many nodes that is, 0 when not worth a fusion.
-static int ggml_cuda_match_mul_mat_vec_q_row_segments(const ggml_cgraph * cgraph, const int i, ggml_cuda_mm_fusion_args_host & fusion) {
+// A run is either all mmvq or all mmvf (F32 weights, which also share one block size).
+static int ggml_cuda_match_mul_mat_vec_row_segments(const ggml_cgraph * cgraph, const int i, ggml_cuda_mm_fusion_args_host & fusion) {
     const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
 
     ggml_tensor * first = cgraph->nodes[i];
-    if (!ggml_cuda_is_plain_mul_mat_vec_q(first, cc, warp_size)) {
+    const bool is_f = ggml_cuda_is_plain_mul_mat_vec_f(first, cc);
+    if (!is_f && !ggml_cuda_is_plain_mul_mat_vec_q(first, cc, warp_size)) {
         return 0;
     }
+    const auto is_plain = [&](const ggml_tensor * node) {
+        return is_f ? ggml_cuda_is_plain_mul_mat_vec_f(node, cc) &&
+                      ggml_cuda_mul_mat_vec_f_block_size(node->src[0]->ne[0], node->ne[0]) ==
+                      ggml_cuda_mul_mat_vec_f_block_size(first->src[0]->ne[0], first->ne[0])
+                    : ggml_cuda_is_plain_mul_mat_vec_q(node, cc, warp_size);
+    };
 
     int n = 1;
     while (n < MMVQ_MAX_ROW_SEGMENTS && i + n < cgraph->n_nodes) {
         const ggml_tensor * node = cgraph->nodes[i + n];
-        const bool same_layout = ggml_cuda_is_plain_mul_mat_vec_q(node, cc, warp_size) && node->src[1] == first->src[1] &&
+        const bool same_layout = is_plain(node) && node->src[1] == first->src[1] &&
                                  node->src[0]->type == first->src[0]->type && node->src[0]->ne[0] == first->src[0]->ne[0] &&
                                  node->src[0]->nb[1] == first->src[0]->nb[1];
         // leave a gate/up pair to its GLU fusion
@@ -5052,12 +5084,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     {
         ggml_cuda_mm_fusion_args_host fusion_data{};
-        if (const int n_fused = ggml_cuda_match_mul_mat_vec_q_row_segments(cgraph, i, fusion_data); n_fused > 0) {
+        if (const int n_fused = ggml_cuda_match_mul_mat_vec_row_segments(cgraph, i, fusion_data); n_fused > 0) {
             int out_nodes[MMVQ_MAX_ROW_SEGMENTS];
             ggml_cuda_row_segment_out_nodes(cgraph, i, n_fused, fusion_data, out_nodes);
             if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_fused, out_nodes, fusion_data.n_row_segments)) {
                 fusion_data.x_node = node;
-                ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], nullptr, node, &fusion_data);
+                if (node->src[0]->type == GGML_TYPE_F32) {
+                    ggml_cuda_mul_mat_vec_f(*cuda_ctx, node->src[0], node->src[1], nullptr, node, &fusion_data);
+                } else {
+                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], nullptr, node, &fusion_data);
+                }
                 return n_fused - 1;
             }
         }
@@ -5712,7 +5748,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         ggml_cuda_set_device(cuda_ctx->device);
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             ggml_cuda_mm_fusion_args_host fusion{};
-            const int n_fused = ggml_cuda_match_mul_mat_vec_q_row_segments(cgraph, i, fusion);
+            const int n_fused = ggml_cuda_match_mul_mat_vec_row_segments(cgraph, i, fusion);
             if (n_fused == 0) {
                 continue;
             }
