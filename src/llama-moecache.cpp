@@ -118,6 +118,8 @@ struct moe_cache {
     ggml_tensor *        routing = nullptr;
     std::vector<int32_t> routing_host;
 
+    FILE * trace = nullptr; // LLAMA_MOE_CACHE_TRACE=<path>: routed ids, one line per layer and token
+
     // async upload worker: slices are copied to the device off the decode
     // thread; the new table mapping is only published at a later step() once
     // the upload has completed, so a running graph never reads a torn slot
@@ -171,6 +173,12 @@ void observe_routed_id(moe_cache & mc, layer_state & ls, int32_t id) {
     }
 }
 
+void trace_routed_ids(moe_cache & mc, int il, const int32_t * ids, int64_t n_ids) {
+    fprintf(mc.trace, "blk.%d.ffn_gate_exps.weight", il);
+    std::for_each(ids, ids + n_ids, [&](int32_t id) { fprintf(mc.trace, " %d", id); });
+    fputc('\n', mc.trace);
+}
+
 void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
     moe_cache * mc = (moe_cache *) ud;
 
@@ -195,10 +203,37 @@ void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
 
     std::lock_guard<std::mutex> lock(mc->mtx);
     for (int64_t t = 0; t < n_tokens; ++t) {
+        if (mc->trace) {
+            std::vector<int32_t> token_ids(n_ids);
+            for (int64_t i = 0; i < n_ids; ++i) {
+                token_ids[i] = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + i*ids->nb[0]);
+            }
+            trace_routed_ids(*mc, il, token_ids.data(), n_ids);
+        }
         for (int64_t i = 0; i < n_ids; ++i) {
             observe_routed_id(*mc, *ls, *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + i*ids->nb[0]));
         }
     }
+}
+
+void trace_device_routing(moe_cache & mc, int64_t n_ids) {
+    const int64_t n_expert_used = n_ids / LLAMA_MOE_CACHE_MAX_TOKENS;
+
+    std::vector<const layer_state *> by_il;
+    for (const auto & ls : mc.layers) {
+        by_il.push_back(&ls);
+    }
+    std::sort(by_il.begin(), by_il.end(), [](const layer_state * a, const layer_state * b) { return a->pub.il < b->pub.il; });
+
+    for (const layer_state * ls : by_il) {
+        const int32_t * row = mc.routing_host.data() + ls->pub.routing_row*n_ids;
+        for (int64_t t = 0; t < LLAMA_MOE_CACHE_MAX_TOKENS; ++t) {
+            if (row[t*n_expert_used] >= 0) {
+                trace_routed_ids(mc, ls->pub.il, row + t*n_expert_used, n_expert_used);
+            }
+        }
+    }
+    fflush(mc.trace);
 }
 
 // the routing a reads_host_experts graph left on the device; call under mc.mtx with no graph in flight
@@ -211,6 +246,10 @@ void observe_device_routing(moe_cache & mc) {
     for (auto & ls : mc.layers) {
         const int32_t * row = mc.routing_host.data() + ls.pub.routing_row*n_ids;
         std::for_each(row, row + n_ids, [&](int32_t id) { observe_routed_id(mc, ls, id); });
+    }
+
+    if (mc.trace) {
+        trace_device_routing(mc, n_ids);
     }
 }
 
@@ -790,6 +829,15 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
             delete mc;
             g_init_done = true; // a real model was seen and allocation failed: stay disabled
             return;
+        }
+
+        if (const char * path = getenv("LLAMA_MOE_CACHE_TRACE")) {
+            mc->trace = fopen(path, "a");
+            if (mc->trace) {
+                LLAMA_LOG_INFO("%s: routing trace on, appending to %s\n", __func__, path);
+            } else {
+                LLAMA_LOG_WARN("%s: cannot open LLAMA_MOE_CACHE_TRACE=%s\n", __func__, path);
+            }
         }
 
         // init LRU state + tables (everything uncached -> dummy slot n_slots)
