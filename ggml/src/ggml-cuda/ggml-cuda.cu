@@ -2833,6 +2833,9 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     if (ggml_cuda_hc_up_pre_check_enabled()) {
         return false;
     }
+    if (ggml_cuda_hc_post_norm_check_enabled()) {
+        return false;
+    }
     if (ggml_cuda_moe_reduce_add_check_enabled()) {
         return false;
     }
@@ -3785,6 +3788,16 @@ static bool ggml_cuda_should_fuse_dsv4_hc_post_gate(const ggml_cgraph * cgraph, 
     return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int) ops.size(), out_nodes, 1);
 }
 
+static int ggml_cuda_hc_post_norm_max_tokens() {
+    static const int max_tokens = [] {
+        const char * env = getenv("GGML_CUDA_HC_POST_NORM_MULTI");
+        const int n = env != nullptr && std::atoi(env) == 0 ? 1 : MMVQ_MAX_ROW_SEGMENT_COLS;
+        GGML_LOG_WARN("ggml_cuda: hc post+norm fusion: up to %d tokens\n", n);
+        return n;
+    }();
+    return max_tokens;
+}
+
 // the gated DSV4_HC_POST above with an identity comb, whose output is the next hc mixer's RMS_NORM -> MUL by a
 // [n_embd, hc] gamma, as qwen4exp's build_hc_mix normalizes it
 static bool ggml_cuda_match_dsv4_hc_post_rms_norm(const ggml_cgraph * cgraph, int node_idx) {
@@ -3803,8 +3816,8 @@ static bool ggml_cuda_match_dsv4_hc_post_rms_norm(const ggml_cgraph * cgraph, in
         !ggml_are_same_shape(logits, cgraph->nodes[node_idx + 2]) || post->src[3] != nullptr) {
         return false;
     }
-    // single token only: the alloc deps move the other buffers, and qwen4exp's prefill logits change with that layout
-    if (post->ne[2] != 1 || (mul->src[0] != norm && mul->src[1] != norm)) {
+    // decode-sized batches only: the alloc deps move the other buffers, and qwen4exp's prefill logits change with that layout
+    if (post->ne[2] > ggml_cuda_hc_post_norm_max_tokens() || (mul->src[0] != norm && mul->src[1] != norm)) {
         return false;
     }
 
@@ -5706,6 +5719,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_should_fuse_dsv4_hc_post_rms_norm(cgraph, i)) {
+        if (ggml_cuda_hc_post_norm_check_enabled()) {
+            ggml_cuda_dsv4_hc_post_rms_norm_check(*cuda_ctx, cgraph->nodes[i + 3], node, cgraph->nodes[i + 2],
+                    cgraph->nodes[i + 4], cgraph->nodes[i + 5]);
+            return 5;
+        }
         ggml_cuda_op_dsv4_hc_post_gated_rms_norm(*cuda_ctx, cgraph->nodes[i + 3], node, cgraph->nodes[i + 2],
                 cgraph->nodes[i + 4], cgraph->nodes[i + 5]);
         return 5;
@@ -5750,6 +5768,16 @@ static bool ggml_cuda_q8_1_reuse_match_rows() {
     return enabled;
 }
 
+static void ggml_cuda_q8_1_reuse_log_drop(const ggml_cgraph * cgraph, const int node_idx, const int slot_idx, const ggml_tensor * slot_src) {
+    static std::atomic<int> n_logged{0};
+    if (!ggml_cuda_q8_1_reuse_debug_enabled() || ggml_nrows(slot_src) <= 1 || n_logged.fetch_add(1) >= 300) {
+        return;
+    }
+    const ggml_tensor * node = cgraph->nodes[node_idx];
+    GGML_LOG_WARN("q8_1_reuse_debug: drop node %d %s (%s) overwrites slot %d src %s\n",
+            node_idx, node->name, ggml_op_name(node->op), slot_idx, slot_src->name);
+}
+
 static void ggml_cuda_q8_1_reuse_drop_overwritten(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int first, int last) {
     auto & reuse = cuda_ctx->q8_1_reuse;
     for (int k = 0; k < reuse.n_slots; ++k) {
@@ -5763,6 +5791,7 @@ static void ggml_cuda_q8_1_reuse_drop_overwritten(ggml_backend_cuda_context * cu
             const char * dst_begin = (const char *) cgraph->nodes[j]->data;
             const char * dst_end   = dst_begin + ggml_nbytes(cgraph->nodes[j]);
             if (dst_begin < src_end && src_begin < dst_end) {
+                ggml_cuda_q8_1_reuse_log_drop(cgraph, j, k, slot.src);
                 slot.src = nullptr;
                 break;
             }
