@@ -3856,7 +3856,9 @@ static int ggml_cuda_match_dsv4_hc_up_pre(const ggml_cgraph * cgraph, int node_i
             return -1;
         }
         take(j);
-        tail = node;
+        if (n_wanted < 2) {
+            tail = node;
+        }
         ++n_wanted;
     }
     if (n_wanted < 3) {
