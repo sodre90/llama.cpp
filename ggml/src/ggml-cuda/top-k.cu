@@ -1,6 +1,9 @@
 #include "argsort.cuh"
 #include "top-k.cuh"
 
+#include <atomic>
+#include <cstdlib>
+
 #ifdef GGML_CUDA_USE_CUB
 #    include <cub/cub.cuh>
 // DeviceTopK has a race condition before CCCL 3.4.3.
@@ -140,6 +143,104 @@ static __global__ void top_k_radix_select(
     }
 }
 
+// Derives the state after pass q (1..4) from the state after pass q-1 and the pass q block histograms.
+// Same result as the serial walk down from the top bin: the chosen bin is the highest one whose suffix sum reaches the rank.
+template<int BLOCK_SIZE, int RADIX_BITS>
+static __device__ __forceinline__ top_k_radix_state top_k_radix_derive(
+        top_k_radix_state * __restrict__ states,
+        const int * __restrict__ block_histograms,
+        int nrows,
+        int k,
+        int blocks_per_row,
+        int row,
+        int row_block,
+        int q) {
+    constexpr int NBINS = 1 << RADIX_BITS;
+    static_assert(BLOCK_SIZE == NBINS, "one thread per bin");
+
+    const int tid = threadIdx.x;
+    const int shift = 32 - RADIX_BITS * q;
+    top_k_radix_state state = q == 1 ? top_k_radix_state{0, 0, k} : states[(size_t) (q - 1) * nrows + row];
+
+    __shared__ int suffix[NBINS];
+    __shared__ int chosen_bin;
+
+    int count = 0;
+#pragma unroll 8
+    for (int b = 0; b < blocks_per_row; ++b) {
+        count += block_histograms[((size_t) row * blocks_per_row + b) * NBINS + tid];
+    }
+    suffix[tid] = count;
+    if (tid == 0) {
+        chosen_bin = 0;
+    }
+    __syncthreads();
+
+    for (int offset = 1; offset < NBINS; offset *= 2) {
+        const int above = tid + offset < NBINS ? suffix[tid + offset] : 0;
+        __syncthreads();
+        suffix[tid] += above;
+        __syncthreads();
+    }
+
+    if (suffix[tid] >= state.rank && (tid == NBINS - 1 || suffix[tid + 1] < state.rank)) {
+        chosen_bin = tid;
+    }
+    __syncthreads();
+
+    const int bin = chosen_bin;
+    state.rank -= bin == NBINS - 1 ? 0 : suffix[bin + 1];
+    state.prefix |= (uint32_t) bin << shift;
+    state.prefix_mask |= (uint32_t) (NBINS - 1) << shift;
+
+    if (row_block == 0 && tid == 0) {
+        states[(size_t) q * nrows + row] = state;
+    }
+    return state;
+}
+
+template<int BLOCK_SIZE, int RADIX_BITS>
+static __global__ void top_k_radix_histogram_fused(
+        const float * __restrict__ src,
+        top_k_radix_state * __restrict__ states,
+        const int * __restrict__ prev_histograms,
+        int * __restrict__ block_histograms,
+        int ncols,
+        int nrows,
+        int k,
+        int blocks_per_row,
+        int pass) {
+    constexpr int NBINS = 1 << RADIX_BITS;
+
+    const int row = blockIdx.x / blocks_per_row;
+    const int row_block = blockIdx.x % blocks_per_row;
+    const int tid = threadIdx.x;
+    const int shift = 32 - RADIX_BITS * pass;
+    const float * row_src = src + (size_t) row * ncols;
+    __shared__ int histogram[NBINS];
+
+    const top_k_radix_state state = pass == 1 ?
+        top_k_radix_state{0, 0, k} :
+        top_k_radix_derive<BLOCK_SIZE, RADIX_BITS>(states, prev_histograms, nrows, k, blocks_per_row, row, row_block, pass - 1);
+
+    histogram[tid] = 0;
+    __syncthreads();
+
+    for (int col = row_block * BLOCK_SIZE + tid;
+         col < ncols;
+         col += blocks_per_row * BLOCK_SIZE) {
+        const uint32_t key = top_k_float_to_ordered(row_src[col]);
+        if ((key & state.prefix_mask) == state.prefix) {
+            atomicAdd(&histogram[(key >> shift) & (NBINS - 1)], 1);
+        }
+    }
+    __syncthreads();
+
+    const size_t histogram_offset =
+        ((size_t) row * blocks_per_row + row_block) * NBINS;
+    block_histograms[histogram_offset + tid] = histogram[tid];
+}
+
 // greater counts in the low half of the int, ties in the high half: one scan serves both
 static __device__ __forceinline__ int top_k_radix_classify(
         const float * __restrict__ row_src, const top_k_radix_state & state, int col, int col_end) {
@@ -150,18 +251,26 @@ static __device__ __forceinline__ int top_k_radix_classify(
     return key > state.prefix ? 1 : key == state.prefix ? 1 << 16 : 0;
 }
 
-template<int BLOCK_SIZE>
+template<int BLOCK_SIZE, bool FUSED>
 static __global__ void top_k_radix_count(
         const float * __restrict__ src,
-        const top_k_radix_state * __restrict__ states,
+        top_k_radix_state * __restrict__ states,
+        const int * __restrict__ last_histograms,
         int * __restrict__ block_counts,
         int ncols,
+        int nrows,
+        int k,
         int cols_per_block,
         int blocks_per_row) {
     const int row = blockIdx.x / blocks_per_row;
     const int row_block = blockIdx.x % blocks_per_row;
     const float * row_src = src + (size_t) row * ncols;
-    const top_k_radix_state state = states[row];
+    top_k_radix_state state;
+    if (FUSED) {
+        state = top_k_radix_derive<BLOCK_SIZE, 8>(states, last_histograms, nrows, k, blocks_per_row, row, row_block, 4);
+    } else {
+        state = states[row];
+    }
     const int col_begin = row_block * cols_per_block;
     const int col_end = min(col_begin + cols_per_block, ncols);
 
@@ -247,6 +356,14 @@ static __global__ void top_k_radix_gather(
     }
 }
 
+static bool top_k_fused_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_CUDA_TOPK_FUSED");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static void top_k_radix_cuda(
         ggml_cuda_pool & pool,
         const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
@@ -255,6 +372,38 @@ static void top_k_radix_cuda(
     constexpr int NBINS = 1 << RADIX_BITS;
     const int blocks_per_row = std::min((ncols + 1023) / 1024, 64);
 
+    const int cols_per_block = (ncols + blocks_per_row - 1) / blocks_per_row;
+    const dim3 row_grid(blocks_per_row * nrows);
+    ggml_cuda_pool_alloc<int> block_counts_alloc(pool, (size_t) nrows * blocks_per_row * 2);
+    int * block_counts = block_counts_alloc.get();
+
+    if (top_k_fused_enabled()) {
+        static std::atomic<bool> fused_logged{false};
+        if (!fused_logged.exchange(true)) {
+            GGML_LOG_WARN("ggml_cuda: top-k: fused radix passes\n");
+        }
+
+        const size_t histogram_size = (size_t) nrows * blocks_per_row * NBINS;
+        ggml_cuda_pool_alloc<top_k_radix_state> states_alloc(pool, 5 * (size_t) nrows);
+        ggml_cuda_pool_alloc<int> histograms_alloc(pool, 2 * histogram_size);
+        top_k_radix_state * states = states_alloc.get();
+        int * histograms = histograms_alloc.get();
+
+        for (int pass = 1; pass <= 4; ++pass) {
+            top_k_radix_histogram_fused<BLOCK_SIZE, RADIX_BITS>
+                <<<row_grid, BLOCK_SIZE, 0, stream>>>(
+                    src, states, histograms + ((pass - 1) & 1) * histogram_size, histograms + (pass & 1) * histogram_size,
+                    ncols, nrows, k, blocks_per_row, pass);
+        }
+        top_k_radix_count<BLOCK_SIZE, true>
+            <<<row_grid, BLOCK_SIZE, 0, stream>>>(
+                src, states, histograms, block_counts, ncols, nrows, k, cols_per_block, blocks_per_row);
+        top_k_radix_gather<BLOCK_SIZE>
+            <<<row_grid, BLOCK_SIZE, 0, stream>>>(
+                src, dst, states + 4 * (size_t) nrows, block_counts, ncols, k, cols_per_block, blocks_per_row);
+        return;
+    }
+
     ggml_cuda_pool_alloc<top_k_radix_state> states_alloc(pool, nrows);
     ggml_cuda_pool_alloc<int> histograms_alloc(pool, (size_t) nrows * blocks_per_row * NBINS);
     top_k_radix_state * states = states_alloc.get();
@@ -262,7 +411,6 @@ static void top_k_radix_cuda(
 
     top_k_radix_init<<<(nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, nrows, k);
 
-    const dim3 row_grid(blocks_per_row * nrows);
     for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
         top_k_radix_histogram<BLOCK_SIZE, RADIX_BITS>
             <<<row_grid, BLOCK_SIZE, 0, stream>>>(
@@ -271,12 +419,9 @@ static void top_k_radix_cuda(
             <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift);
     }
 
-    const int cols_per_block = (ncols + blocks_per_row - 1) / blocks_per_row;
-    ggml_cuda_pool_alloc<int> block_counts_alloc(pool, (size_t) nrows * blocks_per_row * 2);
-    int * block_counts = block_counts_alloc.get();
-    top_k_radix_count<BLOCK_SIZE>
+    top_k_radix_count<BLOCK_SIZE, false>
         <<<row_grid, BLOCK_SIZE, 0, stream>>>(
-            src, states, block_counts, ncols, cols_per_block, blocks_per_row);
+            src, states, nullptr, block_counts, ncols, nrows, k, cols_per_block, blocks_per_row);
     top_k_radix_gather<BLOCK_SIZE>
         <<<row_grid, BLOCK_SIZE, 0, stream>>>(
             src, dst, states, block_counts, ncols, k, cols_per_block, blocks_per_row);
