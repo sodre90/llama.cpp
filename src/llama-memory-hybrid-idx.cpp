@@ -1336,11 +1336,50 @@ static double qsa_scope_cap() {
     return cap;
 }
 
+int64_t llama_memory_hybrid_idx::qsa_query_index(
+        const qsa_input_state & st,
+        const llama_kv_cells & cells,
+        const llama_ubatch & ubatch,
+        int64_t i) const {
+    const int64_t      n_tokens = ubatch.n_tokens;
+    const llama_seq_id seq_id   = ubatch.seq_id[i][0];
+
+    int64_t q = ubatch.pos[i];
+
+    if (st.ranked && st.ranked_seqs.test(seq_id)) {
+        const llama_pos qt = ubatch.pos[i];
+        const llama_pos qy = ubatch.pos[i + n_tokens];
+        const llama_pos qx = ubatch.pos[i + n_tokens*2];
+
+        const auto & order = st.seq_order[seq_id];
+
+        int64_t lo = 0;
+        int64_t hi = (int64_t) order.size();
+
+        while (lo < hi) {
+            const int64_t   mid = (lo + hi)/2;
+            const int32_t   c   = order[mid];
+            const llama_pos pc  = cells.pos_get(c);
+
+            if (pc < qt || (pc == qt && !cells.ext_get(c).is_2d_gt(qx, qy))) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+
+        q = lo - 1;
+    }
+
+    return q;
+}
+
 uint32_t llama_memory_hybrid_idx::qsa_scope_n_blocks(
         const llama_ubatch & ubatch,
         uint32_t n_kv,
         uint32_t ratio,
         uint32_t n_seq_vis,
+        int64_t n_vis_min,
         uint32_t & n_seq) const {
     n_seq = 0;
 
@@ -1364,6 +1403,35 @@ uint32_t llama_memory_hybrid_idx::qsa_scope_n_blocks(
     const auto & cells = get_mem_idx()->get_cells(seqs[0]);
 
     qsa_sync(st, cells, &ubatch, n_kv, r, n_seq_vis, true, false, true);
+
+    // a query that sees fewer blocks than the top-k budget gets invisible filler blocks, and which ones depends on the list
+    if (n_vis_min > 0) {
+        std::vector<int64_t> q_min(LLAMA_MAX_SEQ, INT64_MAX);
+
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            const llama_seq_id sq = ubatch.seq_id[i][0];
+
+            q_min[sq] = std::min(q_min[sq], qsa_query_index(st, cells, ubatch, i));
+        }
+
+        for (const llama_seq_id sq : seqs) {
+            int64_t n_vis = 0;
+
+            for (size_t b = 0; b < st.bid_idx.size(); ++b) {
+                n_vis += st.key_seq[st.bid_key[b]*LLAMA_MAX_SEQ + sq] && cells.seq_has(st.bid_cell[b], sq) && st.bid_idx[b] <= q_min[sq];
+            }
+
+            if (n_vis < n_vis_min) {
+                static bool reported = false;
+                if (!reported) {
+                    reported = true;
+                    LLAMA_LOG_WARN("qsa: token-chunk scope skipped, a query sees %" PRId64 " pooled blocks of %" PRId64 " needed\n", n_vis, n_vis_min);
+                }
+
+                return 0;
+            }
+        }
+    }
 
     const int64_t n_key = (int64_t) st.key_low.size();
 
@@ -1531,7 +1599,6 @@ void llama_memory_hybrid_idx::set_input_qsa(
         const int32_t n_bid = (int32_t) st.bid_idx.size();
         const auto &  unpooled_cells = st.unpooled;
         const int32_t pad = st.pad;
-        const bool    ranked = st.ranked;
         const auto &  bid_idx  = st.bid_idx;
         const auto &  bid_cell = st.bid_cell;
 
@@ -1910,32 +1977,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
             const int64_t      i      = s*n_tps + ii;
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
 
-            int64_t q = ubatch->pos[i];
-
-            if (ranked && st.ranked_seqs.test(seq_id)) {
-                const llama_pos qt = ubatch->pos[i];
-                const llama_pos qy = ubatch->pos[i + n_tokens];
-                const llama_pos qx = ubatch->pos[i + n_tokens*2];
-
-                const auto & order = st.seq_order[seq_id];
-
-                int64_t lo = 0;
-                int64_t hi = (int64_t) order.size();
-
-                while (lo < hi) {
-                    const int64_t   mid = (lo + hi)/2;
-                    const int32_t   c   = order[mid];
-                    const llama_pos pc  = cells.pos_get(c);
-
-                    if (pc < qt || (pc == qt && !cells.ext_get(c).is_2d_gt(qx, qy))) {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
-                }
-
-                q = lo - 1;
-            }
+            const int64_t q = qsa_query_index(st, cells, *ubatch, i);
 
             // the tail is an incomplete block and is always visible, as in the reference
             const int64_t tail_start = (q + 1)/r*r;
@@ -2336,14 +2378,14 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
             scope_rows, scope_cells, scope_bias);
 }
 
-uint32_t llama_memory_hybrid_idx_context::qsa_scope_n_blocks(const llama_ubatch & ubatch, uint32_t ratio, uint32_t n_seq_vis, uint32_t & n_seq) const {
+uint32_t llama_memory_hybrid_idx_context::qsa_scope_n_blocks(const llama_ubatch & ubatch, uint32_t ratio, uint32_t n_seq_vis, int64_t n_vis_min, uint32_t & n_seq) const {
     n_seq = 0;
 
     if (mem == nullptr || get_idx() == nullptr || get_n_stream() != 1) {
         return 0;
     }
 
-    return mem->qsa_scope_n_blocks(ubatch, get_idx()->get_n_kv(), ratio, n_seq_vis, n_seq);
+    return mem->qsa_scope_n_blocks(ubatch, get_idx()->get_n_kv(), ratio, n_seq_vis, n_vis_min, n_seq);
 }
 
 llama_memory_hybrid_idx_context::kpool_access::kpool_access(ggml_context * ctx, ggml_tensor * k, int64_t n_embd) : ctx(ctx) {

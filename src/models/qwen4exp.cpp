@@ -566,6 +566,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
     return ggml_mul(ctx0, normalized, gated);
 }
 
+static bool qsa_chunk_tokens(int64_t n_stream, int64_t n_tps);
+
 // QSA attends to a budget of whole blocks of compress_ratio tokens, plus the incomplete tail
 // one mean-pooled indexer key scores each block; set_input resolves the cache layout
 class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
@@ -646,7 +648,8 @@ public:
         // [TAG_QSA_SEQ_SCOPE] whether and how a ubatch is scoped follows its sequences and their blocks
         if (res && scope_able) {
             uint32_t n_seq = 0;
-            const uint32_t n_blk = mctx->qsa_scope_n_blocks(params.ubatch, ratio, n_seq_vis, n_seq);
+            const int64_t n_vis_min = qsa_chunk_tokens(n_stream, params.ubatch.n_tokens/n_stream) ? n_vis_chunk : 0;
+            const uint32_t n_blk = mctx->qsa_scope_n_blocks(params.ubatch, ratio, n_seq_vis, n_vis_min, n_seq);
 
             res &= n_blk == (scope_cells != nullptr ? scope_cells->ne[1] : 0);
             res &= n_seq == (scope_cells != nullptr ? scope_cells->ne[2] : 0);
@@ -679,6 +682,9 @@ public:
     // the graph could be scoped, so a ubatch has to scope the same way to reuse it
     bool     scope_able = false;
     uint32_t n_seq_vis  = 0;
+
+    // the visible blocks a query needs for its token chunk to be scoped
+    int64_t  n_vis_chunk = 0;
 
     // [TAG_QSA_DEVICE_INPUTS] the per-(block, query) bias and the per-(cell, query) mask both
     // grow with the ubatch times the context; these per-block and per-cell tables do not, and
@@ -933,8 +939,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         qsa->scope_able = blk_bias && use_pooled && mctx_hyb->pooled_is_keyed_by_seq() && n_stream == 1 &&
             (!chunked || (device_bias && qsa_scope_chunks_enabled())) && qsa_seq_scope_enabled();
 
+        qsa->n_vis_chunk = ((int64_t) hparams.indexer_top_k + r - 1 + r - 1)/r;
+
         uint32_t n_seq_scope = 0;
-        const uint32_t n_blk_scope = qsa->scope_able ? mctx_hyb->qsa_scope_n_blocks(ubatch, (uint32_t) r, qsa->n_seq_vis, n_seq_scope) : 0;
+        const uint32_t n_blk_scope = qsa->scope_able ?
+            mctx_hyb->qsa_scope_n_blocks(ubatch, (uint32_t) r, qsa->n_seq_vis, chunked ? qsa->n_vis_chunk : 0, n_seq_scope) : 0;
         const bool scoped = n_blk_scope > 0;
 
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
