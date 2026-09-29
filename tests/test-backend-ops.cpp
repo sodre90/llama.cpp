@@ -7931,6 +7931,11 @@ struct test_mul_mat_vec_row_segments : public test_case {
 
     bool run_whole_graph() override { return true; }
 
+    // the CPU quantizes src1 to Q8_K for IQ4_XS, the GPU to Q8_1: same tolerance as test_mul_mat
+    double max_nmse_err() override {
+        return type == GGML_TYPE_Q8_0 ? test_case::max_nmse_err() : 5e-4;
+    }
+
     test_mul_mat_vec_row_segments(ggml_type type, int64_t k, std::array<int64_t, 4> rows, bool with_tails, int64_t n_tokens = 1,
             ggml_type type_tail = GGML_TYPE_COUNT)
         : type(type), type_tail(type_tail == GGML_TYPE_COUNT ? type : type_tail), k(k), rows(rows), with_tails(with_tails), n_tokens(n_tokens) {}
@@ -12177,7 +12182,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         for (int64_t n_tokens : {1, 2, 3, 4}) {
             test_cases.emplace_back(new test_mul_mat_vec_row_segments(GGML_TYPE_IQ4_XS, 2560, {10240, 6144, 48, 48}, with_tails, n_tokens, GGML_TYPE_F32));
-            test_cases.emplace_back(new test_mul_mat_vec_row_segments(GGML_TYPE_IQ4_XS, 256, {33, 1, 7, 64}, with_tails, n_tokens, GGML_TYPE_F32));
+            test_cases.emplace_back(new test_mul_mat_vec_row_segments(GGML_TYPE_IQ4_XS, 256, {33, 17, 7, 64}, with_tails, n_tokens, GGML_TYPE_F32));
         }
     }
 
