@@ -1327,6 +1327,15 @@ void llama_memory_hybrid_idx::qsa_sync(
     st.pos_2d      = ubatch->is_pos_2d();
 }
 
+static double qsa_scope_cap() {
+    static const double cap = []() {
+        const char * requested = getenv("LLAMA_QSA_SCOPE_CAP");
+        return requested == nullptr ? -1.0 : std::max(atof(requested), 0.0);
+    }();
+
+    return cap;
+}
+
 uint32_t llama_memory_hybrid_idx::qsa_scope_n_blocks(
         const llama_ubatch & ubatch,
         uint32_t n_kv,
@@ -1392,8 +1401,12 @@ uint32_t llama_memory_hybrid_idx::qsa_scope_n_blocks(
     int64_t n_blk = std::max(n_max, n_blk_min);
     n_blk = std::min((n_blk + n_blk_pad - 1)/n_blk_pad*n_blk_pad, n_blocks);
 
-    // every list is padded to the longest, so sequences of very different length can cost more than the pool
-    if ((int64_t) seqs.size()*n_blk > n_blocks + n_blocks/4) {
+    // every list is padded to the longest, so sequences of very different length can cost more than the pool (LLAMA_QSA_SCOPE_CAP, <= 0: no cap)
+    const double scope_cap = qsa_scope_cap();
+    const bool over_cap = scope_cap < 0.0 ?
+        (int64_t) seqs.size()*n_blk > n_blocks + n_blocks/4 :
+        scope_cap > 0.0 && (double) seqs.size()*n_blk > scope_cap * (double) n_blocks;
+    if (over_cap) {
         return 0;
     }
 
