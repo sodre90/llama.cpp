@@ -3116,9 +3116,67 @@ public:
     llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
 
     ~llama_io_read_host() {
-        // flush the reads
-        for (const auto & rinfo : rinfos) {
-            ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
+        // cells restored into a shared pool land between other sequences' cells, so run by run this
+        // would be one synchronous device copy per run: write each span of nearby runs at once and
+        // keep the bytes between them (the context is synchronized, nothing else writes these tensors)
+        std::vector<read_info> sorted = rinfos;
+        std::stable_sort(sorted.begin(), sorted.end(), [](const read_info & a, const read_info & b) {
+            return a.tensor != b.tensor ? std::less<const ggml_tensor *>()(a.tensor, b.tensor) : a.offset < b.offset;
+        });
+
+        // overlapping writes must keep their order, which a span does not
+        for (size_t i = 1; i < sorted.size(); ++i) {
+            if (sorted[i].tensor == sorted[i - 1].tensor && sorted[i].offset < sorted[i - 1].offset + sorted[i - 1].size) {
+                for (const auto & rinfo : rinfos) {
+                    ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
+                }
+                return;
+            }
+        }
+
+        // a span reads and writes its gaps, so the gap limit is lower than when saving
+        const size_t max_gap  = 256u << 10;
+        const size_t max_span = 64u << 20;
+
+        static const bool check_writes = getenv("LLAMA_STATE_READ_CHECK") != nullptr;
+
+        std::vector<uint8_t> span;
+
+        for (size_t i = 0; i < sorted.size(); ) {
+            const read_info & first = sorted[i];
+
+            size_t end = first.offset + first.size;
+            size_t j   = i + 1;
+
+            while (j < sorted.size() && sorted[j].tensor == first.tensor &&
+                    sorted[j].offset - end <= max_gap && sorted[j].offset + sorted[j].size - first.offset <= max_span) {
+                end = sorted[j].offset + sorted[j].size;
+                ++j;
+            }
+
+            if (j == i + 1) {
+                ggml_backend_tensor_set(first.tensor, first.ptr, first.offset, first.size);
+            } else {
+                span.resize(end - first.offset);
+                ggml_backend_tensor_get(first.tensor, span.data(), first.offset, span.size());
+
+                for (size_t k = i; k < j; ++k) {
+                    memcpy(span.data() + (sorted[k].offset - first.offset), sorted[k].ptr, sorted[k].size);
+                }
+
+                ggml_backend_tensor_set(first.tensor, span.data(), first.offset, span.size());
+
+                if (check_writes) {
+                    std::vector<uint8_t> back(span.size());
+                    ggml_backend_tensor_get(first.tensor, back.data(), first.offset, back.size());
+                    GGML_ASSERT(memcmp(back.data(), span.data(), span.size()) == 0 && "state: coalesced write differs");
+                    for (size_t k = i; k < j; ++k) {
+                        GGML_ASSERT(memcmp(back.data() + (sorted[k].offset - first.offset), sorted[k].ptr, sorted[k].size) == 0 && "state: restored row differs");
+                    }
+                }
+            }
+
+            i = j;
         }
     }
 
