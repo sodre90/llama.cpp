@@ -1904,6 +1904,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
+        const int64_t t_start = ggml_time_us();
+
         {
             auto & data = it_best->data.main;
 
@@ -1938,8 +1940,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             }
         }
 
-        SRV_INF("prompt cache: slot %d restored %zu-token entry (f_keep = %.3f, f_sim = %.3f) for a %zu-token prompt\n",
-                id_slot, it_best->prompt.tokens.size(), f_keep_best, f_sim_best, tokens_new.size());
+        SRV_INF("prompt cache: slot %d restored %zu-token entry (f_keep = %.3f, f_sim = %.3f) for a %zu-token prompt in %.1f ms\n",
+                id_slot, it_best->prompt.tokens.size(), f_keep_best, f_sim_best, tokens_new.size(), (ggml_time_us() - t_start) / 1000.0);
 
         prompt = std::move(it_best->prompt);
 
