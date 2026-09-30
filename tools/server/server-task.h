@@ -3,7 +3,11 @@
 #include "common.h"
 #include "llama.h"
 
+#include <condition_variable>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <list>
 #include <map>
@@ -654,6 +658,64 @@ struct server_prompt_cache_state {
     }
 };
 
+// disk tier of server_prompt_cache: entries evicted from RAM are written to files by a background thread
+// the index is owned by the main thread, the mutex only guards the two lists shared with the writer
+struct server_prompt_cache_disk {
+    server_prompt_cache_disk(const std::string & dir, const std::string & prefix, size_t limit_size);
+    ~server_prompt_cache_disk();
+
+    // hand an evicted entry to the writer, it is dropped when too much is already waiting
+    void push(server_prompt_cache_state && state);
+
+    // same search rule as the RAM entries in server_prompt_cache::load()
+    bool take(const server_tokens & tokens_new, float & f_keep_best, float & f_sim_best, server_prompt_cache_state & out, int32_t id_slot);
+
+    // keep the entry that load(tokens_next) would pick from being removed by the size limit
+    void pin(const server_tokens & tokens_next);
+    void unpin();
+
+    void remove_contained(const server_tokens & tokens);
+
+    size_t n_entries();
+
+    // bytes on disk of the indexed entries
+    size_t size();
+
+private:
+    struct entry {
+        server_tokens tokens;
+        std::string   path;
+        size_t        size;
+        bool          pinned = false;
+        uint64_t      id;
+    };
+
+    void collect();
+    void receive();
+    void enforce_limit();
+    size_t indexed_size() const;
+    void remove_entry(std::list<entry>::iterator it);
+    void worker_loop();
+
+    std::string dir;
+    std::string prefix;
+    size_t limit_size;
+
+    std::list<entry> index; // oldest first
+
+    std::mutex              mtx;
+    std::condition_variable cv;
+    bool                    stop = false;
+
+    std::list<server_prompt_cache_state> pending;
+    size_t                               pending_bytes = 0;
+    std::list<entry>                     done;
+
+    uint64_t next_id = 0; // worker thread only
+
+    std::thread worker;
+};
+
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
@@ -687,6 +749,15 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
+
+    std::unique_ptr<server_prompt_cache_disk> disk;
+
+    size_t disk_n_entries() const { return disk ? disk->n_entries() : 0; }
+    size_t disk_size()      const { return disk ? disk->size()      : 0; }
+
+private:
+    // the disk tier, if any, takes the entry before it leaves the RAM cache
+    void evict_oldest();
 };
 
 // used exclusively by router mode
