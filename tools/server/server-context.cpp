@@ -319,6 +319,8 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
+        const int64_t t_start = ggml_time_us();
+
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
         if (cur == nullptr) {
             return false;
@@ -328,6 +330,9 @@ struct server_slot {
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
+
+        SRV_INF("prompt cache: slot %d saved %zu-token prompt, %.1f MiB in %.1f ms\n",
+                id, prompt.tokens.size(), cur_size / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0);
 
         return true;
     }
