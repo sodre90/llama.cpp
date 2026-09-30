@@ -19,6 +19,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cinttypes>
@@ -77,6 +78,34 @@ static std::vector<llama_token> server_accept_replay(
     result.push_back(id);
 
     return result;
+}
+
+static std::unique_ptr<server_prompt_cache_disk> server_make_prompt_cache_disk(const std::string & model_path) {
+    const char * dir = getenv("LLAMA_PROMPT_CACHE_DISK_DIR");
+    if (dir == nullptr || dir[0] == '\0') {
+        return nullptr;
+    }
+
+    const char * limit_mib_str = getenv("LLAMA_PROMPT_CACHE_DISK_MIB");
+
+    try {
+        const size_t limit_mib = limit_mib_str ? std::stoull(limit_mib_str) : 32768;
+
+        std::string prefix = std::filesystem::path(model_path).stem().string() + "-";
+        for (char & c : prefix) {
+            if (!std::isalnum((unsigned char) c) && c != '.' && c != '_' && c != '-') {
+                c = '_';
+            }
+        }
+
+        std::filesystem::create_directories(dir);
+
+        return std::make_unique<server_prompt_cache_disk>(dir, prefix, limit_mib*1024*1024);
+    } catch (const std::exception & e) {
+        SRV_ERR("prompt cache disk: disabled, %s\n", e.what());
+
+        return nullptr;
+    }
 }
 
 // synthetic draft verification for benchmarking - accept draft tokens at random instead of by match with the target
@@ -1478,6 +1507,7 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache->disk = server_make_prompt_cache_disk(params_base.model.path);
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -1779,9 +1809,16 @@ private:
             per_slot += string_format(" %d=%d%s", slot.id, slot.prompt.n_tokens(), slot.is_processing() ? "" : "(idle)");
         }
 
-        SRV_INF("kv pool: %d / %d cells used (%.1f%%), slots%s, deferred tasks %zu, prompt cache %.1f MiB, %zu tokens\n",
+        std::string disk_stats;
+        if (prompt_cache && prompt_cache->disk) {
+            disk_stats = string_format(", prompt cache disk %zu entries, %.1f MiB",
+                    prompt_cache->disk_n_entries(), prompt_cache->disk_size() / (1024.0 * 1024.0));
+        }
+
+        SRV_INF("kv pool: %d / %d cells used (%.1f%%), slots%s, deferred tasks %zu, prompt cache %.1f MiB, %zu tokens%s\n",
                 n_used, n_ctx, 100.0 * n_used / std::max(n_ctx, 1), per_slot.c_str(), queue_tasks.queue_tasks_deferred_size(),
-                prompt_cache ? prompt_cache->size() / (1024.0 * 1024.0) : 0.0, prompt_cache ? prompt_cache->n_tokens() : 0);
+                prompt_cache ? prompt_cache->size() / (1024.0 * 1024.0) : 0.0, prompt_cache ? prompt_cache->n_tokens() : 0,
+                disk_stats.c_str());
     }
 
     server_slot * get_available_slot(const server_task & task) {
