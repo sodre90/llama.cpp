@@ -4142,6 +4142,18 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
+                    // a checkpoint at the start of this batch is created after the loop below, so count it as the last one here
+                    // or the loop breaks again at the next user message
+                    int64_t n_tokens_last_ckpt = slot.prompt.checkpoints.empty() ? -1 : slot.prompt.checkpoints.back().n_tokens;
+                    {
+                        const auto pos = slot.prompt.n_tokens();
+                        if (do_checkpoint && !has_mtmd && spans.is_user_start(pos) &&
+                                llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id) >= 0 &&
+                                (n_tokens_last_ckpt < 0 || pos == last_user_pos || pos > n_tokens_last_ckpt + params_base.checkpoint_min_step)) {
+                            n_tokens_last_ckpt = pos;
+                        }
+                    }
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                         // get next token to process
@@ -4184,9 +4196,8 @@ private:
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
-                            const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            if (pos == last_user_pos || n_tokens_last_ckpt < 0 || pos > n_tokens_last_ckpt + params_base.checkpoint_min_step) {
                                 break;
                             }
                         }
