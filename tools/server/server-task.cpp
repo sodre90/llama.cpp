@@ -1783,10 +1783,15 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
+    // keep only the newest checkpoints: on recurrent models each one is a full state copy, and a
+    // restore seldom rewinds past the last few turns
+    const size_t n_ckpt_keep = std::min<size_t>(prompt.checkpoints.size(), 4);
+    const auto ckpt_first = std::prev(prompt.checkpoints.end(), n_ckpt_keep);
+
     // calculate checkpoints size to see if it will fit with the prompt
     size_t checkpoints_size = 0;
-    for (const auto & ckpt : prompt.checkpoints) {
-        checkpoints_size += ckpt.size();
+    for (auto it = ckpt_first; it != prompt.checkpoints.end(); ++it) {
+        checkpoints_size += it->size();
     }
 
     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
@@ -1843,7 +1848,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
+            /*.checkpoints =*/ std::list<common_prompt_checkpoint>(ckpt_first, prompt.checkpoints.end()),
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
