@@ -5,22 +5,29 @@
 #define MOE_CACHE_MAX_IDS    64
 #define MOE_CACHE_HEADER     8
 
-// state words: [0] K, [1] E, [2] P, [3] clock, [4] n_hit, [5] n_miss, [6] n_fill, [7] n_evict,
-// then slot_expert[K], slot_last_use[K], slot_protected[K], fill_slot[E]
+// state words: [0] K, [1] E, [2] decay (float), [3] clock, [4] n_hit, [5] n_miss, [6] n_fill, [7] n_evict,
+// then slot_expert[K], fill_slot[E], score[E] (float), last[E]
+// score[e] is a hit count that halves every 1/decay steps, last[e] is the step it was updated at
 
-// the number of slots in class >= 0 that sort before slot s by (class, last use, slot)
+// the score of expert e decayed to step now
+static __device__ __forceinline__ float moe_cache_crf(
+        const int32_t * g_score, const int32_t * g_last, const float decay, const uint32_t now, const int e) {
+    return __int_as_float(g_score[e]) * exp2f(-decay * (float) (now - (uint32_t) g_last[e]));
+}
+
+// the number of slots in class >= 0 that sort before slot s by (class, key, slot)
 static __device__ __forceinline__ int moe_cache_rank(
-        const int8_t * slot_class, const uint32_t * slot_last_use, const int n_slots, const int s) {
-    const int      c    = slot_class[s];
-    const uint32_t last = slot_last_use[s];
+        const int8_t * slot_class, const float * slot_key, const int n_slots, const int s) {
+    const int   c   = slot_class[s];
+    const float key = slot_key[s];
     int rank = 0;
     for (int s2 = 0; s2 < n_slots; ++s2) {
         const int c2 = slot_class[s2];
         if (c2 < 0) {
             continue;
         }
-        const uint32_t last2 = slot_last_use[s2];
-        rank += c2 < c || (c2 == c && (last2 < last || (last2 == last && s2 < s)));
+        const float key2 = slot_key[s2];
+        rank += c2 < c || (c2 == c && (key2 < key || (key2 == key && s2 < s)));
     }
     return rank;
 }
@@ -29,21 +36,20 @@ static __global__ void __launch_bounds__(MOE_CACHE_BLOCK_SIZE) moe_cache_assign(
         const int32_t * ids, const int n_ids, int32_t * state, int32_t * table) {
     constexpr int slots_per_thread = MOE_CACHE_MAX_SLOTS/MOE_CACHE_BLOCK_SIZE;
 
-    const int n_slots      = state[0];
-    const int n_experts    = state[1];
-    const int max_protect  = state[2];
+    const int   n_slots   = state[0];
+    const int   n_experts = state[1];
+    const float decay     = __int_as_float(state[2]);
     if (n_slots > MOE_CACHE_MAX_SLOTS || n_experts > MOE_CACHE_MAX_SLOTS || n_slots < 0 || n_experts < 0) {
         return;
     }
 
-    int32_t * g_slot_expert    = state + MOE_CACHE_HEADER;
-    int32_t * g_slot_last_use  = g_slot_expert + n_slots;
-    int32_t * g_slot_protected = g_slot_last_use + n_slots;
-    int32_t * g_fill_slot      = g_slot_protected + n_slots;
+    int32_t * g_slot_expert = state + MOE_CACHE_HEADER;
+    int32_t * g_fill_slot   = g_slot_expert + n_slots;
+    int32_t * g_score       = g_fill_slot + n_experts;
+    int32_t * g_last        = g_score + n_experts;
 
     __shared__ int32_t  slot_expert[MOE_CACHE_MAX_SLOTS];
-    __shared__ uint32_t slot_last_use[MOE_CACHE_MAX_SLOTS];
-    __shared__ uint8_t  slot_protected[MOE_CACHE_MAX_SLOTS];
+    __shared__ float    slot_key[MOE_CACHE_MAX_SLOTS];
     __shared__ int8_t   slot_class[MOE_CACHE_MAX_SLOTS];
     __shared__ uint8_t  routed[MOE_CACHE_MAX_SLOTS];
     __shared__ int32_t  routed_id[MOE_CACHE_MAX_IDS];
@@ -54,7 +60,6 @@ static __global__ void __launch_bounds__(MOE_CACHE_BLOCK_SIZE) moe_cache_assign(
     __shared__ uint32_t n_miss_uses;
     __shared__ uint32_t n_evicted;
     __shared__ uint32_t n_filled;
-    __shared__ int32_t  n_protected;
     __shared__ int32_t  n_distinct_misses;
 
     const int tid = threadIdx.x;
@@ -66,13 +71,10 @@ static __global__ void __launch_bounds__(MOE_CACHE_BLOCK_SIZE) moe_cache_assign(
         n_miss_uses       = 0;
         n_evicted         = 0;
         n_filled          = 0;
-        n_protected       = 0;
         n_distinct_misses = 0;
     }
     for (int s = tid; s < n_slots; s += MOE_CACHE_BLOCK_SIZE) {
-        slot_expert[s]    = g_slot_expert[s];
-        slot_last_use[s]  = (uint32_t) g_slot_last_use[s];
-        slot_protected[s] = g_slot_protected[s] != 0;
+        slot_expert[s] = g_slot_expert[s];
     }
     for (int e = tid; e < n_experts; e += MOE_CACHE_BLOCK_SIZE) {
         routed[e] = 0;
@@ -126,37 +128,21 @@ static __global__ void __launch_bounds__(MOE_CACHE_BLOCK_SIZE) moe_cache_assign(
         }
     }
 
-    for (int s = tid; s < n_slots; s += MOE_CACHE_BLOCK_SIZE) {
-        const int e = slot_expert[s];
-        if (e >= 0 && e < n_experts && routed[e]) {
-            slot_last_use[s]  = now;
-            slot_protected[s] = 1;
-        }
-        if (slot_protected[s]) {
-            atomicAdd(&n_protected, 1);
+    for (int e = tid; e < n_experts; e += MOE_CACHE_BLOCK_SIZE) {
+        if (routed[e]) {
+            g_score[e] = __float_as_int(moe_cache_crf(g_score, g_last, decay, now, e) + 1.0f);
+            g_last[e]  = (int32_t) now;
         }
     }
     __syncthreads();
 
-    const int n_excess = n_protected - max(max_protect, 0);
-    if (n_excess > 0) {
-        for (int s = tid; s < n_slots; s += MOE_CACHE_BLOCK_SIZE) {
-            slot_class[s] = slot_protected[s] ? 0 : -1;
-        }
-        __syncthreads();
-        for (int s = tid; s < n_slots; s += MOE_CACHE_BLOCK_SIZE) {
-            if (slot_class[s] >= 0 && moe_cache_rank(slot_class, slot_last_use, n_slots, s) < n_excess) {
-                slot_protected[s] = 0;
-            }
-        }
-        __syncthreads();
-    }
-
     if (n_distinct_misses > 0) {
         for (int s = tid; s < n_slots; s += MOE_CACHE_BLOCK_SIZE) {
             const int e = slot_expert[s];
-            const bool candidate = e < 0 || e >= n_experts || !routed[e];
-            slot_class[s] = !candidate ? -1 : e < 0 ? 0 : slot_protected[s] ? 2 : 1;
+            const bool in_range  = e >= 0 && e < n_experts;
+            const bool candidate = !in_range || !routed[e];
+            slot_class[s] = !candidate ? -1 : e < 0 ? 0 : 1;
+            slot_key[s]   = in_range ? moe_cache_crf(g_score, g_last, decay, now, e) : 0.0f;
         }
         __syncthreads();
 
@@ -166,7 +152,7 @@ static __global__ void __launch_bounds__(MOE_CACHE_BLOCK_SIZE) moe_cache_assign(
             const int s = tid + i*MOE_CACHE_BLOCK_SIZE;
             victim_of[i] = -1;
             if (s < n_slots && slot_class[s] >= 0) {
-                const int rank = moe_cache_rank(slot_class, slot_last_use, n_slots, s);
+                const int rank = moe_cache_rank(slot_class, slot_key, n_slots, s);
                 if (rank < n_distinct_misses) {
                     victim_of[i] = missed_expert[rank];
                 }
@@ -186,19 +172,15 @@ static __global__ void __launch_bounds__(MOE_CACHE_BLOCK_SIZE) moe_cache_assign(
                 table[old] = n_slots;
                 atomicAdd(&n_evicted, 1u);
             }
-            slot_expert[s]    = -1;
-            slot_protected[s] = 0;
-            slot_last_use[s]  = now;
-            g_fill_slot[e]    = s;
+            slot_expert[s] = -1;
+            g_fill_slot[e] = s;
             atomicAdd(&n_filled, 1u);
         }
         __syncthreads();
     }
 
     for (int s = tid; s < n_slots; s += MOE_CACHE_BLOCK_SIZE) {
-        g_slot_expert[s]    = slot_expert[s];
-        g_slot_last_use[s]  = (int32_t) slot_last_use[s];
-        g_slot_protected[s] = slot_protected[s];
+        g_slot_expert[s] = slot_expert[s];
     }
     if (tid == 0) {
         state[4] = (int32_t) ((uint32_t) state[4] + n_hit_uses);

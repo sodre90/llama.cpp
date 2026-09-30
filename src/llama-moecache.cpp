@@ -80,6 +80,7 @@ struct moe_cache {
     int32_t n_slots       = 0;  // default slots per layer; LLAMA_MOE_CACHE_LAYER_SLOTS overrides per layer
     int32_t max_inserts   = 2;
     int32_t protected_pct = 75; // SLRU protected segment share, LLAMA_MOE_CACHE_PROTECTED_PCT
+    float   decay         = 0.05f; // device policy: an expert's score halves every 1/decay steps, LLAMA_MOE_CACHE_DECAY
     bool    rank_by_demand = true; // LLAMA_MOE_CACHE_INSERT_ORDER=recency restores last-observed-first
     int32_t warm_max      = 0;  // LLAMA_MOE_CACHE_WARM_MAX: slots per layer a prefill may fill from its staged copy, 0 = off
     int32_t max_in_flight = 4;  // LLAMA_MOE_CACHE_MAX_IN_FLIGHT: pending uploads per layer, 0 = unbounded
@@ -698,13 +699,13 @@ bool alloc_routing(moe_cache & mc, int64_t n_expert_used) {
     return true;
 }
 
-constexpr int64_t DEV_STATE_HEADER = 8; // K, E, max protected, clock, n_hit, n_miss, n_fill, n_evict
+constexpr int64_t DEV_STATE_HEADER = 8; // K, E, decay, clock, n_hit, n_miss, n_fill, n_evict
 
 int64_t dev_state_len(int32_t n_slots, int64_t n_expert) {
-    return DEV_STATE_HEADER + 3*n_slots + n_expert;
+    return DEV_STATE_HEADER + n_slots + 3*n_expert;
 }
 
-// per layer, one row of an I32 tensor: header, slot_expert[K], slot_last_use[K], slot_protected[K], fill_slot[E]
+// per layer, one row of an I32 tensor: header, slot_expert[K], fill_slot[E], score[E] (float bits), last[E]
 bool alloc_device_state(moe_cache & mc) {
     const int64_t n_expert = mc.layers.front().pub.up_src->ne[2];
     int32_t max_slots = 0;
@@ -729,7 +730,7 @@ bool alloc_device_state(moe_cache & mc) {
     for (size_t li = 0; li < mc.layers.size(); ++li) {
         auto & pub = mc.layers[li].pub;
         pub.dev_state = ggml_view_1d(ctx, state, dev_state_len(pub.n_slots, n_expert), li*state->nb[1]);
-        pub.fill_slot = ggml_view_1d(ctx, state, n_expert, li*state->nb[1] + (DEV_STATE_HEADER + 3*pub.n_slots)*sizeof(int32_t));
+        pub.fill_slot = ggml_view_1d(ctx, state, n_expert, li*state->nb[1] + (DEV_STATE_HEADER + pub.n_slots)*sizeof(int32_t));
         ggml_format_name(pub.dev_state, "moe_cache_state.%d", pub.il);
         ggml_format_name(pub.fill_slot, "moe_cache_fill.%d",  pub.il);
     }
@@ -748,9 +749,9 @@ bool alloc_device_state(moe_cache & mc) {
         std::vector<int32_t> row(row_len, 0);
         row[0] = ls.n_slots;
         row[1] = (int32_t) n_expert;
-        row[2] = ls.max_protected;
+        std::memcpy(&row[2], &mc.decay, sizeof(int32_t));
         std::fill_n(row.begin() + DEV_STATE_HEADER, ls.n_slots, -1);
-        std::fill_n(row.begin() + DEV_STATE_HEADER + 3*ls.n_slots, n_expert, -1);
+        std::fill_n(row.begin() + DEV_STATE_HEADER + ls.n_slots, n_expert, -1);
         ggml_backend_tensor_set(state, row.data(), li*state->nb[1], row_len*sizeof(int32_t));
     }
 
@@ -811,7 +812,7 @@ void audit_tables(moe_cache & mc) {
         const int64_t n_expert = (int64_t) ls.expert_slot.size();
         const int32_t * row       = mc.state_host.data() + li*mc.dev_state->ne[0];
         const int32_t * slot_expert = row + DEV_STATE_HEADER;
-        const int32_t * fill_slot   = row + DEV_STATE_HEADER + 3*K;
+        const int32_t * fill_slot   = row + DEV_STATE_HEADER + K;
 
         std::vector<int32_t> table(n_expert);
         ggml_backend_tensor_get(ls.pub.dev_table, table.data(), 0, table.size()*sizeof(int32_t));
@@ -916,6 +917,9 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
         }
         if (const char * env = getenv("LLAMA_MOE_CACHE_PROTECTED_PCT")) {
             mc->protected_pct = std::clamp(atoi(env), 0, 100);
+        }
+        if (const char * env = getenv("LLAMA_MOE_CACHE_DECAY")) {
+            mc->decay = std::clamp((float) atof(env), 0.0f, 1.0f);
         }
         if (const char * env = getenv("LLAMA_MOE_CACHE_INSERT_ORDER")) {
             mc->rank_by_demand = strcmp(env, "recency") != 0;
@@ -1164,7 +1168,8 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
                 __func__, mc->layers.size(), slots_total, n_slots, layer_slots_override.empty() ? "" : ", LLAMA_MOE_CACHE_LAYER_SLOTS applied",
                 mc->max_inserts, mc->rank_by_demand ? "demand" : "recency", mc->protected_pct, vram/1024.0/1024.0);
         LLAMA_LOG_INFO("%s: device reads of uncached experts: %s\n", __func__, host_reads.c_str());
-        LLAMA_LOG_INFO("%s: eviction and fill policy: %s (audit %d)\n", __func__, policy.c_str(), mc->audit);
+        const std::string policy_info = mc->device_policy ? policy + format(", decayed frequency, decay %.3f", mc->decay) : policy;
+        LLAMA_LOG_INFO("%s: eviction and fill policy: %s (audit %d)\n", __func__, policy_info.c_str(), mc->audit);
         LLAMA_LOG_WARN("%s: MoE cache policy: %s\n", __func__, policy.c_str());
         LLAMA_LOG_INFO("%s: prefill warm-fill: %s\n", __func__, mc->warm_max > 0 ? (std::to_string(mc->warm_max) + " slots/layer/ubatch").c_str() : "off");
         if (!layer_slots_override.empty()) {
