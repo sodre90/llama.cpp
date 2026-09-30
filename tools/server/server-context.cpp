@@ -1831,6 +1831,20 @@ private:
         return false;
     }
 
+    void log_kv_pool() {
+        int32_t n_used = 0;
+        std::string per_slot;
+
+        for (const server_slot & slot : slots) {
+            n_used += slot.prompt.n_tokens();
+            per_slot += string_format(" %d=%d%s", slot.id, slot.prompt.n_tokens(), slot.is_processing() ? "" : "(idle)");
+        }
+
+        SRV_INF("kv pool: %d / %d cells used (%.1f%%), slots%s, deferred tasks %zu, prompt cache %.1f MiB, %zu tokens\n",
+                n_used, n_ctx, 100.0 * n_used / std::max(n_ctx, 1), per_slot.c_str(), queue_tasks.queue_tasks_deferred_size(),
+                prompt_cache ? prompt_cache->size() / (1024.0 * 1024.0) : 0.0, prompt_cache ? prompt_cache->n_tokens() : 0);
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
@@ -3337,6 +3351,15 @@ private:
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
         }
 #endif
+
+        if (params_base.kv_unified) {
+            static int64_t t_pool_log = 0;
+            const int64_t t_now = ggml_time_us();
+            if (t_now - t_pool_log > 60 * 1000 * 1000) { // every 60 seconds
+                t_pool_log = t_now;
+                log_kv_pool();
+            }
+        }
 
         // check if all slots are idle
         {
