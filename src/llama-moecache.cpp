@@ -859,6 +859,33 @@ int64_t count_stale_host_entries(moe_cache & mc) {
     return n_stale;
 }
 
+// how a differing slot differs: byte count and span, a second read, and the host expert it equals, if any
+void log_slot_difference(const layer_state & ls, const char * name, const ggml_tensor * cache, const ggml_tensor * src,
+        int32_t slot, int32_t expert, const std::vector<char> & bytes, uint64_t step) {
+    const char * want = (const char *) src->data + (size_t) expert*src->nb[2];
+    size_t n_diff = 0;
+    size_t first = bytes.size();
+    size_t last  = 0;
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        if (bytes[i] != want[i]) {
+            n_diff++;
+            first = std::min(first, i);
+            last  = i;
+        }
+    }
+    std::vector<char> again(bytes.size());
+    ggml_backend_tensor_get(cache, again.data(), (size_t) slot*cache->nb[2], again.size());
+    const bool stable = again == bytes;
+    int64_t equal_expert = -1;
+    for (int64_t e = 0; e < src->ne[2] && equal_expert < 0; ++e) {
+        if (memcmp(bytes.data(), (const char *) src->data + (size_t) e*src->nb[2], bytes.size()) == 0) {
+            equal_expert = e;
+        }
+    }
+    LLAMA_LOG_WARN("moe-cache audit: layer %d slot %d expert %d differs in %s, step %" PRIu64 ": %zu of %zu bytes in [%zu, %zu], second read %s, equals host expert %" PRId64 "\n",
+            ls.pub.il, slot, expert, name, step, n_diff, bytes.size(), first, last, stable ? "same" : "changed", equal_expert);
+}
+
 // bytes of N random committed slots against the host experts
 void audit_slot_bytes(moe_cache & mc) {
     for (int32_t n = 0; n < mc.audit; ++n) {
@@ -888,8 +915,7 @@ void audit_slot_bytes(moe_cache & mc) {
             if (memcmp(bytes.data(), (const char *) m.src->data + (size_t) expert*m.src->nb[2], bytes.size()) != 0) {
                 differs = true;
                 if (audit_report_allowed(mc)) {
-                    LLAMA_LOG_WARN("moe-cache audit: layer %d slot %d expert %d differs in %s, step %" PRIu64 "\n",
-                            ls.pub.il, slot, expert, m.name, mc.n_steps);
+                    log_slot_difference(ls, m.name, m.cache, m.src, slot, expert, bytes, mc.n_steps);
                 }
             }
         }
@@ -1170,7 +1196,7 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
         LLAMA_LOG_INFO("%s: device reads of uncached experts: %s\n", __func__, host_reads.c_str());
         const std::string policy_info = mc->device_policy ? policy + format(", decayed frequency, decay %.3f", mc->decay) : policy;
         LLAMA_LOG_INFO("%s: eviction and fill policy: %s (audit %d)\n", __func__, policy_info.c_str(), mc->audit);
-        LLAMA_LOG_WARN("%s: MoE cache policy: %s\n", __func__, policy.c_str());
+        LLAMA_LOG_WARN("%s: MoE cache policy: %s\n", __func__, policy_info.c_str());
         LLAMA_LOG_INFO("%s: prefill warm-fill: %s\n", __func__, mc->warm_max > 0 ? (std::to_string(mc->warm_max) + " slots/layer/ubatch").c_str() : "off");
         if (!layer_slots_override.empty()) {
             std::string per_layer;
