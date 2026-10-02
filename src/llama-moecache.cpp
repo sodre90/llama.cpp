@@ -1226,8 +1226,9 @@ ggml_tensor * llama_moe_cache_mul_mat_id(ggml_context * ctx, const llama_moe_cac
     if (layer.device_policy) {
         cur->src[4]   = layer.fill_slot;
     }
-    cur->op_params[0] = layer.n_slots;
-    memcpy(&cur->op_params[2], &host_src->data, sizeof(host_src->data));
+    static_assert(GGML_MOE_CACHE_OP_HOST_EXPERTS*sizeof(int32_t) + sizeof(void *) <= GGML_MAX_OP_PARAMS, "MoE cache op_params overflow");
+    cur->op_params[GGML_MOE_CACHE_OP_N_SLOTS] = layer.n_slots;
+    memcpy(&cur->op_params[GGML_MOE_CACHE_OP_HOST_EXPERTS], &host_src->data, sizeof(host_src->data));
     return cur;
 }
 
