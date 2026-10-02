@@ -2382,7 +2382,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         if (mcache) {
             up->src[3] = mcache->host_table;
-            up->op_params[0] = mcache->n_slots;
+            up->op_params[GGML_MOE_CACHE_OP_N_SLOTS] = mcache->n_slots;
         }
 
         if (up_exps_s) {
@@ -2400,7 +2400,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
             if (mcache) {
                 cur->src[3] = mcache->host_table;
-                cur->op_params[0] = mcache->n_slots;
+                cur->op_params[GGML_MOE_CACHE_OP_N_SLOTS] = mcache->n_slots;
             }
         } else {
             cur = up;
@@ -2512,7 +2512,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (mcache) {
         experts->src[3] = mcache->host_table;
-        experts->op_params[0] = mcache->n_slots;
+        experts->op_params[GGML_MOE_CACHE_OP_N_SLOTS] = mcache->n_slots;
 
         cache_down = build_cache_down();
 

@@ -1648,14 +1648,14 @@ static void ggml_compute_forward_mul_mat_id(
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
         // llama MoE expert cache: when src[3] is set it is an I32 table mapping
-        // expert id -> device cache slot, with op_params[0] holding the "not
+        // expert id -> device cache slot, with op_params[GGML_MOE_CACHE_OP_N_SLOTS] holding the "not
         // cached" dummy value. Cached ids are served by the device-side cache
         // chain, so this op skips them and zeroes their dst rows instead.
         const int32_t * moe_tbl   = NULL;
         int32_t         moe_dummy = 0;
         if (dst->src[3]) {
             moe_tbl   = (const int32_t *) dst->src[3]->data;
-            moe_dummy = ggml_get_op_params_i32(dst, 0);
+            moe_dummy = ggml_get_op_params_i32(dst, GGML_MOE_CACHE_OP_N_SLOTS);
         }
 
         // group rows by src0 matrix
@@ -1784,7 +1784,7 @@ static void ggml_compute_forward_mul_mat_id(
 #define GGML_MOE_MAX_EXPERTS_USED 128
 
 // llama MoE expert cache: src[3] is an I32 table mapping expert id -> device
-// cache slot, with op_params[0] the "not cached" dummy. Ids the device chain
+// cache slot, with op_params[GGML_MOE_CACHE_OP_N_SLOTS] the "not cached" dummy. Ids the device chain
 // serves must be skipped here exactly as ggml_compute_forward_mul_mat_id does.
 struct ggml_moe_cache_filter {
     const int32_t * tbl;
@@ -1795,7 +1795,7 @@ static struct ggml_moe_cache_filter ggml_moe_cache_filter_from(const struct ggml
     struct ggml_moe_cache_filter f = { NULL, 0 };
     if (node->src[3]) {
         f.tbl   = (const int32_t *) node->src[3]->data;
-        f.dummy = ggml_get_op_params_i32(node, 0);
+        f.dummy = ggml_get_op_params_i32(node, GGML_MOE_CACHE_OP_N_SLOTS);
     }
     return f;
 }

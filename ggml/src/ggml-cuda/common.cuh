@@ -1699,15 +1699,14 @@ struct ggml_backend_cuda_context {
     }
 };
 
-// A MUL_MAT_ID over llama's MoE expert cache: src[0] holds the cached experts, src[3] maps expert id -> slot
-// (op_params[0] is the slot count) and op_params[2..3] carry the address of the full expert tensor in pinned host
-// memory, from which the experts without a slot are read in place.
+// A MUL_MAT_ID over llama's MoE expert cache: src[0] holds the cached experts, src[3] maps expert id -> slot (op_params[GGML_MOE_CACHE_OP_N_SLOTS] is the slot count)
+// and op_params[GGML_MOE_CACHE_OP_HOST_EXPERTS] carries the address of the full expert tensor in pinned host memory, from which the experts without a slot are read in place.
 static const void * ggml_cuda_mmid_host_experts(const ggml_tensor * mm_id) {
     if (mm_id == nullptr || mm_id->op != GGML_OP_MUL_MAT_ID || mm_id->src[3] == nullptr) {
         return nullptr;
     }
     const void * host_experts;
-    memcpy(&host_experts, &mm_id->op_params[2], sizeof(host_experts));
+    memcpy(&host_experts, &mm_id->op_params[GGML_MOE_CACHE_OP_HOST_EXPERTS], sizeof(host_experts));
     return host_experts;
 }
 

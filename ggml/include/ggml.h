@@ -361,6 +361,11 @@ extern "C" {
     GGML_API void            ggml_set_moe_obs_callback(ggml_moe_obs_cb_t cb, void * ud);
     GGML_API ggml_moe_obs_cb_t ggml_get_moe_obs_callback(void ** ud);
 
+    // op_params of a MUL_MAT_ID over the llama MoE expert cache (src[3] maps expert id -> slot).
+    // They sit above the ggml_prec slots (0 and 2 + src index).
+    #define GGML_MOE_CACHE_OP_N_SLOTS      10 // i32: slot count; a table value not below it marks an expert without a slot
+    #define GGML_MOE_CACHE_OP_HOST_EXPERTS 12 // pointer (2 slots): the full expert tensor in pinned host memory
+
     GGML_NORETURN GGML_ATTRIBUTE_FORMAT(3, 4)
     GGML_API void ggml_abort(const char * file, int line, const char * fmt, ...);
 

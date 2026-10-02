@@ -2663,9 +2663,9 @@ void ggml_cuda_mul_mat_vec_q(
     if (const void * x_host = ids ? ggml_cuda_mmid_host_experts(x_node) : nullptr) {
         fusion_local.x_host         = x_host;
         fusion_local.expert_slot    = (const int32_t *) x_node->src[3]->data;
-        fusion_local.n_expert_slots = ggml_get_op_params_i32(x_node, 0);
+        fusion_local.n_expert_slots = ggml_get_op_params_i32(x_node, GGML_MOE_CACHE_OP_N_SLOTS);
         if (fusion_local.gate) {
-            GGML_ASSERT(gate_node && gate_node->src[3] == x_node->src[3] && ggml_get_op_params_i32(gate_node, 0) == fusion_local.n_expert_slots);
+            GGML_ASSERT(gate_node && gate_node->src[3] == x_node->src[3] && ggml_get_op_params_i32(gate_node, GGML_MOE_CACHE_OP_N_SLOTS) == fusion_local.n_expert_slots);
             fusion_local.gate_host = ggml_cuda_mmid_host_experts(gate_node);
             GGML_ASSERT(fusion_local.gate_host);
         }
