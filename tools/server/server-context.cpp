@@ -1076,6 +1076,7 @@ private:
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
     int decode_priority_burst = 0;       // env: LLAMA_SERVER_DECODE_PRIORITY
     int n_decode_steps_since_prompt = 0; // counter for decode steps while a prompt is pending
+    int decode_priority_min = 0;         // env: LLAMA_SERVER_DECODE_PRIORITY_MIN, prompts with at most this many tokens left are not held
 
     size_t i_slot_start = 0; // rotates so a low slot id cannot monopolize the n_batch prompt budget
 
@@ -1551,8 +1552,12 @@ private:
                 decode_priority_burst = 0;
             }
 
+            const char * LLAMA_SERVER_DECODE_PRIORITY_MIN = getenv("LLAMA_SERVER_DECODE_PRIORITY_MIN");
+            decode_priority_min = LLAMA_SERVER_DECODE_PRIORITY_MIN ? atoi(LLAMA_SERVER_DECODE_PRIORITY_MIN) : (int) params_base.n_ubatch;
+
             if (decode_priority_burst > 0) {
-                SRV_INF("decode-priority interleaving enabled: %d decode steps per prefill chunk (LLAMA_SERVER_DECODE_PRIORITY)\n", decode_priority_burst);
+                SRV_INF("decode-priority interleaving enabled: %d decode steps per prefill chunk (LLAMA_SERVER_DECODE_PRIORITY), prompts with <= %d tokens left are not held (LLAMA_SERVER_DECODE_PRIORITY_MIN)\n",
+                        decode_priority_burst, decode_priority_min);
             }
         }
 
@@ -3722,19 +3727,30 @@ private:
 
         // next, batch any pending prompts without exceeding n_batch
         bool allow_prompt_batch = params_base.cont_batching || batch.size() == 0;
+
+        // decode-priority holds only the long prompts, a short prompt costs the decodes about the same now or later
+        bool hold_long_prompts = false;
+        auto is_long_prompt = [this](const server_slot & slot) {
+            int64_t n_cached = slot.prompt.n_tokens();
+            if (slot.state == SLOT_STATE_STARTED) {
+                n_cached = slot.task->params.cache_prompt ? (int64_t) slot.prompt.tokens.get_common_prefix(slot.task->tokens) : 0;
+            }
+            return slot.task->n_tokens() - n_cached > decode_priority_min;
+        };
+
         if (allow_prompt_batch && batch.size() > 0 && decode_priority_burst > 0) {
-            bool has_pending_prompts = false;
+            bool has_long_prompts = false;
             for (const auto & slot : slots) {
-                if (slot.is_processing() && (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED)) {
-                    has_pending_prompts = true;
+                if (slot.is_processing() && (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) && is_long_prompt(slot)) {
+                    has_long_prompts = true;
                     break;
                 }
             }
-            if (has_pending_prompts) {
+            if (has_long_prompts) {
                 if (n_decode_steps_since_prompt < decode_priority_burst) {
                     n_decode_steps_since_prompt++;
-                    allow_prompt_batch = false;
-                    SRV_DBG("decode-priority: step %d/%d, holding prompt batch\n",
+                    hold_long_prompts = true;
+                    SRV_DBG("decode-priority: step %d/%d, holding long prompts\n",
                             n_decode_steps_since_prompt, decode_priority_burst);
                 } else {
                     n_decode_steps_since_prompt = 0;
@@ -3774,6 +3790,10 @@ private:
 
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
+                    if (hold_long_prompts && is_long_prompt(slot)) {
+                        return;
+                    }
+
                     const auto & input_tokens = slot.task->tokens;
 
                     // used to determine the number of tokens added to the batch for the current slot
