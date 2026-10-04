@@ -42,6 +42,10 @@
 // With the reader, a prefill ubatch reads the next layer's experts that are in neither the pool nor the device cache
 // into one of two pinned lookahead buffers while the current layer computes (LLAMA_MOE_HOST_LOOKAHEAD, default 1, 0 = off;
 // LLAMA_MOE_HOST_LOOKAHEAD_MIN_USED, default 0.9: the fraction of a layer's experts the ubatch must use for that).
+// LLAMA_MOE_HOST_PREDICT=1 (needs the reader) makes a decode ubatch guess the next cache layer's routing by running that
+// layer's router on this layer's router input, and read the guessed experts that the next layer's pool lacks into the pool
+// while this layer computes (LLAMA_MOE_HOST_PREDICT_K guessed experts per token, default n_expert_used;
+// LLAMA_MOE_HOST_PREDICT_MAX experts read ahead per layer and step, default 8). The real routing is not changed.
 //
 // Enabled via llama_context_params.n_moe_cache_slots (CLI: --moe-expert-cache).
 
@@ -93,6 +97,16 @@ struct llama_moe_cache_layer {
     ggml_tensor * dev_state     = nullptr;
     ggml_tensor * fill_slot     = nullptr;
 
+    // the router of this layer (the bias tensors may be null), for the host tier's guess of its routing
+    ggml_tensor * gate_inp    = nullptr;
+    ggml_tensor * gate_inp_b  = nullptr;
+    ggml_tensor * exp_probs_b = nullptr;
+
+    // host tier guess (LLAMA_MOE_HOST_PREDICT): the next cache layer, whose routing the graph guesses with its router, and the
+    // number of experts guessed per token; nullptr when the guess is off or this is the last cache layer
+    const llama_moe_cache_layer * predict_next = nullptr;
+    int32_t                       predict_k    = 0;
+
     // host tier: > 0 when the cache chain reads a miss from a pool of this many pinned host slots; up_h, gate_h and
     // down_h have ne[2] == n_host_slots + 1 (the last slot is padding), the experts stay in up_src, gate_src, down_src
     int32_t       n_host_slots = 0;
@@ -115,8 +129,10 @@ ggml_tensor * llama_moe_cache_mul_mat_id(ggml_context * ctx, const llama_moe_cac
         ggml_tensor * cache, const ggml_tensor * host_src, ggml_tensor * b, ggml_tensor * ids);
 
 // host tier: I32 [n_expert], for each routed id the host pool slot holding its expert. A CPU op that first copies
-// the routed experts missing from the pool in from the mapping; the cache chain's routing copy takes it as src[4]
-ggml_tensor * llama_moe_cache_host_map(ggml_context * ctx, const llama_moe_cache_layer & layer, ggml_tensor * ids);
+// the routed experts missing from the pool in from the mapping; the cache chain's routing copy takes it as src[4].
+// guess (optional) is I32 [k, n_tokens], the experts the layer.predict_next layer may route to: the op starts reading
+// those that its pool lacks and has them in the pool by the time that layer's own op runs
+ggml_tensor * llama_moe_cache_host_map(ggml_context * ctx, const llama_moe_cache_layer & layer, ggml_tensor * ids, ggml_tensor * guess = nullptr);
 
 // true when the host tier is on for the cached layers
 bool llama_moe_cache_host_tier();

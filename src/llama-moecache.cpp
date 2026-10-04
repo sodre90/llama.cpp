@@ -316,6 +316,34 @@ struct lookahead_buffer {
     expert_reader::ticket reads;       // the reads that fill the buffer
 };
 
+struct guess_stats {
+    uint64_t read    = 0; // experts read ahead because a guess named them
+    uint64_t used    = 0; // of those, experts the real routing then used
+    uint64_t wanted  = 0; // experts the real routing used that the pool did not hold before the guess
+    uint64_t wait_us = 0; // time spent waiting for the reads at the start of the layer's step
+
+    guess_stats & operator+=(const guess_stats & other) {
+        read    += other.read;
+        used    += other.used;
+        wanted  += other.wanted;
+        wait_us += other.wait_us;
+        return *this;
+    }
+
+    guess_stats operator-(const guess_stats & other) const {
+        return {read - other.read, used - other.used, wanted - other.wanted, wait_us - other.wait_us};
+    }
+};
+
+// what the guess made while the previous layer ran left in a layer's pool, until the layer's real routing arrives
+struct host_guess {
+    expert_reader::ticket reads;        // the reads into the pool, nullptr: none
+    bool                  made = false; // a guess was made for the layer's next step
+    std::vector<int32_t>  admitted;     // experts the guess put into the pool
+    std::vector<int32_t>  evicted;      // experts the guess pushed out of the pool
+    guess_stats           stats;
+};
+
 struct moe_cache {
     int32_t n_slots       = 0;  // default slots per layer; LLAMA_MOE_CACHE_LAYER_SLOTS overrides per layer
     int32_t max_inserts   = 2;
@@ -358,6 +386,12 @@ struct moe_cache {
     float                               lookahead_min_used = 0.9f;
     int64_t                             lookahead_layer = -1; // the layer of the last host weight the scheduler asked about
     std::array<lookahead_buffer, 2>     lookahead_bufs;
+
+    // a decode ubatch guesses the next layer's routing and reads the guessed experts into its pool (LLAMA_MOE_HOST_PREDICT)
+    bool                                predict     = false;
+    size_t                              predict_max = 8; // LLAMA_MOE_HOST_PREDICT_MAX: experts read ahead per layer and step
+    std::vector<host_guess>             host_guesses;    // per layer, parallel to layers
+    guess_stats                         last_log_guess;
 
     uint64_t last_log_host_hits   = 0;
     uint64_t last_log_host_misses = 0;
@@ -899,18 +933,24 @@ std::vector<host_copy> assign_host_slots(const moe_cache & mc, layer_state & ls,
     return copies;
 }
 
-void copy_into_host_pool(const moe_cache & mc, const layer_state & ls, const std::vector<host_copy> & copies) {
+// the reads that fill the pool slots of the copies
+std::vector<expert_reader::job> host_copy_jobs(const layer_state & ls, const std::vector<host_copy> & copies) {
     const auto matrices = host_matrices_of(ls.pub);
-    if (mc.host_reader) {
-        std::vector<expert_reader::job> jobs;
-        for (const host_copy & c : copies) {
-            for (size_t k = 0; k < matrices.size(); ++k) {
-                jobs.push_back(host_read_job(ls, k, c.expert, 1, (char *) matrices[k].pool->data + (size_t) c.slot*matrices[k].pool->nb[2]));
-            }
+    std::vector<expert_reader::job> jobs;
+    for (const host_copy & c : copies) {
+        for (size_t k = 0; k < matrices.size(); ++k) {
+            jobs.push_back(host_read_job(ls, k, c.expert, 1, (char *) matrices[k].pool->data + (size_t) c.slot*matrices[k].pool->nb[2]));
         }
-        mc.host_reader->read(jobs);
-        return;
     }
+    return jobs;
+}
+
+// with a reader the reads are only queued, and the caller waits for the returned ticket; without one the copies are done on return
+expert_reader::ticket copy_into_host_pool(const moe_cache & mc, const layer_state & ls, const std::vector<host_copy> & copies) {
+    if (mc.host_reader) {
+        return mc.host_reader->submit(host_copy_jobs(ls, copies), expert_reader::priority::high);
+    }
+    const auto matrices = host_matrices_of(ls.pub);
     for (const host_copy & c : copies) {
         for (const host_matrix & m : matrices) {
             advise_will_need((const char *) m.src->data + (size_t) c.expert*m.src->nb[2], m.src->nb[2]);
@@ -921,14 +961,97 @@ void copy_into_host_pool(const moe_cache & mc, const layer_state & ls, const std
             memcpy((char *) m.pool->data + (size_t) c.slot*m.pool->nb[2], (const char *) m.src->data + (size_t) c.expert*m.src->nb[2], m.src->nb[2]);
         }
     }
+    return nullptr;
 }
 
 size_t host_expert_bytes(const llama_moe_cache_layer & pub) {
     return pub.up_src->nb[2] + pub.gate_src->nb[2] + pub.down_src->nb[2];
 }
 
+size_t layer_index(const moe_cache & mc, const layer_state & ls) {
+    return &ls - mc.layers.data();
+}
+
+// the reads of an earlier guess must land before the layer's pool is used or its slots are given away again;
+// returns the microseconds spent waiting
+int64_t wait_guess_reads(moe_cache & mc, size_t layer_idx) {
+    if (!mc.predict) {
+        return 0;
+    }
+    expert_reader::ticket & reads = mc.host_guesses[layer_idx].reads;
+    if (!reads) {
+        return 0;
+    }
+    const int64_t t_start = ggml_time_us();
+    mc.host_reader->promote(reads);
+    mc.host_reader->wait(reads);
+    reads.reset();
+    return ggml_time_us() - t_start;
+}
+
+// how the real routing of a step compares with the guess made for it; the guess is spent afterwards
+guess_stats settle_guess(host_guess & guess, const layer_state & ls, const std::vector<int32_t> & routed) {
+    const auto contains = [](const std::vector<int32_t> & experts, int32_t expert) {
+        return std::find(experts.begin(), experts.end(), expert) != experts.end();
+    };
+    guess_stats outcome;
+    if (guess.made) {
+        for (const int32_t e : routed) {
+            const bool admitted = contains(guess.admitted, e);
+            outcome.used   += admitted;
+            outcome.wanted += admitted || (ls.host_slot[e] < 0 && !contains(guess.evicted, e));
+        }
+    }
+    guess.made = false;
+    guess.admitted.clear();
+    guess.evicted.clear();
+    return outcome;
+}
+
+std::vector<int32_t> experts_outside_pool_and_vram(const layer_state & ls);
+
+// the experts the guess names that the layer holds in neither its pool nor its device cache: token 0 first, at most max_experts
+std::vector<int32_t> guessed_misses(const layer_state & ls, const ggml_tensor * guess, size_t max_experts) {
+    const std::vector<int32_t> outside = experts_outside_pool_and_vram(ls);
+    std::vector<int32_t> experts;
+    for (int64_t i1 = 0; i1 < guess->ne[1]; ++i1) {
+        for (int64_t i0 = 0; i0 < guess->ne[0] && experts.size() < max_experts; ++i0) {
+            const int32_t id = *(const int32_t *) ((const char *) guess->data + i1*guess->nb[1] + i0*guess->nb[0]);
+            if (std::binary_search(outside.begin(), outside.end(), id) && std::find(experts.begin(), experts.end(), id) == experts.end()) {
+                experts.push_back(id);
+            }
+        }
+    }
+    return experts;
+}
+
+// puts the experts the guess names into the layer's pool and queues their reads behind every demand read; returns how many
+size_t admit_guess(moe_cache & mc, size_t layer_idx, const ggml_tensor * guessed_ids) {
+    layer_state & ls   = mc.layers[layer_idx];
+    host_guess & guess = mc.host_guesses[layer_idx];
+    wait_guess_reads(mc, layer_idx);
+
+    const std::vector<int32_t> missed = guessed_misses(ls, guessed_ids, std::min<size_t>(mc.predict_max, ls.pub.n_host_slots));
+    const std::vector<int32_t> slot_expert_before = ls.host_slot_expert;
+    const std::vector<host_copy> copies = assign_host_slots(mc, ls, missed, ls.host_clock + 1);
+
+    guess.made     = true;
+    guess.admitted = missed;
+    guess.evicted.clear();
+    for (const host_copy & c : copies) {
+        if (slot_expert_before[c.slot] >= 0) {
+            guess.evicted.push_back(slot_expert_before[c.slot]);
+        }
+    }
+    if (!copies.empty()) {
+        guess.reads = mc.host_reader->submit(host_copy_jobs(ls, copies), expert_reader::priority::low);
+    }
+    return copies.size();
+}
+
 // GGML_OP_CUSTOM on the CPU, once per layer per decode ubatch: after it every expert dst->src[0] routes to is in
-// the pool. dst is I32 [n_expert]: the pool slot of each expert (-1 when absent)
+// the pool. dst is I32 [n_expert]: the pool slot of each expert (-1 when absent). dst->src[1], when set, is the guess
+// of the next layer's routing: its experts that the next layer's pool lacks are read ahead while this layer computes
 void host_map_op(ggml_tensor * dst, int ith, int /*nth*/, void * userdata) {
     if (ith != 0) {
         return;
@@ -937,6 +1060,8 @@ void host_map_op(ggml_tensor * dst, int ith, int /*nth*/, void * userdata) {
     layer_state & ls = *(layer_state *) userdata;
     const ggml_tensor * ids = dst->src[0];
     const int32_t n_expert  = (int32_t) ls.host_slot.size();
+    const size_t layer_idx  = layer_index(mc, ls);
+    const int64_t guess_wait_us = wait_guess_reads(mc, layer_idx);
     const uint32_t now      = ++ls.host_clock;
 
     std::vector<int32_t> routed;
@@ -956,9 +1081,14 @@ void host_map_op(ggml_tensor * dst, int ith, int /*nth*/, void * userdata) {
 
     std::vector<int32_t> missed;
     std::copy_if(routed.begin(), routed.end(), std::back_inserter(missed), [&ls](int32_t e) { return ls.host_slot[e] < 0; });
+    const guess_stats outcome = mc.predict ? settle_guess(mc.host_guesses[layer_idx], ls, routed) : guess_stats();
 
     const int64_t t_start = ggml_time_us();
-    copy_into_host_pool(mc, ls, assign_host_slots(mc, ls, missed, now));
+    const expert_reader::ticket miss_reads = copy_into_host_pool(mc, ls, assign_host_slots(mc, ls, missed, now));
+    const size_t n_admitted = dst->src[1] ? admit_guess(mc, layer_idx + 1, dst->src[1]) : 0;
+    if (miss_reads) {
+        mc.host_reader->wait(miss_reads);
+    }
     const int64_t t_us = ggml_time_us() - t_start;
 
     std::for_each(routed.begin(), routed.end(), [&ls](int32_t e) { ls.host_routed[e] = 0; });
@@ -969,6 +1099,32 @@ void host_map_op(ggml_tensor * dst, int ith, int /*nth*/, void * userdata) {
     ls.n_host_miss     += missed.size();
     ls.host_bytes_read += missed.size()*host_expert_bytes(ls.pub);
     ls.host_read_us    += t_us;
+    if (mc.predict) {
+        guess_stats & stats = mc.host_guesses[layer_idx].stats;
+        stats += outcome;
+        stats.wait_us += guess_wait_us;
+        if (dst->src[1]) {
+            mc.host_guesses[layer_idx + 1].stats.read += n_admitted;
+        }
+    }
+}
+
+// the guess numbers since the previous log line, as the tail of the host tier line; "" when the guess is off
+std::string guess_window_info(moe_cache & mc) {
+    if (!mc.predict) {
+        return "";
+    }
+    guess_stats total;
+    for (const host_guess & guess : mc.host_guesses) {
+        total += guess.stats;
+    }
+    const guess_stats win = total - mc.last_log_guess;
+    mc.last_log_guess = total;
+    const auto percent = [](uint64_t part, uint64_t whole) { return whole > 0 ? 100.0 * part / whole : 0.0; };
+    return format(" win_guess_read=%" PRIu64 " win_guess_used=%" PRIu64 " win_recall=%.1f%% (%" PRIu64 "/%" PRIu64 ") win_guess_wait=%.1f ms"
+            " total_guess_read=%" PRIu64 " total_guess_used=%" PRIu64 " total_recall=%.1f%% (%" PRIu64 "/%" PRIu64 ") total_guess_wait=%.2f s",
+            win.read, win.used, percent(win.used, win.wanted), win.used, win.wanted, win.wait_us/1000.0,
+            total.read, total.used, percent(total.used, total.wanted), total.used, total.wanted, total.wait_us/1e6);
 }
 
 // the host tier numbers since the previous log line
@@ -992,10 +1148,10 @@ void log_host_tier_window(moe_cache & mc) {
     mc.last_log_host_bytes  = bytes;
     mc.last_log_host_us     = us;
 
-    LLAMA_LOG_WARN("moe-cache: host tier slots=%d win_hit=%.1f%% (%" PRIu64 "/%" PRIu64 ") total_hit=%.1f%% (%" PRIu64 "/%" PRIu64 ") win_copied=%.1f MiB in %.1f ms total_copied=%.2f GiB in %.1f s\n",
+    LLAMA_LOG_WARN("moe-cache: host tier slots=%d win_hit=%.1f%% (%" PRIu64 "/%" PRIu64 ") total_hit=%.1f%% (%" PRIu64 "/%" PRIu64 ") win_copied=%.1f MiB in %.1f ms total_copied=%.2f GiB in %.1f s%s\n",
             mc.host_slots, win_hits + win_misses > 0 ? 100.0 * win_hits / (win_hits + win_misses) : 0.0, win_hits, win_hits + win_misses,
             hits + misses > 0 ? 100.0 * hits / (hits + misses) : 0.0, hits, hits + misses,
-            win_bytes/1024.0/1024.0, win_us/1000.0, bytes/1024.0/1024.0/1024.0, us/1e6);
+            win_bytes/1024.0/1024.0, win_us/1000.0, bytes/1024.0/1024.0/1024.0, us/1e6, guess_window_info(mc).c_str());
 }
 
 struct layer_window_rate {
@@ -1327,6 +1483,34 @@ void populate_host_tier(moe_cache & mc) {
             mc.host_slots, mc.layers.front().pub.up_src->ne[2]);
     LLAMA_LOG_WARN("moe-cache: host tier on: %zu layers, %d slots per layer, %.1f GiB pinned, populated in %.1f s\n",
             mc.layers.size(), mc.host_slots, pinned_bytes/1024.0/1024.0/1024.0, (ggml_time_us() - t_start)/1e6);
+}
+
+// LLAMA_MOE_HOST_PREDICT=1: every cache layer but the last guesses the routing of the next one, see host_map_op
+void setup_host_predict(moe_cache & mc, const llama_model & model) {
+    if (const char * env = getenv("LLAMA_MOE_HOST_PREDICT"); !env || atoi(env) == 0) {
+        return;
+    }
+    if (!mc.host_reader) {
+        LLAMA_LOG_WARN("moe-cache: LLAMA_MOE_HOST_PREDICT needs the file reader, guess off\n");
+        return;
+    }
+    int32_t predict_k = 0;
+    if (const char * env = getenv("LLAMA_MOE_HOST_PREDICT_K")) {
+        predict_k = std::max(atoi(env), 0);
+    }
+    if (const char * env = getenv("LLAMA_MOE_HOST_PREDICT_MAX")) {
+        mc.predict_max = (size_t) std::max(atoi(env), 0);
+    }
+    for (size_t i = 0; i + 1 < mc.layers.size(); ++i) {
+        const llama_moe_cache_layer & next = mc.layers[i + 1].pub;
+        const int32_t k = predict_k > 0 ? predict_k : (int32_t) model.hparams.n_expert_used(next.il);
+        mc.layers[i].pub.predict_next = &next;
+        mc.layers[i].pub.predict_k    = (int32_t) std::clamp<int64_t>(k, 1, next.gate_inp->ne[1]);
+    }
+    mc.host_guesses.resize(mc.layers.size());
+    mc.predict = true;
+    LLAMA_LOG_WARN("moe-cache: host tier guesses the next layer's routing: %d experts per token (0: n_expert_used), at most %zu read ahead per layer and step\n",
+            predict_k, mc.predict_max);
 }
 
 // where a matrix's experts start in a lookahead buffer: the matrices before it come first
@@ -1814,6 +1998,9 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
                     ls->pub.up_src   = c.l->ffn_up_exps;
                     ls->pub.gate_src = c.l->ffn_gate_exps;
                     ls->pub.down_src = c.l->ffn_down_exps;
+                    ls->pub.gate_inp    = c.l->ffn_gate_inp;
+                    ls->pub.gate_inp_b  = c.l->ffn_gate_inp_b;
+                    ls->pub.exp_probs_b = c.l->ffn_exp_probs_b;
                 }
 
                 if (tables_only) {
@@ -1937,6 +2124,7 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
         warn_host_tier_off(host_tier_off);
         if (mc->host_slots > 0) {
             populate_host_tier(*mc);
+            setup_host_predict(*mc, model);
         }
 
         for (ggml_backend_buffer_t buf : mc->bufs) {
@@ -2067,10 +2255,11 @@ ggml_tensor * llama_moe_cache_mul_mat_id(ggml_context * ctx, const llama_moe_cac
     return cur;
 }
 
-ggml_tensor * llama_moe_cache_host_map(ggml_context * ctx, const llama_moe_cache_layer & layer, ggml_tensor * ids) {
+ggml_tensor * llama_moe_cache_host_map(ggml_context * ctx, const llama_moe_cache_layer & layer, ggml_tensor * ids, ggml_tensor * guess) {
     GGML_ASSERT(g_cache && layer.n_host_slots > 0);
     layer_state & ls = g_cache->layers[g_cache->by_up_src.at(layer.up_src)];
-    return ggml_custom_4d(ctx, GGML_TYPE_I32, (int64_t) ls.host_slot.size(), 1, 1, 1, &ids, 1, host_map_op, 1, &ls);
+    ggml_tensor * args[] = {ids, guess};
+    return ggml_custom_4d(ctx, GGML_TYPE_I32, (int64_t) ls.host_slot.size(), 1, 1, 1, args, guess ? 2 : 1, host_map_op, 1, &ls);
 }
 
 bool llama_moe_cache_host_tier() {
@@ -2087,6 +2276,7 @@ bool llama_moe_cache_expert_host(const ggml_tensor * weight, const uint32_t * us
         return false;
     }
     const layer_state & ls = mc->layers[it->second.layer_idx];
+    wait_guess_reads(*mc, it->second.layer_idx);
     *pool      = host_pool_of(ls.pub, weight);
     *host_slot = ls.host_slot.data();
     *n_slots   = ls.pub.n_host_slots;

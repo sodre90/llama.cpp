@@ -2007,6 +2007,18 @@ ggml_tensor * llm_graph_context::build_ffn(
     return cur;
 }
 
+// the router's probabilities for gating_op, as build_moe_ffn computes them
+static ggml_tensor * moe_gating_probs(ggml_context * ctx0, ggml_tensor * logits, llama_expert_gating_func_type gating_op) {
+    switch (gating_op) {
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:        return ggml_soft_max(ctx0, logits);
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:        return ggml_sigmoid(ctx0, logits);
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT: return logits;
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS:  return ggml_sqrt(ctx0, ggml_softplus(ctx0, logits));
+        default:
+            GGML_ABORT("fatal error");
+    }
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -2247,7 +2259,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 routed->src[2] = mcache->dev_state;
                 routed->src[3] = mcache->dev_table;
                 if (mcache->n_host_slots > 0) {
-                    routed->src[4] = llama_moe_cache_host_map(ctx0, *mcache, selected_experts);
+                    ggml_tensor * guess = nullptr;
+                    if (const llama_moe_cache_layer * next = mcache->predict_next) {
+                        // the next layer's router on this layer's router input: a guess of its routing
+                        ggml_tensor * guess_logits = ggml_mul_mat(ctx0, next->gate_inp, cur); // [n_expert, n_tokens]
+                        if (next->gate_inp_b) {
+                            guess_logits = ggml_add(ctx0, guess_logits, next->gate_inp_b);
+                        }
+                        cb(guess_logits, "ffn_moe_pred_logits", il);
+
+                        ggml_tensor * guess_scores = next->exp_probs_b ? ggml_add(ctx0, moe_gating_probs(ctx0, guess_logits, gating_op), next->exp_probs_b) : guess_logits;
+                        guess = ggml_argsort_top_k(ctx0, guess_scores, mcache->predict_k); // [predict_k, n_tokens]
+                        cb(guess, "ffn_moe_pred", il);
+                    }
+                    routed->src[4] = llama_moe_cache_host_map(ctx0, *mcache, selected_experts, guess);
                     cb(routed->src[4], "ffn_moe_host_map", il);
                 }
                 mc_routed_ids  = routed;
