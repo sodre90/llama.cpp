@@ -807,6 +807,7 @@ void llama_context::sched_reserve() {
     ggml_backend_sched_set_expert_rows_callback(sched.get(), llama_moe_cache_expert_rows, nullptr);
     ggml_backend_sched_set_expert_staged_callback(sched.get(), llama_moe_cache_warm_from_staging, nullptr);
     ggml_backend_sched_set_expert_host_callback(sched.get(), llama_moe_cache_expert_host, nullptr);
+    ggml_backend_sched_set_expert_read_callback(sched.get(), llama_moe_cache_direct_reads() ? llama_moe_cache_expert_read : nullptr, nullptr);
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -851,6 +852,7 @@ void llama_context::sched_reserve() {
                 ggml_backend_sched_set_expert_rows_callback(sched.get(), llama_moe_cache_expert_rows, nullptr);
                 ggml_backend_sched_set_expert_staged_callback(sched.get(), llama_moe_cache_warm_from_staging, nullptr);
                 ggml_backend_sched_set_expert_host_callback(sched.get(), llama_moe_cache_expert_host, nullptr);
+                ggml_backend_sched_set_expert_read_callback(sched.get(), llama_moe_cache_direct_reads() ? llama_moe_cache_expert_read : nullptr, nullptr);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {

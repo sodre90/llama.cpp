@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cerrno>
 #include <cinttypes>
 #include <cmath>
 #include <condition_variable>
@@ -17,6 +19,7 @@
 #include <deque>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <random>
@@ -26,10 +29,18 @@
 #include <vector>
 #include <unistd.h>
 #ifndef _WIN32
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #endif
 
 namespace {
+
+// a host expert matrix in its model file: the descriptor the reader opened and the offset of expert 0
+struct host_file {
+    int    fd     = -1;
+    size_t offset = 0;
+};
 
 struct layer_state {
     llama_moe_cache_layer pub;
@@ -89,6 +100,8 @@ struct layer_state {
     uint64_t n_host_miss     = 0; // routed experts copied into the pool
     uint64_t host_bytes_read = 0; // bytes copied into the pool
     uint64_t host_read_us    = 0; // time spent copying
+
+    std::array<host_file, 3> host_files; // up, gate, down; set when the tier has a reader
 };
 
 struct upload_job {
@@ -96,6 +109,170 @@ struct upload_job {
     int32_t expert;
     int32_t slot;
     bool    done = false;
+};
+
+// opens path for O_DIRECT reads and raises alignment to the block size of its file; -1 with errno set when it cannot
+int open_direct(const char * path, size_t & alignment) {
+#if !defined(_WIN32) && defined(O_DIRECT)
+    const int fd = open(path, O_RDONLY | O_DIRECT);
+    if (fd < 0) {
+        return -1;
+    }
+    struct stat file_stat = {};
+    if (fstat(fd, &file_stat) != 0) {
+        close(fd);
+        return -1;
+    }
+    alignment = std::max<size_t>(alignment, file_stat.st_blksize);
+    return fd;
+#else
+    GGML_UNUSED(path);
+    GGML_UNUSED(alignment);
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
+// pread of at most n bytes; -1 with errno set on error
+int64_t read_at(int fd, void * buf, size_t n, size_t offset) {
+#ifndef _WIN32
+    return pread(fd, buf, n, (off_t) offset);
+#else
+    GGML_UNUSED(fd);
+    GGML_UNUSED(buf);
+    GGML_UNUSED(n);
+    GGML_UNUSED(offset);
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
+// parallel O_DIRECT reads of byte ranges of the model files, so that nothing goes through the page cache
+struct expert_reader {
+    struct job {
+        int          fd;
+        size_t       offset; // in the file
+        void *       dst;
+        size_t       len;
+        const void * mapped; // the same bytes in the mapping, copied when the read fails
+    };
+
+    std::vector<int>         fds;
+    size_t                   alignment   = 4096;
+    size_t                   chunk_bytes = 512*1024;
+    std::vector<void *>      bounces;
+    std::vector<std::thread> threads;
+
+    std::mutex              call_mtx; // one read() at a time
+    std::mutex              mtx;      // guards the members below
+    std::condition_variable work_cv;
+    std::condition_variable done_cv;
+    std::vector<job>        chunks;
+    size_t                  next    = 0;
+    size_t                  pending = 0;
+    bool                    stop    = false;
+
+    std::atomic<bool> warned{false};
+
+    ~expert_reader() {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            stop = true;
+        }
+        work_cv.notify_all();
+        for (auto & thread : threads) {
+            thread.join();
+        }
+        for (void * bounce : bounces) {
+            free(bounce);
+        }
+        for (const int fd : fds) {
+            close(fd);
+        }
+    }
+
+    // false when a read buffer cannot be allocated
+    bool start(int n_threads) {
+        for (int i = 0; i < n_threads; ++i) {
+            void * bounce = nullptr;
+            if (posix_memalign(&bounce, alignment, chunk_bytes + 2*alignment) != 0) {
+                return false;
+            }
+            bounces.push_back(bounce);
+        }
+        for (void * bounce : bounces) {
+            threads.emplace_back([this, bounce]() { work((char *) bounce); });
+        }
+        return true;
+    }
+
+    // returns when every byte of every job is in its dst
+    void read(const std::vector<job> & jobs) {
+        std::lock_guard<std::mutex> call_lock(call_mtx);
+        std::unique_lock<std::mutex> lock(mtx);
+        chunks.clear();
+        for (const job & j : jobs) {
+            for (size_t done = 0; done < j.len; done += chunk_bytes) {
+                chunks.push_back({j.fd, j.offset + done, (char *) j.dst + done, std::min(chunk_bytes, j.len - done), (const char *) j.mapped + done});
+            }
+        }
+        next    = 0;
+        pending = chunks.size();
+        if (pending == 0) {
+            return;
+        }
+        work_cv.notify_all();
+        done_cv.wait(lock, [this]() { return pending == 0; });
+    }
+
+    void work(char * bounce) {
+        std::unique_lock<std::mutex> lock(mtx);
+        for (;;) {
+            work_cv.wait(lock, [this]() { return stop || next < chunks.size(); });
+            if (stop) {
+                return;
+            }
+            const job chunk = chunks[next++];
+            lock.unlock();
+            if (const int err = read_chunk(chunk, bounce); err != 0) {
+                copy_from_mapping(chunk, err);
+            }
+            lock.lock();
+            if (--pending == 0) {
+                done_cv.notify_one();
+            }
+        }
+    }
+
+    // 0, or the errno of the failed read; a read that stops at the end of the file is fine when it covers the chunk
+    int read_chunk(const job & chunk, char * bounce) const {
+        const size_t begin = chunk.offset/alignment*alignment;
+        const size_t end   = (chunk.offset + chunk.len + alignment - 1)/alignment*alignment;
+        const size_t skip  = chunk.offset - begin;
+        size_t got = 0;
+        while (got < skip + chunk.len) {
+            const int64_t n = read_at(chunk.fd, bounce + got, end - begin - got, begin + got);
+            if (n < 0 && errno == EINTR) {
+                continue;
+            }
+            if (n < 0) {
+                return errno;
+            }
+            if (n == 0) {
+                return EIO;
+            }
+            got += (size_t) n;
+        }
+        memcpy(chunk.dst, bounce + skip, chunk.len);
+        return 0;
+    }
+
+    void copy_from_mapping(const job & chunk, int err) {
+        if (!warned.exchange(true)) {
+            LLAMA_LOG_WARN("moe-cache: direct read of the model file failed (%s), copying from the mapping\n", strerror(err));
+        }
+        memcpy(chunk.dst, chunk.mapped, chunk.len);
+    }
 };
 
 struct moe_cache {
@@ -132,6 +309,7 @@ struct moe_cache {
     int32_t                             host_slots = 0;
     std::vector<ggml_context *>         host_ctxs;
     std::vector<ggml_backend_buffer_t>  host_bufs;
+    std::unique_ptr<expert_reader>      host_reader; // nullptr: the tier copies from the mapping
     uint64_t last_log_host_hits   = 0;
     uint64_t last_log_host_misses = 0;
     uint64_t last_log_host_bytes  = 0;
@@ -621,6 +799,13 @@ const ggml_tensor * host_pool_of(const llama_moe_cache_layer & pub, const ggml_t
     return src == pub.up_src ? pub.up_h : src == pub.gate_src ? pub.gate_h : pub.down_h;
 }
 
+// the read of n_experts experts from first_expert of the layer's matrix (0: up, 1: gate, 2: down) into dst
+expert_reader::job host_read_job(const layer_state & ls, size_t matrix, int64_t first_expert, int64_t n_experts, void * dst) {
+    const ggml_tensor * src = host_matrices_of(ls.pub)[matrix].src;
+    const size_t offset = (size_t) first_expert*src->nb[2];
+    return {ls.host_files[matrix].fd, ls.host_files[matrix].offset + offset, dst, (size_t) n_experts*src->nb[2], (const char *) src->data + offset};
+}
+
 float host_score_at(const moe_cache & mc, const layer_state & ls, uint32_t now, int32_t expert) {
     return ls.host_score[expert] * exp2f(-mc.decay * (float) (now - ls.host_last[expert]));
 }
@@ -665,8 +850,18 @@ std::vector<host_copy> assign_host_slots(const moe_cache & mc, layer_state & ls,
     return copies;
 }
 
-void copy_into_host_pool(const layer_state & ls, const std::vector<host_copy> & copies) {
+void copy_into_host_pool(const moe_cache & mc, const layer_state & ls, const std::vector<host_copy> & copies) {
     const auto matrices = host_matrices_of(ls.pub);
+    if (mc.host_reader) {
+        std::vector<expert_reader::job> jobs;
+        for (const host_copy & c : copies) {
+            for (size_t k = 0; k < matrices.size(); ++k) {
+                jobs.push_back(host_read_job(ls, k, c.expert, 1, (char *) matrices[k].pool->data + (size_t) c.slot*matrices[k].pool->nb[2]));
+            }
+        }
+        mc.host_reader->read(jobs);
+        return;
+    }
     for (const host_copy & c : copies) {
         for (const host_matrix & m : matrices) {
             advise_will_need((const char *) m.src->data + (size_t) c.expert*m.src->nb[2], m.src->nb[2]);
@@ -714,7 +909,7 @@ void host_map_op(ggml_tensor * dst, int ith, int /*nth*/, void * userdata) {
     std::copy_if(routed.begin(), routed.end(), std::back_inserter(missed), [&ls](int32_t e) { return ls.host_slot[e] < 0; });
 
     const int64_t t_start = ggml_time_us();
-    copy_into_host_pool(ls, assign_host_slots(mc, ls, missed, now));
+    copy_into_host_pool(mc, ls, assign_host_slots(mc, ls, missed, now));
     const int64_t t_us = ggml_time_us() - t_start;
 
     std::for_each(routed.begin(), routed.end(), [&ls](int32_t e) { ls.host_routed[e] = 0; });
@@ -930,6 +1125,7 @@ bool alloc_host_pools(moe_cache & mc, ggml_backend_buffer_type_t host_buft) {
 
 // the tier is off again: the pools are freed and the layers stop reading the experts in place
 void drop_host_tier(moe_cache & mc) {
+    mc.host_reader.reset();
     for (auto * buf : mc.host_bufs) { ggml_backend_buffer_free(buf); }
     for (auto * ctx : mc.host_ctxs) { ggml_free(ctx); }
     mc.host_bufs.clear();
@@ -944,6 +1140,50 @@ void drop_host_tier(moe_cache & mc) {
         ls.pub.routing            = nullptr;
     }
     mc.routing = nullptr;
+}
+
+// the reader of the model files that hold the host experts; nullptr, and why_not, when they cannot be read with O_DIRECT
+std::unique_ptr<expert_reader> open_expert_reader(moe_cache & mc, const llama_model & model, std::string & why_not) {
+    int n_threads = 16;
+    if (const char * env = getenv("LLAMA_MOE_HOST_IO_THREADS")) {
+        n_threads = atoi(env);
+    }
+    if (n_threads <= 0) {
+        why_not = "LLAMA_MOE_HOST_IO_THREADS=0";
+        return nullptr;
+    }
+    auto reader = std::make_unique<expert_reader>();
+    if (const char * env = getenv("LLAMA_MOE_HOST_IO_CHUNK_KB")) {
+        reader->chunk_bytes = (size_t) std::max(atoi(env), 1)*1024;
+    }
+
+    std::map<std::string, int> fd_of_path;
+    for (auto & ls : mc.layers) {
+        const auto matrices = host_matrices_of(ls.pub);
+        for (size_t k = 0; k < matrices.size(); ++k) {
+            std::string path;
+            size_t offset = 0;
+            if (!model.mapped_file_of(matrices[k].src->data, path, offset) || path.empty()) {
+                why_not = std::string(matrices[k].src->name) + " is not in a mapped model file";
+                return nullptr;
+            }
+            if (fd_of_path.count(path) == 0) {
+                const int fd = open_direct(path.c_str(), reader->alignment);
+                if (fd < 0) {
+                    why_not = "cannot open " + path + " with O_DIRECT: " + strerror(errno);
+                    return nullptr;
+                }
+                reader->fds.push_back(fd);
+                fd_of_path[path] = fd;
+            }
+            ls.host_files[k] = {fd_of_path[path], offset};
+        }
+    }
+    if (!reader->start(n_threads)) {
+        why_not = "no memory for the read buffers";
+        return nullptr;
+    }
+    return reader;
 }
 
 // "" when the tier is on: every layer has n_host_slots and its pools; else why it is off
@@ -969,6 +1209,15 @@ std::string setup_host_tier(moe_cache & mc, const llama_model & model, int32_t n
         drop_host_tier(mc);
         return "no pinned host memory for the pools";
     }
+
+    std::string reader_why_not;
+    mc.host_reader = open_expert_reader(mc, model, reader_why_not);
+    if (mc.host_reader) {
+        LLAMA_LOG_WARN("moe-cache: host tier reads the model files with O_DIRECT: %zu files, %zu threads, %zu KiB chunks, %zu byte alignment\n",
+                mc.host_reader->fds.size(), mc.host_reader->threads.size(), mc.host_reader->chunk_bytes/1024, mc.host_reader->alignment);
+    } else {
+        LLAMA_LOG_WARN("moe-cache: host tier reads through the model mapping: %s\n", reader_why_not.c_str());
+    }
     return "";
 }
 
@@ -987,11 +1236,21 @@ void populate_host_tier(moe_cache & mc) {
         ls.host_routed.assign(n_expert, 0);
 
         const auto matrices = host_matrices_of(ls.pub);
-        for (const host_matrix & m : matrices) {
-            advise_will_need(m.src->data, (size_t) ls.pub.n_host_slots*m.src->nb[2]);
+        if (mc.host_reader) {
+            std::vector<expert_reader::job> jobs;
+            for (size_t k = 0; k < matrices.size(); ++k) {
+                jobs.push_back(host_read_job(ls, k, 0, ls.pub.n_host_slots, matrices[k].pool->data));
+            }
+            mc.host_reader->read(jobs);
+        } else {
+            for (const host_matrix & m : matrices) {
+                advise_will_need(m.src->data, (size_t) ls.pub.n_host_slots*m.src->nb[2]);
+            }
+            for (const host_matrix & m : matrices) {
+                memcpy(m.pool->data, m.src->data, (size_t) ls.pub.n_host_slots*m.src->nb[2]);
+            }
         }
         for (const host_matrix & m : matrices) {
-            memcpy(m.pool->data, m.src->data, (size_t) ls.pub.n_host_slots*m.src->nb[2]);
             pinned_bytes += ggml_nbytes(m.pool);
         }
     }
@@ -1655,12 +1914,37 @@ bool llama_moe_cache_expert_host(const ggml_tensor * weight, const uint32_t * us
     *host_slot = ls.host_slot.data();
     *n_slots   = ls.pub.n_host_slots;
 
-    for (int64_t id = 0; id < weight->ne[2]; ++id) {
-        if ((used_ids[id >> 5] >> (id & 31) & 1) && ls.host_slot[id] < 0) {
-            advise_will_need((const char *) weight->data + (size_t) id*weight->nb[2], weight->nb[2]);
+    if (!mc->host_reader) {
+        for (int64_t id = 0; id < weight->ne[2]; ++id) {
+            if ((used_ids[id >> 5] >> (id & 31) & 1) && ls.host_slot[id] < 0) {
+                advise_will_need((const char *) weight->data + (size_t) id*weight->nb[2], weight->nb[2]);
+            }
         }
     }
     return *pool != nullptr;
+}
+
+bool llama_moe_cache_direct_reads() {
+    return g_cache && g_cache->host_reader;
+}
+
+bool llama_moe_cache_expert_read(const ggml_tensor * weight, int64_t first, int64_t n, void * dst, void * /*user_data*/) {
+    moe_cache * mc = g_cache;
+    if (!mc || !mc->host_reader) {
+        return false;
+    }
+    auto it = mc->by_src.find(weight);
+    if (it == mc->by_src.end()) {
+        return false;
+    }
+    const layer_state & ls = mc->layers[it->second.layer_idx];
+    const auto matrices = host_matrices_of(ls.pub);
+    const size_t matrix = std::find_if(matrices.begin(), matrices.end(), [weight](const host_matrix & m) { return m.src == weight; }) - matrices.begin();
+    if (matrix == matrices.size()) {
+        return false;
+    }
+    mc->host_reader->read({host_read_job(ls, matrix, first, n, dst)});
+    return true;
 }
 
 bool llama_moe_cache_expert_rows(const ggml_tensor * weight, const ggml_tensor ** rows, const int32_t ** expert_slot, int32_t * n_slots, void * /*user_data*/) {

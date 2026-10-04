@@ -409,6 +409,10 @@ extern "C" {
         const struct ggml_tensor ** pool, const int32_t ** host_slot, int32_t * n_slots, void * user_data);
     GGML_API void                 ggml_backend_sched_set_expert_host_callback(ggml_backend_sched_t sched, ggml_backend_sched_expert_host_fn fn, void * user_data);
 
+    // reads experts [first, first + n) of a host weight into dst (n * nb[2] bytes); false: the caller copies them from weight->data
+    typedef bool (*ggml_backend_sched_expert_read_fn)(const struct ggml_tensor * weight, int64_t first, int64_t n, void * dst, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_expert_read_callback(ggml_backend_sched_t sched, ggml_backend_sched_expert_read_fn fn, void * user_data);
+
     //
     // Meta backend
     //

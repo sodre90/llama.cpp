@@ -1036,6 +1036,16 @@ struct ggml_backend_sched {
     ggml_backend_sched_expert_host_fn expert_host_fn;
     void * expert_host_user_data;
 
+    // experts read by a callback (see ggml_backend_sched_set_expert_read_callback) into a pinned staging buffer of two
+    // halves: one is read while the other is uploaded. GGML_SCHED_EXPERT_READ_MB sizes it, 0 = off
+    ggml_backend_sched_expert_read_fn expert_read_fn;
+    void * expert_read_user_data;
+    size_t expert_read_bytes;
+    ggml_backend_buffer_t expert_read_buf;
+    ggml_backend_t expert_read_pending[2]; // the backend still uploading from each half, or NULL
+    int expert_read_cur;
+    bool expert_read_warned;
+
     // GGML_SCHED_SPLIT_STATS=1: per-split wall time (input copies and syncs vs compute launch),
     // accumulated over graphs with the same split count and logged every 256 of them
     struct ggml_backend_sched_split_profile * split_profile;
@@ -2065,6 +2075,30 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
     return true;
 }
 
+// allocates the staging buffer of the expert read callback at first use; false when the experts are copied from the weight instead
+static bool ggml_backend_sched_expert_read_init(ggml_backend_sched_t sched, ggml_backend_t split_backend, size_t expert_size) {
+    if (sched->expert_read_bytes == 0) {
+        return false;
+    }
+    if (sched->expert_read_buf == NULL) {
+        ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(split_backend));
+        sched->expert_read_buf = buft ? ggml_backend_buft_alloc_buffer(buft, sched->expert_read_bytes) : NULL;
+        if (sched->expert_read_buf == NULL) {
+            GGML_LOG_WARN("%s: no pinned host buffer of %zu MiB for the expert reads, copying the experts from the weights\n", __func__, sched->expert_read_bytes >> 20);
+            sched->expert_read_bytes = 0;
+            return false;
+        }
+    }
+    if (expert_size > sched->expert_read_bytes/2) {
+        if (!sched->expert_read_warned) {
+            sched->expert_read_warned = true;
+            GGML_LOG_WARN("%s: an expert of %zu bytes does not fit in half of the expert read buffer, copying the experts from the weights\n", __func__, expert_size);
+        }
+        return false;
+    }
+    return true;
+}
+
 static std::string ggml_backend_sched_split_label(ggml_backend_sched_t sched, const struct ggml_backend_sched_split * split) {
     const struct ggml_tensor * first = split->graph.n_nodes > 0 ? split->graph.nodes[0] : NULL;
     const struct ggml_tensor * last  = split->graph.n_nodes > 0 ? split->graph.nodes[split->graph.n_nodes - 1] : NULL;
@@ -2374,8 +2408,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
 
     if (sched->expert_copy_stats && stat_tensors > 0) {
-        GGML_LOG_WARN("sched expert upload: %d weight tensors, %.1f%% of experts used, %.1f%% of the used rows device-filled, %.1f MiB over the host link, %.1f MiB from the host pool\n",
-                stat_tensors, 100.0*stat_used/stat_experts, stat_used > 0 ? 100.0*stat_resident/stat_used : 0.0, stat_bytes_host/1024.0/1024.0, stat_bytes_pool/1024.0/1024.0);
+        GGML_LOG_WARN("sched expert upload: %d weight tensors, %.1f%% of experts used, %.1f%% of the used rows device-filled, %.1f MiB over the host link, %.1f MiB from the host pool, %.1f MiB read through the read callback in %.1f ms\n",
+                stat_tensors, 100.0*stat_used/stat_experts, stat_used > 0 ? 100.0*stat_resident/stat_used : 0.0, stat_bytes_host/1024.0/1024.0, stat_bytes_pool/1024.0/1024.0,
+                stat_bytes_read/1024.0/1024.0, stat_read_us/1000.0);
     }
 
     if (sched->split_profile) {
@@ -2427,6 +2462,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->expert_staged_user_data = NULL;
     sched->expert_host_fn        = NULL;
     sched->expert_host_user_data = NULL;
+    sched->expert_read_fn        = NULL;
+    sched->expert_read_user_data = NULL;
+    const char * GGML_SCHED_EXPERT_READ_MB = getenv("GGML_SCHED_EXPERT_READ_MB");
+    sched->expert_read_bytes = (GGML_SCHED_EXPERT_READ_MB ? (size_t) std::max(atoi(GGML_SCHED_EXPERT_READ_MB), 0) : 256) << 20;
     const char * GGML_SCHED_EXPERT_CACHE_D2D = getenv("GGML_SCHED_EXPERT_CACHE_D2D");
     sched->expert_rows_d2d = GGML_SCHED_EXPERT_CACHE_D2D ? atoi(GGML_SCHED_EXPERT_CACHE_D2D) != 0 : true;
     const char * GGML_SCHED_EXPERT_COPY_STATS = getenv("GGML_SCHED_EXPERT_COPY_STATS");
@@ -2516,6 +2555,12 @@ void ggml_backend_sched_set_expert_host_callback(ggml_backend_sched_t sched, ggm
     sched->expert_host_user_data = user_data;
 }
 
+void ggml_backend_sched_set_expert_read_callback(ggml_backend_sched_t sched, ggml_backend_sched_expert_read_fn fn, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->expert_read_fn        = fn;
+    sched->expert_read_user_data = user_data;
+}
+
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
@@ -2535,6 +2580,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     }
     if (sched->prefetch_backend) {
         ggml_backend_free(sched->prefetch_backend);
+    }
+    if (sched->expert_read_buf) {
+        ggml_backend_buffer_free(sched->expert_read_buf);
     }
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
@@ -2645,6 +2693,8 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);
     }
+    sched->expert_read_pending[0] = NULL;
+    sched->expert_read_pending[1] = NULL;
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization
         // this ensures that during generation the same copy is used every time,

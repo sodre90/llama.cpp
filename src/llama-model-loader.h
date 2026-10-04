@@ -124,6 +124,7 @@ struct llama_model_loader {
     int shared_target_tensors = -1;
 
     llama_files files;
+    std::vector<std::string> paths; // of files; empty for a file given as FILE *
     llama_ftype ftype;
     llama_fver  fver;
 

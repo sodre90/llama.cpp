@@ -1211,6 +1211,7 @@ struct llama_model::impl {
 
     // model memory mapped files
     llama_mmaps mappings;
+    std::vector<std::string> mapping_paths; // parallel to mappings; empty for a file given as FILE *
 
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
@@ -1821,7 +1822,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // 0: do not read the whole file ahead, it can be larger than RAM
+    const char * mmap_prefetch_env = getenv("LLAMA_MMAP_PREFETCH");
+    ml.init_mappings(!(mmap_prefetch_env && strcmp(mmap_prefetch_env, "0") == 0), use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -1967,6 +1970,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
+        pimpl->mapping_paths.assign(ml.paths.begin(), ml.paths.begin() + pimpl->mappings.size());
     }
 
     return true;
@@ -2328,6 +2332,18 @@ ggml_backend_buffer_type_t llama_model::select_buft(int il) const {
 
 bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
+}
+
+bool llama_model::mapped_file_of(const void * ptr, std::string & path, size_t & offset) const {
+    for (size_t i = 0; i < pimpl->mappings.size(); ++i) {
+        const uintptr_t base = (uintptr_t) pimpl->mappings[i]->addr();
+        if ((uintptr_t) ptr >= base && (uintptr_t) ptr < base + pimpl->mappings[i]->size()) {
+            path   = pimpl->mapping_paths[i];
+            offset = (uintptr_t) ptr - base;
+            return true;
+        }
+    }
+    return false;
 }
 
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
