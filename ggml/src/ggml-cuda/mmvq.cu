@@ -615,7 +615,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
-// the weight channel an expert id reads: its cache slot, or the id itself in the host tensor (see ggml_cuda_mmid_host_experts)
+// the weight channel an expert id reads: its cache slot, or in the host tensor its host pool slot, or without a host tier the id itself (see ggml_cuda_mmid_host_experts)
 static __device__ __forceinline__ uint32_t mmvq_expert_channel(
         const ggml_cuda_mm_fusion_args_device & fusion, const uint32_t expert, const void *& x, const void *& gate) {
     if (fusion.expert_slot == nullptr) {
@@ -627,7 +627,7 @@ static __device__ __forceinline__ uint32_t mmvq_expert_channel(
     }
     x    = fusion.x_host;
     gate = fusion.gate_host;
-    return expert;
+    return fusion.n_host_slots > 0 ? (uint32_t) (slot - fusion.n_expert_slots) : expert;
 }
 
 static __device__ __forceinline__ bool mmvq_expert_missed(const ggml_cuda_mm_fusion_args_device & fusion, const void * x_weights) {
@@ -666,17 +666,17 @@ static __device__ __forceinline__ void mmvq_copy_bytes(char * dst, const char * 
     }
 }
 
-// copies rows [row0, row0 + nrows) of an expert to a fill channel, without the rows past fill_nrows
+// copies rows [row0, row0 + nrows) of channel src_channel of the host weights (see mmvq_expert_channel) to a fill channel, without the rows past fill_nrows
 static __device__ __forceinline__ void mmvq_fill_rows(
         const ggml_cuda_mm_fusion_args_device & fusion, char * fill_base, const void * src_base, const size_t block_bytes,
-        const uint32_t expert, const uint32_t fill_channel, const uint32_t row0, const uint32_t nrows,
+        const uint32_t src_channel, const uint32_t fill_channel, const uint32_t row0, const uint32_t nrows,
         const uint32_t stride_row_x, const uint32_t stride_channel_x, const int tid, const int nthreads) {
     if (row0 >= fusion.fill_nrows) {
         return;
     }
     const uint32_t nrows_copy = min(nrows, fusion.fill_nrows - row0);
     const size_t offset_rows  = (size_t) row0*stride_row_x;
-    const size_t offset_src   = ((size_t) expert*stride_channel_x + offset_rows)*block_bytes;
+    const size_t offset_src   = ((size_t) src_channel*stride_channel_x + offset_rows)*block_bytes;
     const size_t offset_dst   = ((size_t) fill_channel*stride_channel_x + offset_rows)*block_bytes;
     mmvq_copy_bytes(fill_base + offset_dst, (const char *) src_base + offset_src, (size_t) nrows_copy*stride_row_x*block_bytes, tid, nthreads);
 }
@@ -889,10 +889,10 @@ static __global__ void mul_mat_vec_q(
         if (fill_channel >= 0) {
             constexpr size_t block_bytes = ggml_cuda_type_traits<type>::bs;
             constexpr int    nthreads    = nwarps*warp_size;
-            mmvq_fill_rows(fusion, fusion.fill_x, x_weights, block_bytes, channel_x, fill_channel, row0, rows_per_cuda_block,
+            mmvq_fill_rows(fusion, fusion.fill_x, x_weights, block_bytes, channel_w, fill_channel, row0, rows_per_cuda_block,
                 stride_row_x, stride_channel_x, tid, nthreads);
             if (use_gate) {
-                mmvq_fill_rows(fusion, fusion.fill_gate, vgate, block_bytes, channel_x, fill_channel, row0, rows_per_cuda_block,
+                mmvq_fill_rows(fusion, fusion.fill_gate, vgate, block_bytes, channel_w, fill_channel, row0, rows_per_cuda_block,
                     stride_row_x, stride_channel_x, tid, nthreads);
             }
             if constexpr (quant_prologue) {
@@ -1135,10 +1135,10 @@ static __global__ void mul_mat_vec_q_moe(
         const int32_t fill_channel = mmvq_fill_channel(fusion, channel_x, channel_dst, token_idx);
         if (fill_channel >= 0) {
             constexpr size_t block_bytes = ggml_cuda_type_traits<type>::bs;
-            mmvq_fill_rows(fusion, fusion.fill_x, x_weights, block_bytes, channel_x, fill_channel, row0, c_rows_per_block,
+            mmvq_fill_rows(fusion, fusion.fill_x, x_weights, block_bytes, channel_w, fill_channel, row0, c_rows_per_block,
                 stride_row_x, stride_channel_x, threadIdx.x, warp_size);
             if (use_gate) {
-                mmvq_fill_rows(fusion, fusion.fill_gate, vgate, block_bytes, channel_x, fill_channel, row0, c_rows_per_block,
+                mmvq_fill_rows(fusion, fusion.fill_gate, vgate, block_bytes, channel_w, fill_channel, row0, c_rows_per_block,
                     stride_row_x, stride_channel_x, threadIdx.x, warp_size);
             }
             __threadfence_block();
@@ -2370,9 +2370,10 @@ static void mmvq_moe_fill_diag(cudaStream_t stream, const ggml_tensor * src0, co
         int up_equal   = -1;
         int gate_equal = -1;
         if (device_fill && entry.token >= 0 && entry.table >= fusion.n_expert_slots && entry.fill >= 0) {
-            up_equal = mmvq_cache_row_equals_host((const char *) src0->data, (const char *) fusion.x_host, entry.fill, entry.expert, entry.row, src0);
+            const int host_channel = fusion.n_host_slots > 0 ? entry.table - fusion.n_expert_slots : entry.expert;
+            up_equal = mmvq_cache_row_equals_host((const char *) src0->data, (const char *) fusion.x_host, entry.fill, host_channel, entry.row, src0);
             if (fusion.gate_host != nullptr && fusion.fill_gate != nullptr) {
-                gate_equal = mmvq_cache_row_equals_host(fusion.fill_gate, (const char *) fusion.gate_host, entry.fill, entry.expert, entry.row, src0);
+                gate_equal = mmvq_cache_row_equals_host(fusion.fill_gate, (const char *) fusion.gate_host, entry.fill, host_channel, entry.row, src0);
             }
         }
         GGML_LOG_WARN("moe fill diag bytes: idx=%" PRId64 " up row equal=%d gate row equal=%d\n", entry.idx, up_equal, gate_equal);
@@ -2664,8 +2665,10 @@ void ggml_cuda_mul_mat_vec_q(
         fusion_local.x_host         = x_host;
         fusion_local.expert_slot    = (const int32_t *) x_node->src[3]->data;
         fusion_local.n_expert_slots = ggml_get_op_params_i32(x_node, GGML_MOE_CACHE_OP_N_SLOTS);
+        fusion_local.n_host_slots   = ggml_get_op_params_i32(x_node, GGML_MOE_CACHE_OP_HOST_SLOTS);
         if (fusion_local.gate) {
             GGML_ASSERT(gate_node && gate_node->src[3] == x_node->src[3] && ggml_get_op_params_i32(gate_node, GGML_MOE_CACHE_OP_N_SLOTS) == fusion_local.n_expert_slots);
+            GGML_ASSERT(ggml_get_op_params_i32(gate_node, GGML_MOE_CACHE_OP_HOST_SLOTS) == fusion_local.n_host_slots);
             fusion_local.gate_host = ggml_cuda_mmid_host_experts(gate_node);
             GGML_ASSERT(fusion_local.gate_host);
         }

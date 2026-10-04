@@ -1652,6 +1652,17 @@ std::string server_task_result_metrics::to_metrics() {
             { "moe_cache_layers",         "MoE expert cache: cached layers",                         (double) moe_cache.n_layers },
             { "moe_cache_slots_per_layer","MoE expert cache: slots per cached layer",                (double) moe_cache.n_slots  },
         });
+        if (moe_cache.n_host_slots > 0) {
+            add_items("counter", {
+                { "moe_cache_host_hits_total",         "MoE host tier: routed experts found in the host pool",      (double) moe_cache.n_host_hit          },
+                { "moe_cache_host_misses_total",       "MoE host tier: routed experts copied into the host pool",   (double) moe_cache.n_host_miss         },
+                { "moe_cache_host_read_bytes_total",   "MoE host tier: bytes copied into the host pool",            (double) moe_cache.host_bytes_read     },
+                { "moe_cache_host_read_seconds_total", "MoE host tier: time spent copying into the host pool",      moe_cache.host_read_us / 1.e6          },
+            });
+            add_items("gauge", {
+                { "moe_cache_host_slots_per_layer",    "MoE host tier: pool slots per cached layer",                (double) moe_cache.n_host_slots        },
+            });
+        }
     }
 
     // labeled counter: one time series per draft position

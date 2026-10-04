@@ -32,6 +32,12 @@
 // LLAMA_MOE_CACHE_DEVICE=1 moves the policy to the device: a kernel after the routing copy picks victims and
 // the matvec kernels fill them while computing; llama_moe_cache_step() only mirrors the device state.
 //
+// Host tier (llama_context_params.n_moe_host_slots, CLI: --moe-expert-host-slots): the experts need not sit in pinned
+// host memory. Per layer a pool of that many pinned host slots holds the experts that were routed lately, and the
+// rest stay in the model file's mapping. A CPU op in front of each decode ubatch's cache chain copies the routed
+// experts that are not in the pool from the mapping into it, and the device reads a VRAM miss from its pool slot.
+// Needs the device policy (LLAMA_MOE_CACHE_DEVICE=1).
+//
 // Enabled via llama_context_params.n_moe_cache_slots (CLI: --moe-expert-cache).
 
 #include <cstddef>
@@ -81,19 +87,38 @@ struct llama_moe_cache_layer {
     bool          device_policy = false;
     ggml_tensor * dev_state     = nullptr;
     ggml_tensor * fill_slot     = nullptr;
+
+    // host tier: > 0 when the cache chain reads a miss from a pool of this many pinned host slots; up_h, gate_h and
+    // down_h have ne[2] == n_host_slots + 1 (the last slot is padding), the experts stay in up_src, gate_src, down_src
+    int32_t       n_host_slots = 0;
+    ggml_tensor * up_h   = nullptr;
+    ggml_tensor * gate_h = nullptr;
+    ggml_tensor * down_h = nullptr;
 };
 
-// build the cache for every host-resident expert layer of the model.
+// build the cache for every host-resident expert layer of the model; n_host_slots > 0 asks for the host tier.
 // Safe to call more than once; only the first call does work.
-void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t max_inserts);
+void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t max_inserts, int32_t n_host_slots);
 
 // nullptr when the cache is disabled or this tensor has no cached layer
 const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * up_exps);
 
 // mul_mat_id over one of a reads_host_experts layer's cache tensors (up_c, gate_c or down_c) with the routed ids:
-// each id reads its slot, or the expert in place from host_src (the matching up_src, gate_src or down_src)
+// each id reads its slot, or the expert in place from host_src (the matching up_src, gate_src or down_src),
+// or from the matching host pool when the layer has the host tier
 ggml_tensor * llama_moe_cache_mul_mat_id(ggml_context * ctx, const llama_moe_cache_layer & layer,
         ggml_tensor * cache, const ggml_tensor * host_src, ggml_tensor * b, ggml_tensor * ids);
+
+// host tier: I32 [n_expert], for each routed id the host pool slot holding its expert. A CPU op that first copies
+// the routed experts missing from the pool in from the mapping; the cache chain's routing copy takes it as src[4]
+ggml_tensor * llama_moe_cache_host_map(ggml_context * ctx, const llama_moe_cache_layer & layer, ggml_tensor * ids);
+
+// true when the host tier is on for the cached layers
+bool llama_moe_cache_host_tier();
+
+// ggml_backend_sched_expert_host_fn over the host pools: lets the scheduler's prefill upload of a host-resident
+// up/gate/down weight copy the pool-resident experts from the pool. Does not admit or score anything.
+bool llama_moe_cache_expert_host(const ggml_tensor * weight, const uint32_t * used_ids, const ggml_tensor ** pool, const int32_t ** host_slot, int32_t * n_slots, void * user_data);
 
 // ggml_backend_sched_expert_rows_fn over the cache: lets the scheduler's prefill upload of a
 // host-resident up/gate/down weight fill the resident experts from their slots instead of over the

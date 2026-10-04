@@ -8,6 +8,7 @@
 // state words: [0] K, [1] E, [2] decay (float), [3] clock, [4] n_hit, [5] n_miss, [6] n_fill, [7] n_evict,
 // then slot_expert[K], fill_slot[E], score[E] (float), last[E]
 // score[e] is a hit count that halves every 1/decay steps, last[e] is the step it was updated at
+// table[e]: [0, K) VRAM slot, K without a slot; with a host tier (host_map != nullptr) a routed expert without a VRAM slot gets K + its host pool slot
 
 // the score of expert e decayed to step now
 static __device__ __forceinline__ float moe_cache_crf(
@@ -33,7 +34,7 @@ static __device__ __forceinline__ int moe_cache_rank(
 }
 
 static __global__ void __launch_bounds__(MOE_CACHE_BLOCK_SIZE) moe_cache_assign(
-        const int32_t * ids, const int n_ids, int32_t * state, int32_t * table) {
+        const int32_t * ids, const int n_ids, int32_t * state, int32_t * table, const int32_t * host_map) {
     constexpr int slots_per_thread = MOE_CACHE_MAX_SLOTS/MOE_CACHE_BLOCK_SIZE;
 
     const int   n_slots   = state[0];
@@ -179,6 +180,13 @@ static __global__ void __launch_bounds__(MOE_CACHE_BLOCK_SIZE) moe_cache_assign(
         __syncthreads();
     }
 
+    if (host_map != nullptr && tid < n_ids) {
+        const int e = routed_id[tid];
+        if (e >= 0 && e < n_experts && table[e] >= n_slots) {
+            table[e] = n_slots + host_map[e];
+        }
+    }
+
     for (int s = tid; s < n_slots; s += MOE_CACHE_BLOCK_SIZE) {
         g_slot_expert[s] = slot_expert[s];
     }
@@ -193,13 +201,17 @@ static __global__ void __launch_bounds__(MOE_CACHE_BLOCK_SIZE) moe_cache_assign(
 void ggml_cuda_moe_cache_assign(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * state = dst->src[2];
     const ggml_tensor * table = dst->src[3];
+    const ggml_tensor * host_map = dst->src[4];
 
     GGML_ASSERT(dst->type == GGML_TYPE_I32 && state->type == GGML_TYPE_I32 && table->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(state) && ggml_is_contiguous(table));
+    GGML_ASSERT(host_map == nullptr || (host_map->type == GGML_TYPE_I32 && ggml_is_contiguous(host_map) &&
+                ggml_nelements(host_map) == ggml_nelements(table)));
     GGML_ASSERT(ggml_nelements(dst) <= MOE_CACHE_MAX_IDS);
     GGML_ASSERT(ggml_nelements(table) <= MOE_CACHE_MAX_SLOTS);
     GGML_ASSERT(ggml_nelements(state) >= MOE_CACHE_HEADER);
 
     moe_cache_assign<<<1, MOE_CACHE_BLOCK_SIZE, 0, ctx.stream()>>>(
-        (const int32_t *) dst->data, (int) ggml_nelements(dst), (int32_t *) state->data, (int32_t *) table->data);
+        (const int32_t *) dst->data, (int) ggml_nelements(dst), (int32_t *) state->data, (int32_t *) table->data,
+        host_map ? (const int32_t *) host_map->data : nullptr);
 }

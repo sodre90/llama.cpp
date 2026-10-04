@@ -400,6 +400,15 @@ extern "C" {
         const int32_t * ids, int64_t ne0, int64_t ne1, size_t s0, size_t s1, ggml_backend_t backend, void * user_data);
     GGML_API void                 ggml_backend_sched_set_expert_staged_callback(ggml_backend_sched_t sched, ggml_backend_sched_expert_staged_fn fn, void * user_data);
 
+    // A pinned host copy of some experts of a host-resident MUL_MAT_ID weight (a host tier kept for decode):
+    // pool->data + slot*nb[2] holds expert id when 0 <= host_slot[id] < n_slots. `used_ids` is the bitset of the
+    // experts the ubatch routes to (32 ids per word). When set, the used-experts upload copies those experts from
+    // the pool and the others from the weight. Return false when the weight has no pool. host_slot must stay valid
+    // and unchanged for the whole graph compute.
+    typedef bool (*ggml_backend_sched_expert_host_fn)(const struct ggml_tensor * weight, const uint32_t * used_ids,
+        const struct ggml_tensor ** pool, const int32_t ** host_slot, int32_t * n_slots, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_expert_host_callback(ggml_backend_sched_t sched, ggml_backend_sched_expert_host_fn fn, void * user_data);
+
     //
     // Meta backend
     //

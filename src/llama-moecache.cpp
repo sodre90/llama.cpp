@@ -7,19 +7,27 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <iterator>
 #include <map>
 #include <mutex>
+#include <numeric>
 #include <random>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 #include <unistd.h>
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
 
 namespace {
 
@@ -67,6 +75,20 @@ struct layer_state {
 
     uint64_t last_log_hits   = 0;
     uint64_t last_log_misses = 0;
+
+    // host tier (pub.n_host_slots > 0), changed only by host_map_op: which pool slot holds which expert, and the
+    // decayed use count (same policy as the device cache) that picks the slot to reuse
+    std::vector<int32_t>  host_slot;        // expert id -> pool slot, -1 when absent
+    std::vector<int32_t>  host_slot_expert; // pool slot -> expert id, -1 when empty
+    std::vector<float>    host_score;       // expert id -> use count as of host_last
+    std::vector<uint32_t> host_last;        // expert id -> host_clock when it was last routed
+    std::vector<uint8_t>  host_routed;      // expert id -> routed by the running ubatch
+    uint32_t              host_clock = 0;
+
+    uint64_t n_host_hit      = 0; // routed experts already in the pool
+    uint64_t n_host_miss     = 0; // routed experts copied into the pool
+    uint64_t host_bytes_read = 0; // bytes copied into the pool
+    uint64_t host_read_us    = 0; // time spent copying
 };
 
 struct upload_job {
@@ -91,7 +113,7 @@ struct moe_cache {
     uint64_t last_log_hits   = 0;
     uint64_t last_log_misses = 0;
 
-    std::mutex mtx; // guards pending lists + clock (observe runs during graph exec)
+    std::mutex mtx; // guards pending lists + clock (observe runs during graph exec) and the host tier counters
 
     std::vector<layer_state> layers;
     std::map<const ggml_tensor *, size_t> by_up_src;
@@ -105,6 +127,15 @@ struct moe_cache {
 
     std::vector<ggml_context *>         ctxs;
     std::vector<ggml_backend_buffer_t>  bufs;
+
+    // host tier: slots per layer (0 = off) and the pools, one buffer per layer
+    int32_t                             host_slots = 0;
+    std::vector<ggml_context *>         host_ctxs;
+    std::vector<ggml_backend_buffer_t>  host_bufs;
+    uint64_t last_log_host_hits   = 0;
+    uint64_t last_log_host_misses = 0;
+    uint64_t last_log_host_bytes  = 0;
+    uint64_t last_log_host_us     = 0;
 
     // every layer's host table is a row of host_tables; each device group's tables are views of one
     // block whose rows are a contiguous run of host_tables, so a step publishes them in one copy each
@@ -562,6 +593,167 @@ void plan_warm_fill(moe_cache & mc, layer_state & ls, const int32_t * ids, int64
     }
 }
 
+// the pages of the range are read in the background, so that the copy that follows finds them
+void advise_will_need(const void * data, size_t nbytes) {
+#ifndef _WIN32
+    static const uintptr_t page_size = (uintptr_t) sysconf(_SC_PAGESIZE);
+    const uintptr_t begin = (uintptr_t) data & ~(page_size - 1);
+    const uintptr_t end   = ((uintptr_t) data + nbytes + page_size - 1) & ~(page_size - 1);
+    posix_madvise((void *) begin, end - begin, POSIX_MADV_WILLNEED);
+#else
+    GGML_UNUSED(data);
+    GGML_UNUSED(nbytes);
+#endif
+}
+
+struct host_matrix {
+    const ggml_tensor * src;
+    const ggml_tensor * pool;
+};
+
+std::array<host_matrix, 3> host_matrices_of(const llama_moe_cache_layer & pub) {
+    return {{{pub.up_src, pub.up_h}, {pub.gate_src, pub.gate_h}, {pub.down_src, pub.down_h}}};
+}
+
+// the pool that holds the experts of one of the layer's host weights (up_src, gate_src or down_src)
+const ggml_tensor * host_pool_of(const llama_moe_cache_layer & pub, const ggml_tensor * src) {
+    GGML_ASSERT(src == pub.up_src || src == pub.gate_src || src == pub.down_src);
+    return src == pub.up_src ? pub.up_h : src == pub.gate_src ? pub.gate_h : pub.down_h;
+}
+
+float host_score_at(const moe_cache & mc, const layer_state & ls, uint32_t now, int32_t expert) {
+    return ls.host_score[expert] * exp2f(-mc.decay * (float) (now - ls.host_last[expert]));
+}
+
+struct host_copy {
+    int32_t expert;
+    int32_t slot;
+};
+
+// the pool slots for the routed experts that are missing: empty slots first, then the lowest decayed score,
+// never a slot whose expert the running ubatch routes to
+std::vector<host_copy> assign_host_slots(const moe_cache & mc, layer_state & ls, const std::vector<int32_t> & missed, uint32_t now) {
+    struct candidate {
+        int     is_filled;
+        float   score;
+        int32_t slot;
+    };
+    std::vector<candidate> candidates;
+    for (int32_t slot = 0; slot < ls.pub.n_host_slots; ++slot) {
+        const int32_t expert = ls.host_slot_expert[slot];
+        if (expert < 0) {
+            candidates.push_back({0, 0.0f, slot});
+        } else if (!ls.host_routed[expert]) {
+            candidates.push_back({1, host_score_at(mc, ls, now, expert), slot});
+        }
+    }
+    GGML_ASSERT(candidates.size() >= missed.size());
+    std::partial_sort(candidates.begin(), candidates.begin() + missed.size(), candidates.end(), [](const candidate & a, const candidate & b) {
+        return std::tie(a.is_filled, a.score, a.slot) < std::tie(b.is_filled, b.score, b.slot);
+    });
+
+    std::vector<host_copy> copies;
+    for (size_t i = 0; i < missed.size(); ++i) {
+        const int32_t slot = candidates[i].slot;
+        if (const int32_t evicted = ls.host_slot_expert[slot]; evicted >= 0) {
+            ls.host_slot[evicted] = -1;
+        }
+        ls.host_slot[missed[i]]   = slot;
+        ls.host_slot_expert[slot] = missed[i];
+        copies.push_back({missed[i], slot});
+    }
+    return copies;
+}
+
+void copy_into_host_pool(const layer_state & ls, const std::vector<host_copy> & copies) {
+    const auto matrices = host_matrices_of(ls.pub);
+    for (const host_copy & c : copies) {
+        for (const host_matrix & m : matrices) {
+            advise_will_need((const char *) m.src->data + (size_t) c.expert*m.src->nb[2], m.src->nb[2]);
+        }
+    }
+    for (const host_copy & c : copies) {
+        for (const host_matrix & m : matrices) {
+            memcpy((char *) m.pool->data + (size_t) c.slot*m.pool->nb[2], (const char *) m.src->data + (size_t) c.expert*m.src->nb[2], m.src->nb[2]);
+        }
+    }
+}
+
+size_t host_expert_bytes(const llama_moe_cache_layer & pub) {
+    return pub.up_src->nb[2] + pub.gate_src->nb[2] + pub.down_src->nb[2];
+}
+
+// GGML_OP_CUSTOM on the CPU, once per layer per decode ubatch: after it every expert dst->src[0] routes to is in
+// the pool. dst is I32 [n_expert]: the pool slot of each expert (-1 when absent)
+void host_map_op(ggml_tensor * dst, int ith, int /*nth*/, void * userdata) {
+    if (ith != 0) {
+        return;
+    }
+    moe_cache & mc   = *g_cache;
+    layer_state & ls = *(layer_state *) userdata;
+    const ggml_tensor * ids = dst->src[0];
+    const int32_t n_expert  = (int32_t) ls.host_slot.size();
+    const uint32_t now      = ++ls.host_clock;
+
+    std::vector<int32_t> routed;
+    for (int64_t i1 = 0; i1 < ids->ne[1]; ++i1) {
+        for (int64_t i0 = 0; i0 < ids->ne[0]; ++i0) {
+            const int32_t id = *(const int32_t *) ((const char *) ids->data + i1*ids->nb[1] + i0*ids->nb[0]);
+            if (id >= 0 && id < n_expert && !ls.host_routed[id]) {
+                ls.host_routed[id] = 1;
+                routed.push_back(id);
+            }
+        }
+    }
+    for (const int32_t e : routed) {
+        ls.host_score[e] = host_score_at(mc, ls, now, e) + 1.0f;
+        ls.host_last[e]  = now;
+    }
+
+    std::vector<int32_t> missed;
+    std::copy_if(routed.begin(), routed.end(), std::back_inserter(missed), [&ls](int32_t e) { return ls.host_slot[e] < 0; });
+
+    const int64_t t_start = ggml_time_us();
+    copy_into_host_pool(ls, assign_host_slots(mc, ls, missed, now));
+    const int64_t t_us = ggml_time_us() - t_start;
+
+    std::for_each(routed.begin(), routed.end(), [&ls](int32_t e) { ls.host_routed[e] = 0; });
+    memcpy(dst->data, ls.host_slot.data(), n_expert*sizeof(int32_t));
+
+    std::lock_guard<std::mutex> lock(mc.mtx);
+    ls.n_host_hit      += routed.size() - missed.size();
+    ls.n_host_miss     += missed.size();
+    ls.host_bytes_read += missed.size()*host_expert_bytes(ls.pub);
+    ls.host_read_us    += t_us;
+}
+
+// the host tier numbers since the previous log line
+void log_host_tier_window(moe_cache & mc) {
+    uint64_t hits   = 0;
+    uint64_t misses = 0;
+    uint64_t bytes  = 0;
+    uint64_t us     = 0;
+    for (const auto & ls : mc.layers) {
+        hits   += ls.n_host_hit;
+        misses += ls.n_host_miss;
+        bytes  += ls.host_bytes_read;
+        us     += ls.host_read_us;
+    }
+    const uint64_t win_hits   = hits   - mc.last_log_host_hits;
+    const uint64_t win_misses = misses - mc.last_log_host_misses;
+    const uint64_t win_bytes  = bytes  - mc.last_log_host_bytes;
+    const uint64_t win_us     = us     - mc.last_log_host_us;
+    mc.last_log_host_hits   = hits;
+    mc.last_log_host_misses = misses;
+    mc.last_log_host_bytes  = bytes;
+    mc.last_log_host_us     = us;
+
+    LLAMA_LOG_WARN("moe-cache: host tier slots=%d win_hit=%.1f%% (%" PRIu64 "/%" PRIu64 ") total_hit=%.1f%% (%" PRIu64 "/%" PRIu64 ") win_copied=%.1f MiB in %.1f ms total_copied=%.2f GiB in %.1f s\n",
+            mc.host_slots, win_hits + win_misses > 0 ? 100.0 * win_hits / (win_hits + win_misses) : 0.0, win_hits, win_hits + win_misses,
+            hits + misses > 0 ? 100.0 * hits / (hits + misses) : 0.0, hits, hits + misses,
+            win_bytes/1024.0/1024.0, win_us/1000.0, bytes/1024.0/1024.0/1024.0, us/1e6);
+}
+
 struct layer_window_rate {
     int    il;
     double hit_pct;
@@ -602,6 +794,9 @@ void log_window_stats(moe_cache & mc) {
 
     LLAMA_LOG_WARN("moe-cache: steps=%" PRIu64 " win_hit=%.1f%% (%" PRIu64 "/%" PRIu64 ") total_hit=%.1f%% (%" PRIu64 "/%" PRIu64 ") ins=%" PRIu64 " warm=%" PRIu64 " evict=%" PRIu64 " prot=%d%%\n",
             mc.n_steps, win_rate, dh, dh + dm, total_rate, h, h + m, ins, wm, ev, mc.protected_pct);
+    if (mc.host_slots > 0) {
+        log_host_tier_window(mc);
+    }
 
     if (rates.empty()) {
         return;
@@ -640,7 +835,8 @@ bool backend_has_feature(ggml_backend_reg_t reg, const char * name) {
 }
 
 // the device can read the uncached experts in place when its backend supports that and every expert tensor sits
-// in that device's pinned host buffer (load-mode none or mlock, not mmap); LLAMA_MOE_CACHE_HOST_READS=0 opts out
+// in that device's pinned host buffer (load-mode none or mlock, not mmap) or the layer has a host pool, which does;
+// LLAMA_MOE_CACHE_HOST_READS=0 opts out
 bool can_read_host_experts(const moe_cache & mc, std::string & why_not) {
     if (const char * env = getenv("LLAMA_MOE_CACHE_HOST_READS"); env && atoi(env) == 0) {
         why_not = "LLAMA_MOE_CACHE_HOST_READS=0";
@@ -658,6 +854,9 @@ bool can_read_host_experts(const moe_cache & mc, std::string & why_not) {
             why_not = "the cache spans devices";
             return false;
         }
+        if (ls.pub.n_host_slots > 0) {
+            continue;
+        }
         for (const ggml_tensor * src : {ls.pub.up_src, ls.pub.gate_src, ls.pub.down_src}) {
             if (ggml_backend_buffer_get_type(src->buffer) != host_buft) {
                 why_not = std::string(src->name) + " is in " + ggml_backend_buffer_name(src->buffer) + ", not pinned host memory";
@@ -666,6 +865,140 @@ bool can_read_host_experts(const moe_cache & mc, std::string & why_not) {
         }
     }
     return true;
+}
+
+// why the host tier cannot be set up, or "" when every layer can have it
+std::string host_tier_blocker(const moe_cache & mc, const llama_model & model, int32_t n_host_slots, ggml_backend_buffer_type_t host_buft) {
+    if (const char * env = getenv("LLAMA_MOE_CACHE_DEVICE"); !env || atoi(env) == 0) {
+        return "the host tier needs LLAMA_MOE_CACHE_DEVICE=1";
+    }
+    if (host_buft == nullptr) {
+        return "the cache device has no pinned host buffer type";
+    }
+    for (const auto & ls : mc.layers) {
+        for (const ggml_tensor * src : {ls.pub.up_src, ls.pub.gate_src, ls.pub.down_src}) {
+            if (!src->buffer || !ggml_backend_buffer_is_host(src->buffer)) {
+                return std::string(src->name) + " is not in host memory";
+            }
+            if (ggml_backend_buffer_get_type(src->buffer) == host_buft) {
+                return "experts already in pinned host memory";
+            }
+            if (!ggml_is_contiguous(src)) {
+                return std::string(src->name) + " is not contiguous";
+            }
+        }
+    }
+    const int64_t n_ids = model.hparams.n_expert_used_max()*LLAMA_MOE_CACHE_MAX_TOKENS;
+    const int64_t slots = std::min<int64_t>(n_host_slots, mc.layers.front().pub.up_src->ne[2]);
+    if (slots < n_ids) {
+        return format("%" PRId64 " host slots cannot hold the %" PRId64 " expert ids of one step", slots, n_ids);
+    }
+    return "";
+}
+
+bool alloc_host_pools(moe_cache & mc, ggml_backend_buffer_type_t host_buft) {
+    for (auto & ls : mc.layers) {
+        ggml_init_params ip = {
+            /*.mem_size  =*/ ggml_tensor_overhead()*3,
+            /*.mem_buffer=*/ nullptr,
+            /*.no_alloc  =*/ true,
+        };
+        ggml_context * ctx = ggml_init(ip);
+        if (!ctx) {
+            return false;
+        }
+        mc.host_ctxs.push_back(ctx);
+
+        const auto new_pool = [&](const ggml_tensor * src, const char * name) {
+            ggml_tensor * pool = ggml_new_tensor_3d(ctx, src->type, src->ne[0], src->ne[1], ls.pub.n_host_slots + 1);
+            ggml_format_name(pool, "moe_host_%s.%d", name, ls.pub.il);
+            return pool;
+        };
+        ls.pub.up_h   = new_pool(ls.pub.up_src,   "up");
+        ls.pub.gate_h = new_pool(ls.pub.gate_src, "gate");
+        ls.pub.down_h = new_pool(ls.pub.down_src, "down");
+
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, host_buft);
+        if (!buf) {
+            return false;
+        }
+        ggml_backend_buffer_clear(buf, 0);
+        mc.host_bufs.push_back(buf);
+    }
+    return true;
+}
+
+// the tier is off again: the pools are freed and the layers stop reading the experts in place
+void drop_host_tier(moe_cache & mc) {
+    for (auto * buf : mc.host_bufs) { ggml_backend_buffer_free(buf); }
+    for (auto * ctx : mc.host_ctxs) { ggml_free(ctx); }
+    mc.host_bufs.clear();
+    mc.host_ctxs.clear();
+    mc.host_slots = 0;
+    for (auto & ls : mc.layers) {
+        ls.pub.n_host_slots = 0;
+        ls.pub.up_h   = nullptr;
+        ls.pub.gate_h = nullptr;
+        ls.pub.down_h = nullptr;
+        ls.pub.reads_host_experts = false;
+        ls.pub.routing            = nullptr;
+    }
+    mc.routing = nullptr;
+}
+
+// "" when the tier is on: every layer has n_host_slots and its pools; else why it is off
+std::string setup_host_tier(moe_cache & mc, const llama_model & model, int32_t n_host_slots) {
+    const ggml_backend_buffer_type_t cache_buft = ggml_backend_buffer_get_type(mc.layers.front().pub.up_c->buffer);
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(cache_buft);
+    const ggml_backend_buffer_type_t host_buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+
+    if (std::string blocker = host_tier_blocker(mc, model, n_host_slots, host_buft); !blocker.empty()) {
+        return blocker;
+    }
+
+    mc.host_slots = (int32_t) std::min<int64_t>(n_host_slots, mc.layers.front().pub.up_src->ne[2]);
+    for (auto & ls : mc.layers) {
+        ls.pub.n_host_slots = mc.host_slots;
+    }
+    std::string why_not;
+    if (!can_read_host_experts(mc, why_not)) {
+        drop_host_tier(mc);
+        return why_not;
+    }
+    if (!alloc_host_pools(mc, host_buft)) {
+        drop_host_tier(mc);
+        return "no pinned host memory for the pools";
+    }
+    return "";
+}
+
+// slot h holds expert h; the experts 0..H-1 are one contiguous range of each tensor
+void populate_host_tier(moe_cache & mc) {
+    const int64_t t_start = ggml_time_us();
+    size_t pinned_bytes = 0;
+    for (auto & ls : mc.layers) {
+        const int64_t n_expert = ls.pub.up_src->ne[2];
+        ls.host_slot.assign(n_expert, -1);
+        std::iota(ls.host_slot.begin(), ls.host_slot.begin() + ls.pub.n_host_slots, 0);
+        ls.host_slot_expert.resize(ls.pub.n_host_slots);
+        std::iota(ls.host_slot_expert.begin(), ls.host_slot_expert.end(), 0);
+        ls.host_score.assign(n_expert, 0.0f);
+        ls.host_last.assign(n_expert, 0);
+        ls.host_routed.assign(n_expert, 0);
+
+        const auto matrices = host_matrices_of(ls.pub);
+        for (const host_matrix & m : matrices) {
+            advise_will_need(m.src->data, (size_t) ls.pub.n_host_slots*m.src->nb[2]);
+        }
+        for (const host_matrix & m : matrices) {
+            memcpy(m.pool->data, m.src->data, (size_t) ls.pub.n_host_slots*m.src->nb[2]);
+            pinned_bytes += ggml_nbytes(m.pool);
+        }
+    }
+    LLAMA_LOG_INFO("moe-cache: host tier: %d of %" PRId64 " experts per layer are pinned, the others are read from the model file on demand\n",
+            mc.host_slots, mc.layers.front().pub.up_src->ne[2]);
+    LLAMA_LOG_WARN("moe-cache: host tier on: %zu layers, %d slots per layer, %.1f GiB pinned, populated in %.1f s\n",
+            mc.layers.size(), mc.host_slots, pinned_bytes/1024.0/1024.0/1024.0, (ggml_time_us() - t_start)/1e6);
 }
 
 bool alloc_routing(moe_cache & mc, int64_t n_expert_used) {
@@ -831,14 +1164,16 @@ void audit_tables(moe_cache & mc) {
                 table_error("slot_expert without matching table entry", s, e);
             }
         }
+        const int32_t max_table = K + std::max(ls.pub.n_host_slots - 1, 0);
         for (int64_t e = 0; e < n_expert; ++e) {
-            if (table[e] < 0 || table[e] > K) {
+            if (table[e] < 0 || table[e] > max_table) {
                 table_error("table entry out of range", -1, e);
             } else if (table[e] < K && slot_expert[table[e]] != e) {
                 table_error("table entry without matching slot_expert", table[e], e);
             }
             const int32_t s = fill_slot[e];
-            if (s >= 0 && (s >= K || table[e] != K || slot_expert[s] != -1)) {
+            const bool has_slot = ls.pub.n_host_slots > 0 ? table[e] < K : table[e] != K;
+            if (s >= 0 && (s >= K || has_slot || slot_expert[s] != -1)) {
                 table_error("fill_slot on a cached expert or a used slot", s, e);
             }
         }
@@ -853,7 +1188,7 @@ int64_t count_stale_host_entries(moe_cache & mc) {
         ggml_backend_tensor_get(ls.pub.dev_table, table.data(), 0, table.size()*sizeof(int32_t));
         const int32_t * host = (const int32_t *) ls.pub.host_table->data;
         for (size_t e = 0; e < table.size(); ++e) {
-            n_stale += host[e] != table[e];
+            n_stale += host[e] != std::min(table[e], ls.pub.n_slots);
         }
     }
     return n_stale;
@@ -925,13 +1260,20 @@ void audit_slot_bytes(moe_cache & mc) {
 
 } // namespace
 
-void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t max_inserts) {
+void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t max_inserts, int32_t n_host_slots) {
     std::lock_guard<std::mutex> init_lock(g_init_mtx);
     if (g_init_done) {
         return;
     }
     [&]() {
+        const auto warn_host_tier_off = [&](const std::string & why) {
+            if (n_host_slots > 0 && !why.empty()) {
+                LLAMA_LOG_WARN("%s: %s, host tier off\n", __func__, why.c_str());
+            }
+        };
+
         if (n_slots <= 0) {
+            warn_host_tier_off("the MoE expert cache is off");
             g_init_done = true;
             return;
         }
@@ -982,6 +1324,7 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
 
         if (groups.empty()) {
             LLAMA_LOG_INFO("%s: LLAMA_MOE_CACHE_SLOTS=%d but no host-resident expert layers found - disabled\n", __func__, n_slots);
+            warn_host_tier_off("no host-resident expert layers");
             delete mc;
             return;
         }
@@ -1075,6 +1418,7 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
         }
 
         if (!ok) {
+            warn_host_tier_off("the MoE expert cache is off");
             for (auto * b : mc->bufs) { ggml_backend_buffer_free(b); }
             for (auto * c : mc->ctxs) { ggml_free(c); }
             delete mc;
@@ -1119,13 +1463,18 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
                     ls.pub.il, ls.pub.up_src->name, ls.pub.up_src->nb[2]);
         }
 
+        std::string host_tier_off;
+        if (n_host_slots > 0) {
+            host_tier_off = setup_host_tier(*mc, model, n_host_slots);
+        }
+
         std::string host_reads = "off: ";
         if (std::string why_not; !can_read_host_experts(*mc, why_not)) {
             host_reads += why_not;
         } else if (!alloc_routing(*mc, model.hparams.n_expert_used_max())) {
             host_reads += "no device memory for the routing readback";
         } else {
-            host_reads = "on, uncached experts are read in place from pinned host memory";
+            host_reads = mc->host_slots > 0 ? "on, uncached experts are read in place from the host pools" : "on, uncached experts are read in place from pinned host memory";
         }
 
         std::string policy = "host";
@@ -1142,6 +1491,16 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
                     mc->audit = std::max(0, atoi(audit_env));
                 }
             }
+        }
+
+        if (mc->host_slots > 0 && !mc->device_policy) {
+            drop_host_tier(*mc);
+            host_tier_off = "no device memory for the routing readback or the device policy state";
+            host_reads    = "off: " + host_tier_off;
+        }
+        warn_host_tier_off(host_tier_off);
+        if (mc->host_slots > 0) {
+            populate_host_tier(*mc);
         }
 
         for (ggml_backend_buffer_t buf : mc->bufs) {
@@ -1227,11 +1586,16 @@ bool llama_moe_cache_get_stats(llama_moe_cache_stats * out) {
     *out = {};
     out->n_layers = (int32_t) mc->layers.size();
     out->n_slots  = mc->n_slots;
+    out->n_host_slots = mc->host_slots;
     for (const auto & ls : mc->layers) {
         out->n_hit    += ls.n_hit;
         out->n_miss   += ls.n_miss;
         out->n_insert += ls.n_insert;
         out->n_evict  += ls.n_evict;
+        out->n_host_hit      += ls.n_host_hit;
+        out->n_host_miss     += ls.n_host_miss;
+        out->host_bytes_read += ls.host_bytes_read;
+        out->host_read_us    += ls.host_read_us;
     }
 
     return true;
@@ -1258,9 +1622,45 @@ ggml_tensor * llama_moe_cache_mul_mat_id(ggml_context * ctx, const llama_moe_cac
         cur->src[4]   = layer.fill_slot;
     }
     static_assert(GGML_MOE_CACHE_OP_HOST_EXPERTS*sizeof(int32_t) + sizeof(void *) <= GGML_MAX_OP_PARAMS, "MoE cache op_params overflow");
-    cur->op_params[GGML_MOE_CACHE_OP_N_SLOTS] = layer.n_slots;
-    memcpy(&cur->op_params[GGML_MOE_CACHE_OP_HOST_EXPERTS], &host_src->data, sizeof(host_src->data));
+    static_assert(GGML_MOE_CACHE_OP_HOST_SLOTS*sizeof(int32_t) + sizeof(int32_t) <= GGML_MAX_OP_PARAMS, "MoE cache op_params overflow");
+    static_assert(GGML_MOE_CACHE_OP_HOST_EXPERTS + 2 <= GGML_MOE_CACHE_OP_HOST_SLOTS, "MoE cache op_params overlap");
+    const ggml_tensor * host_experts = layer.n_host_slots > 0 ? host_pool_of(layer, host_src) : host_src;
+    cur->op_params[GGML_MOE_CACHE_OP_N_SLOTS]    = layer.n_slots;
+    cur->op_params[GGML_MOE_CACHE_OP_HOST_SLOTS] = layer.n_host_slots;
+    memcpy(&cur->op_params[GGML_MOE_CACHE_OP_HOST_EXPERTS], &host_experts->data, sizeof(host_experts->data));
     return cur;
+}
+
+ggml_tensor * llama_moe_cache_host_map(ggml_context * ctx, const llama_moe_cache_layer & layer, ggml_tensor * ids) {
+    GGML_ASSERT(g_cache && layer.n_host_slots > 0);
+    layer_state & ls = g_cache->layers[g_cache->by_up_src.at(layer.up_src)];
+    return ggml_custom_4d(ctx, GGML_TYPE_I32, (int64_t) ls.host_slot.size(), 1, 1, 1, &ids, 1, host_map_op, 1, &ls);
+}
+
+bool llama_moe_cache_host_tier() {
+    return g_cache && g_cache->host_slots > 0;
+}
+
+bool llama_moe_cache_expert_host(const ggml_tensor * weight, const uint32_t * used_ids, const ggml_tensor ** pool, const int32_t ** host_slot, int32_t * n_slots, void * /*user_data*/) {
+    moe_cache * mc = g_cache;
+    if (!mc || mc->host_slots <= 0) {
+        return false;
+    }
+    auto it = mc->by_src.find(weight);
+    if (it == mc->by_src.end()) {
+        return false;
+    }
+    const layer_state & ls = mc->layers[it->second.layer_idx];
+    *pool      = host_pool_of(ls.pub, weight);
+    *host_slot = ls.host_slot.data();
+    *n_slots   = ls.pub.n_host_slots;
+
+    for (int64_t id = 0; id < weight->ne[2]; ++id) {
+        if ((used_ids[id >> 5] >> (id & 31) & 1) && ls.host_slot[id] < 0) {
+            advise_will_need((const char *) weight->data + (size_t) id*weight->nb[2], weight->nb[2]);
+        }
+    }
+    return *pool != nullptr;
 }
 
 bool llama_moe_cache_expert_rows(const ggml_tensor * weight, const ggml_tensor ** rows, const int32_t ** expert_slot, int32_t * n_slots, void * /*user_data*/) {

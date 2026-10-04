@@ -177,6 +177,19 @@ static void report_device_budget(const llama_context & lctx, const char * label)
     }
 }
 
+// the prefetch copies a whole expert tensor from the model file, which the host tier avoids
+static int prefetch_slots_with_host_tier(int slots) {
+    if (slots <= 0 || !llama_moe_cache_host_tier()) {
+        return slots;
+    }
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        LLAMA_LOG_WARN("moe-cache: the host tier turns the expert prefetch off\n");
+    }
+    return 0;
+}
+
 struct llm_fused_op_probe {
     llm_fused_op op;
     const char * name;
@@ -238,7 +251,7 @@ llama_context::llama_context(
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
 
-    llama_moe_cache_init(model, params.n_moe_cache_slots, params.n_moe_cache_inserts);
+    llama_moe_cache_init(model, params.n_moe_cache_slots, params.n_moe_cache_inserts, params.n_moe_host_slots);
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
@@ -790,9 +803,10 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
-    ggml_backend_sched_set_prefetch_experts_slots(sched.get(), cparams.prefetch_experts_slots);
+    ggml_backend_sched_set_prefetch_experts_slots(sched.get(), prefetch_slots_with_host_tier(cparams.prefetch_experts_slots));
     ggml_backend_sched_set_expert_rows_callback(sched.get(), llama_moe_cache_expert_rows, nullptr);
     ggml_backend_sched_set_expert_staged_callback(sched.get(), llama_moe_cache_warm_from_staging, nullptr);
+    ggml_backend_sched_set_expert_host_callback(sched.get(), llama_moe_cache_expert_host, nullptr);
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -833,9 +847,10 @@ void llama_context::sched_reserve() {
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
-                ggml_backend_sched_set_prefetch_experts_slots(sched.get(), cparams.prefetch_experts_slots);
+                ggml_backend_sched_set_prefetch_experts_slots(sched.get(), prefetch_slots_with_host_tier(cparams.prefetch_experts_slots));
                 ggml_backend_sched_set_expert_rows_callback(sched.get(), llama_moe_cache_expert_rows, nullptr);
                 ggml_backend_sched_set_expert_staged_callback(sched.get(), llama_moe_cache_warm_from_staging, nullptr);
+                ggml_backend_sched_set_expert_host_callback(sched.get(), llama_moe_cache_expert_host, nullptr);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -2932,6 +2947,44 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         }
     }
 
+    // experts the model keeps in a pinned host pool are copied from there, the rest from the weight
+    const ggml_tensor * host_pool    = NULL;
+    const int32_t     * host_slot    = NULL;
+    int32_t             n_host_slots = 0;
+    std::vector<uint32_t> used_bitset((n_expert + 31) / 32, 0);
+    for (int64_t id = 0; id < n_expert; ++id) {
+        if (st.used[id]) {
+            used_bitset[id >> 5] |= (1u << (id & 31));
+        }
+    }
+    const bool pool_rows = llama_moe_cache_expert_host(src, used_bitset.data(), &host_pool, &host_slot, &n_host_slots, nullptr) &&
+        host_pool && host_pool->data && host_slot && n_host_slots > 0 &&
+        host_pool->type == src->type && host_pool->ne[0] == src->ne[0] && host_pool->ne[1] == src->ne[1] &&
+        host_pool->nb[1] == src->nb[1] && host_pool->nb[2] == expert_size && host_pool->ne[2] > n_host_slots;
+
+    if (pool_rows) {
+        static const uint8_t zero_padding[512] = {0};
+        for (int32_t id = 0; id < n_expert; ++id) {
+            if (!host_used[id]) {
+                continue;
+            }
+
+            const int32_t slot = host_slot[id];
+            if (slot < 0 || slot >= n_host_slots) {
+                continue;
+            }
+
+            ggml_backend_tensor_set_async(backend, dst,
+                (const uint8_t *) host_pool->data + (size_t) slot*expert_size, (size_t) id*expert_size, expert_size);
+            host_used[id] = false;
+
+            // zeros, not the pool: the next pool slot holds another expert, and the next id may be staged already
+            if (id + 1 < n_expert && !st.used[id + 1]) {
+                ggml_backend_tensor_set_async(backend, dst, zero_padding, (size_t) (id + 1)*expert_size, padding);
+            }
+        }
+    }
+
     // group consecutive experts and copy them together
     for (int64_t first = 0; first < n_expert; ) {
         if (!host_used[first]) {
@@ -4205,6 +4258,7 @@ llama_context_params llama_context_default_params() {
         /*.defrag_thold                =*/ -1.0f,
         /*.n_moe_cache_slots           =*/ 0,
         /*.n_moe_cache_inserts         =*/ 2,
+        /*.n_moe_host_slots            =*/ 0,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,

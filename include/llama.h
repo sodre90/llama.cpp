@@ -397,6 +397,7 @@ extern "C" {
         // GPU-resident LRU cache for host-offloaded MoE expert weights [EXPERIMENTAL]
         int32_t  n_moe_cache_slots;   // cache slots per host-resident expert layer (0 = disabled)
         int32_t  n_moe_cache_inserts; // max expert uploads per layer per decode step
+        int32_t  n_moe_host_slots;    // pinned host pool slots per layer: the experts stay in the model file's mapping (0 = off)
 
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
@@ -1727,6 +1728,13 @@ extern "C" {
         uint64_t n_miss;   // routed expert ids observed not resident
         uint64_t n_insert; // uploads scheduled
         uint64_t n_evict;  // resident experts displaced to make room
+
+        // host tier (--moe-expert-host-slots), all zero when it is off
+        int32_t  n_host_slots;     // host pool slots per layer
+        uint64_t n_host_hit;       // routed experts already in the host pool
+        uint64_t n_host_miss;      // routed experts copied into the host pool
+        uint64_t host_bytes_read;  // bytes copied into the host pool
+        uint64_t host_read_us;     // time spent copying them
     };
 
     // false when the cache is disabled

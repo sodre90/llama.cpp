@@ -2246,6 +2246,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             if (mcache->device_policy) {
                 routed->src[2] = mcache->dev_state;
                 routed->src[3] = mcache->dev_table;
+                if (mcache->n_host_slots > 0) {
+                    routed->src[4] = llama_moe_cache_host_map(ctx0, *mcache, selected_experts);
+                    cb(routed->src[4], "ffn_moe_host_map", il);
+                }
                 mc_routed_ids  = routed;
             }
             ggml_build_forward_expand(gf, routed);

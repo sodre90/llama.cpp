@@ -365,6 +365,7 @@ extern "C" {
     // They sit above the ggml_prec slots (0 and 2 + src index).
     #define GGML_MOE_CACHE_OP_N_SLOTS      10 // i32: slot count; a table value not below it marks an expert without a slot
     #define GGML_MOE_CACHE_OP_HOST_EXPERTS 12 // pointer (2 slots): the full expert tensor in pinned host memory
+    #define GGML_MOE_CACHE_OP_HOST_SLOTS   14 // i32: host pool slots; 0: the host tensor holds every expert, read by expert id
 
     GGML_NORETURN GGML_ATTRIBUTE_FORMAT(3, 4)
     GGML_API void ggml_abort(const char * file, int line, const char * fmt, ...);

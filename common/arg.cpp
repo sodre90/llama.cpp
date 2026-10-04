@@ -2562,6 +2562,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.n_moe_cache_inserts = value;
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_INSERTS"));
+    add_opt(common_arg(
+        {"--moe-expert-host-slots"}, "N",
+        string_format("host tier slots per MoE layer; the other experts are read from the model file on demand; needs load-mode mmap and the device cache policy; 0 = off (default: %d)", params.n_moe_host_slots),
+        [](common_params & params, int value) {
+            params.n_moe_host_slots = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_HOST_SLOTS"));
     if (ex == LLAMA_EXAMPLE_SERVER) {
         // this is to make sure this option appears in the server-specific section of the help message
         add_opt(common_arg(

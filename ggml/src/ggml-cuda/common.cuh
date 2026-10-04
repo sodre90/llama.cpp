@@ -1701,6 +1701,7 @@ struct ggml_backend_cuda_context {
 
 // A MUL_MAT_ID over llama's MoE expert cache: src[0] holds the cached experts, src[3] maps expert id -> slot (op_params[GGML_MOE_CACHE_OP_N_SLOTS] is the slot count)
 // and op_params[GGML_MOE_CACHE_OP_HOST_EXPERTS] carries the address of the full expert tensor in pinned host memory, from which the experts without a slot are read in place.
+// With op_params[GGML_MOE_CACHE_OP_HOST_SLOTS] > 0 that address is a pool of that many host slots instead, and a table value not below the slot count names the pool slot it is read from.
 static const void * ggml_cuda_mmid_host_experts(const ggml_tensor * mm_id) {
     if (mm_id == nullptr || mm_id->op != GGML_OP_MUL_MAT_ID || mm_id->src[3] == nullptr) {
         return nullptr;
@@ -1764,6 +1765,8 @@ struct ggml_cuda_mm_fusion_args_device {
     const void    * gate_host      = nullptr;
     const int32_t * expert_slot    = nullptr;
     int32_t         n_expert_slots = 0;
+    // > 0: a missed expert reads host pool slot (table value - n_expert_slots), else its id in the full host tensor
+    int32_t         n_host_slots   = 0;
     // fill targets, in src0's layout: a missed expert is copied to channel (pair index) here before it is used
     char          * fill_x               = nullptr;
     char          * fill_gate            = nullptr;
