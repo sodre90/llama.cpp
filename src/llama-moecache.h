@@ -39,6 +39,9 @@
 // Needs the device policy (LLAMA_MOE_CACHE_DEVICE=1).
 // The tier reads the experts from the model files with parallel O_DIRECT preads when it can, else from the mapping
 // (LLAMA_MOE_HOST_IO_THREADS, default 16, 0 = mapping; LLAMA_MOE_HOST_IO_CHUNK_KB, default 512).
+// With the reader, a prefill ubatch reads the next layer's experts that are in neither the pool nor the device cache
+// into one of two pinned lookahead buffers while the current layer computes (LLAMA_MOE_HOST_LOOKAHEAD, default 1, 0 = off;
+// LLAMA_MOE_HOST_LOOKAHEAD_MIN_USED, default 0.9: the fraction of a layer's experts the ubatch must use for that).
 //
 // Enabled via llama_context_params.n_moe_cache_slots (CLI: --moe-expert-cache).
 
@@ -128,6 +131,10 @@ bool llama_moe_cache_direct_reads();
 // ggml_backend_sched_expert_read_fn over the host tier's file reader: reads the experts of an up/gate/down weight
 // into dst. False when the tier has no reader or does not know the weight.
 bool llama_moe_cache_expert_read(const ggml_tensor * weight, int64_t first, int64_t n, void * dst, void * user_data);
+
+// ggml_backend_sched_expert_src_fn over the lookahead buffers: the pinned bytes of experts [first, first + n) of an up/gate/down
+// weight, once the reads that fill them are done. nullptr when the run is not buffered.
+const void * llama_moe_cache_expert_src(const ggml_tensor * weight, int64_t first, int64_t n, void * user_data);
 
 // ggml_backend_sched_expert_rows_fn over the cache: lets the scheduler's prefill upload of a
 // host-resident up/gate/down weight fill the resident experts from their slots instead of over the

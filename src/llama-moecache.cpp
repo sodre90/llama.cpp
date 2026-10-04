@@ -157,20 +157,32 @@ struct expert_reader {
         const void * mapped; // the same bytes in the mapping, copied when the read fails
     };
 
+    // demand reads are taken before speculative ones
+    enum class priority { high, low };
+
+    // the chunks of one submit that are not done yet
+    struct batch {
+        size_t pending = 0;
+    };
+    using ticket = std::shared_ptr<batch>;
+
+    struct queued_chunk {
+        job    part;
+        ticket owner;
+    };
+
     std::vector<int>         fds;
     size_t                   alignment   = 4096;
     size_t                   chunk_bytes = 512*1024;
     std::vector<void *>      bounces;
     std::vector<std::thread> threads;
 
-    std::mutex              call_mtx; // one read() at a time
-    std::mutex              mtx;      // guards the members below
-    std::condition_variable work_cv;
-    std::condition_variable done_cv;
-    std::vector<job>        chunks;
-    size_t                  next    = 0;
-    size_t                  pending = 0;
-    bool                    stop    = false;
+    std::mutex               mtx; // guards the members below and batch::pending
+    std::condition_variable  work_cv;
+    std::condition_variable  done_cv;
+    std::deque<queued_chunk> high;
+    std::deque<queued_chunk> low;
+    bool                     stop = false;
 
     std::atomic<bool> warned{false};
 
@@ -206,40 +218,59 @@ struct expert_reader {
         return true;
     }
 
-    // returns when every byte of every job is in its dst
-    void read(const std::vector<job> & jobs) {
-        std::lock_guard<std::mutex> call_lock(call_mtx);
-        std::unique_lock<std::mutex> lock(mtx);
-        chunks.clear();
+    // queues the jobs and returns at once; wait(ticket) returns when every byte of every job is in its dst
+    ticket submit(const std::vector<job> & jobs, priority prio) {
+        auto t = std::make_shared<batch>();
+        std::lock_guard<std::mutex> lock(mtx);
+        std::deque<queued_chunk> & queue = prio == priority::high ? high : low;
         for (const job & j : jobs) {
             for (size_t done = 0; done < j.len; done += chunk_bytes) {
-                chunks.push_back({j.fd, j.offset + done, (char *) j.dst + done, std::min(chunk_bytes, j.len - done), (const char *) j.mapped + done});
+                queue.push_back({{j.fd, j.offset + done, (char *) j.dst + done, std::min(chunk_bytes, j.len - done), (const char *) j.mapped + done}, t});
+                t->pending++;
             }
         }
-        next    = 0;
-        pending = chunks.size();
-        if (pending == 0) {
+        work_cv.notify_all();
+        return t;
+    }
+
+    void wait(const ticket & t) {
+        std::unique_lock<std::mutex> lock(mtx);
+        done_cv.wait(lock, [&t]() { return t->pending == 0; });
+    }
+
+    // the chunks of t that no worker has started are taken before every speculative one
+    void promote(const ticket & t) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (t->pending == 0) {
             return;
         }
-        work_cv.notify_all();
-        done_cv.wait(lock, [this]() { return pending == 0; });
+        const auto first_of_t = std::stable_partition(low.begin(), low.end(), [&t](const queued_chunk & c) { return c.owner != t; });
+        std::move(first_of_t, low.end(), std::back_inserter(high));
+        low.erase(first_of_t, low.end());
+    }
+
+    // returns when every byte of every job is in its dst
+    void read(const std::vector<job> & jobs) {
+        wait(submit(jobs, priority::high));
     }
 
     void work(char * bounce) {
         std::unique_lock<std::mutex> lock(mtx);
         for (;;) {
-            work_cv.wait(lock, [this]() { return stop || next < chunks.size(); });
+            work_cv.wait(lock, [this]() { return stop || !high.empty() || !low.empty(); });
             if (stop) {
                 return;
             }
-            const job chunk = chunks[next++];
+            std::deque<queued_chunk> & queue = high.empty() ? low : high;
+            queued_chunk next = std::move(queue.front());
+            queue.pop_front();
             lock.unlock();
-            if (const int err = read_chunk(chunk, bounce); err != 0) {
-                copy_from_mapping(chunk, err);
+            if (const int err = read_chunk(next.part, bounce); err != 0) {
+                copy_from_mapping(next.part, err);
             }
             lock.lock();
-            if (--pending == 0) {
-                done_cv.notify_one();
+            if (--next.owner->pending == 0) {
+                done_cv.notify_all();
             }
         }
     }
@@ -273,6 +304,16 @@ struct expert_reader {
         }
         memcpy(chunk.dst, chunk.mapped, chunk.len);
     }
+};
+
+// the experts of one layer that a prefill reads from the files ahead of its upload, in ascending id order:
+// [up experts][gate experts][down experts]
+struct lookahead_buffer {
+    ggml_backend_buffer_t buf = nullptr;
+    int64_t               layer = -1;  // index in moe_cache::layers of the layer the buffer holds, -1: none
+    int32_t               count = 0;   // experts per matrix in the buffer
+    std::vector<int32_t>  position;    // expert id -> index among the buffered experts, -1 when not buffered
+    expert_reader::ticket reads;       // the reads that fill the buffer
 };
 
 struct moe_cache {
@@ -310,6 +351,14 @@ struct moe_cache {
     std::vector<ggml_context *>         host_ctxs;
     std::vector<ggml_backend_buffer_t>  host_bufs;
     std::unique_ptr<expert_reader>      host_reader; // nullptr: the tier copies from the mapping
+    ggml_backend_buffer_type_t          host_buft = nullptr; // where the pools and lookahead buffers live
+
+    // a prefill ubatch reads the next layer's experts ahead into one of two buffers, by layer parity (LLAMA_MOE_HOST_LOOKAHEAD)
+    bool                                lookahead = false;
+    float                               lookahead_min_used = 0.9f;
+    int64_t                             lookahead_layer = -1; // the layer of the last host weight the scheduler asked about
+    std::array<lookahead_buffer, 2>     lookahead_bufs;
+
     uint64_t last_log_host_hits   = 0;
     uint64_t last_log_host_misses = 0;
     uint64_t last_log_host_bytes  = 0;
@@ -1123,9 +1172,21 @@ bool alloc_host_pools(moe_cache & mc, ggml_backend_buffer_type_t host_buft) {
     return true;
 }
 
+void free_lookahead_buffers(moe_cache & mc) {
+    for (auto & la : mc.lookahead_bufs) {
+        if (la.buf) {
+            ggml_backend_buffer_free(la.buf);
+        }
+        la = {};
+    }
+}
+
 // the tier is off again: the pools are freed and the layers stop reading the experts in place
 void drop_host_tier(moe_cache & mc) {
     mc.host_reader.reset();
+    free_lookahead_buffers(mc);
+    mc.lookahead = false;
+    mc.host_buft = nullptr;
     for (auto * buf : mc.host_bufs) { ggml_backend_buffer_free(buf); }
     for (auto * ctx : mc.host_ctxs) { ggml_free(ctx); }
     mc.host_bufs.clear();
@@ -1197,6 +1258,7 @@ std::string setup_host_tier(moe_cache & mc, const llama_model & model, int32_t n
     }
 
     mc.host_slots = (int32_t) std::min<int64_t>(n_host_slots, mc.layers.front().pub.up_src->ne[2]);
+    mc.host_buft  = host_buft;
     for (auto & ls : mc.layers) {
         ls.pub.n_host_slots = mc.host_slots;
     }
@@ -1213,8 +1275,15 @@ std::string setup_host_tier(moe_cache & mc, const llama_model & model, int32_t n
     std::string reader_why_not;
     mc.host_reader = open_expert_reader(mc, model, reader_why_not);
     if (mc.host_reader) {
-        LLAMA_LOG_WARN("moe-cache: host tier reads the model files with O_DIRECT: %zu files, %zu threads, %zu KiB chunks, %zu byte alignment\n",
-                mc.host_reader->fds.size(), mc.host_reader->threads.size(), mc.host_reader->chunk_bytes/1024, mc.host_reader->alignment);
+        mc.lookahead = mc.host_slots < mc.layers.front().pub.up_src->ne[2];
+        if (const char * env = getenv("LLAMA_MOE_HOST_LOOKAHEAD")) {
+            mc.lookahead = mc.lookahead && atoi(env) != 0;
+        }
+        if (const char * env = getenv("LLAMA_MOE_HOST_LOOKAHEAD_MIN_USED")) {
+            mc.lookahead_min_used = std::clamp((float) atof(env), 0.0f, 1.0f);
+        }
+        LLAMA_LOG_WARN("moe-cache: host tier reads the model files with O_DIRECT: %zu files, %zu threads, %zu KiB chunks, %zu byte alignment, lookahead %s\n",
+                mc.host_reader->fds.size(), mc.host_reader->threads.size(), mc.host_reader->chunk_bytes/1024, mc.host_reader->alignment, mc.lookahead ? "on" : "off");
     } else {
         LLAMA_LOG_WARN("moe-cache: host tier reads through the model mapping: %s\n", reader_why_not.c_str());
     }
@@ -1258,6 +1327,114 @@ void populate_host_tier(moe_cache & mc) {
             mc.host_slots, mc.layers.front().pub.up_src->ne[2]);
     LLAMA_LOG_WARN("moe-cache: host tier on: %zu layers, %d slots per layer, %.1f GiB pinned, populated in %.1f s\n",
             mc.layers.size(), mc.host_slots, pinned_bytes/1024.0/1024.0/1024.0, (ggml_time_us() - t_start)/1e6);
+}
+
+// where a matrix's experts start in a lookahead buffer: the matrices before it come first
+size_t lookahead_section_offset(const layer_state & ls, size_t matrix, int32_t count) {
+    const auto matrices = host_matrices_of(ls.pub);
+    const size_t expert_bytes = std::accumulate(matrices.begin(), matrices.begin() + matrix, (size_t) 0, [](size_t sum, const host_matrix & m) { return sum + m.src->nb[2]; });
+    return (size_t) count*expert_bytes;
+}
+
+// the experts of the layer that are in neither the host pool nor the device cache; a prefill ubatch reads them from the files
+std::vector<int32_t> experts_outside_pool_and_vram(const layer_state & ls) {
+    const int32_t * vram_slot = ls.pub.host_table && ls.pub.host_table->data ? (const int32_t *) ls.pub.host_table->data : nullptr;
+    std::vector<int32_t> experts;
+    for (int32_t e = 0; e < (int32_t) ls.host_slot.size(); ++e) {
+        const bool in_vram = vram_slot && vram_slot[e] >= 0 && vram_slot[e] < ls.pub.n_slots;
+        if (ls.host_slot[e] < 0 && !in_vram) {
+            experts.push_back(e);
+        }
+    }
+    return experts;
+}
+
+// two pinned buffers, each for the most experts a layer can have outside the pool; false when there is no memory for them
+bool alloc_lookahead_buffers(moe_cache & mc) {
+    size_t bytes = 0;
+    for (const auto & ls : mc.layers) {
+        bytes = std::max(bytes, (size_t) (ls.pub.up_src->ne[2] - ls.pub.n_host_slots)*host_expert_bytes(ls.pub));
+    }
+    for (auto & la : mc.lookahead_bufs) {
+        la.buf = ggml_backend_buft_alloc_buffer(mc.host_buft, bytes);
+        if (!la.buf) {
+            free_lookahead_buffers(mc);
+            return false;
+        }
+    }
+    LLAMA_LOG_WARN("moe-cache: host tier lookahead: 2 pinned buffers of %.2f GiB\n", bytes/1024.0/1024.0/1024.0);
+    return true;
+}
+
+// the reads of the layer's experts outside the pool and the device cache, into the buffer of the layer's parity
+void lookahead_read_layer(moe_cache & mc, size_t layer_idx) {
+    const layer_state & ls = mc.layers[layer_idx];
+    lookahead_buffer & la  = mc.lookahead_bufs[layer_idx % 2];
+    if (la.reads) {
+        mc.host_reader->wait(la.reads);
+        la.reads.reset();
+    }
+    la.layer = -1;
+
+    const std::vector<int32_t> experts = experts_outside_pool_and_vram(ls);
+    if (experts.empty() || experts.size()*host_expert_bytes(ls.pub) > ggml_backend_buffer_get_size(la.buf)) {
+        return;
+    }
+    la.count = (int32_t) experts.size();
+    la.position.assign(ls.host_slot.size(), -1);
+    for (size_t i = 0; i < experts.size(); ++i) {
+        la.position[experts[i]] = (int32_t) i;
+    }
+
+    std::vector<expert_reader::job> jobs;
+    const auto matrices = host_matrices_of(ls.pub);
+    for (size_t k = 0; k < matrices.size(); ++k) {
+        char * section = (char *) ggml_backend_buffer_get_base(la.buf) + lookahead_section_offset(ls, k, la.count);
+        for (size_t run_begin = 0; run_begin < experts.size(); ) {
+            size_t run_end = run_begin + 1;
+            while (run_end < experts.size() && experts[run_end] == experts[run_end - 1] + 1) {
+                ++run_end;
+            }
+            jobs.push_back(host_read_job(ls, k, experts[run_begin], run_end - run_begin, section + run_begin*matrices[k].src->nb[2]));
+            run_begin = run_end;
+        }
+    }
+    la.reads = mc.host_reader->submit(jobs, expert_reader::priority::low);
+    la.layer = (int64_t) layer_idx;
+}
+
+int64_t count_used_experts(const uint32_t * used_ids, int64_t n_expert) {
+    int64_t n_used = 0;
+    for (int64_t id = 0; id < n_expert; ++id) {
+        n_used += used_ids[id >> 5] >> (id & 31) & 1;
+    }
+    return n_used;
+}
+
+// the scheduler is about to upload a weight of the layer; the first time for a layer, its own reads are needed now
+// and the next layer's reads start in the background
+void lookahead_enter_layer(moe_cache & mc, size_t layer_idx, const uint32_t * used_ids) {
+    if (!mc.lookahead || (int64_t) layer_idx == mc.lookahead_layer) {
+        return;
+    }
+    mc.lookahead_layer = (int64_t) layer_idx;
+
+    const lookahead_buffer & own = mc.lookahead_bufs[layer_idx % 2];
+    if (own.layer == (int64_t) layer_idx && own.reads) {
+        mc.host_reader->promote(own.reads);
+    }
+
+    const size_t next_idx = layer_idx + 1;
+    const int64_t n_expert = mc.layers[layer_idx].pub.up_src->ne[2];
+    if (next_idx >= mc.layers.size() || count_used_experts(used_ids, n_expert) < mc.lookahead_min_used*n_expert) {
+        return;
+    }
+    if (!mc.lookahead_bufs.front().buf && !alloc_lookahead_buffers(mc)) {
+        LLAMA_LOG_WARN("moe-cache: no pinned host memory for the lookahead buffers, lookahead off\n");
+        mc.lookahead = false;
+        return;
+    }
+    lookahead_read_layer(mc, next_idx);
 }
 
 bool alloc_routing(moe_cache & mc, int64_t n_expert_used) {
@@ -1914,6 +2091,7 @@ bool llama_moe_cache_expert_host(const ggml_tensor * weight, const uint32_t * us
     *host_slot = ls.host_slot.data();
     *n_slots   = ls.pub.n_host_slots;
 
+    lookahead_enter_layer(*mc, it->second.layer_idx, used_ids);
     if (!mc->host_reader) {
         for (int64_t id = 0; id < weight->ne[2]; ++id) {
             if ((used_ids[id >> 5] >> (id & 31) & 1) && ls.host_slot[id] < 0) {
@@ -1945,6 +2123,33 @@ bool llama_moe_cache_expert_read(const ggml_tensor * weight, int64_t first, int6
     }
     mc->host_reader->read({host_read_job(ls, matrix, first, n, dst)});
     return true;
+}
+
+const void * llama_moe_cache_expert_src(const ggml_tensor * weight, int64_t first, int64_t n, void * /*user_data*/) {
+    moe_cache * mc = g_cache;
+    if (!mc || !mc->lookahead) {
+        return nullptr;
+    }
+    auto it = mc->by_src.find(weight);
+    if (it == mc->by_src.end()) {
+        return nullptr;
+    }
+    const size_t layer_idx = it->second.layer_idx;
+    const layer_state & ls = mc->layers[layer_idx];
+    const lookahead_buffer & la = mc->lookahead_bufs[layer_idx % 2];
+    if (la.layer != (int64_t) layer_idx || first < 0 || n <= 0 || first + n > (int64_t) la.position.size()) {
+        return nullptr;
+    }
+    const auto run = la.position.begin() + first;
+    const bool buffered = *run >= 0 && std::adjacent_find(run, run + n, [](int32_t a, int32_t b) { return b != a + 1; }) == run + n;
+    const auto matrices = host_matrices_of(ls.pub);
+    const size_t matrix = std::find_if(matrices.begin(), matrices.end(), [weight](const host_matrix & m) { return m.src == weight; }) - matrices.begin();
+    if (!buffered || matrix == matrices.size()) {
+        return nullptr;
+    }
+    mc->host_reader->promote(la.reads);
+    mc->host_reader->wait(la.reads);
+    return (const char *) ggml_backend_buffer_get_base(la.buf) + lookahead_section_offset(ls, matrix, la.count) + (size_t) *run*weight->nb[2];
 }
 
 bool llama_moe_cache_expert_rows(const ggml_tensor * weight, const ggml_tensor ** rows, const int32_t ** expert_slot, int32_t * n_slots, void * /*user_data*/) {

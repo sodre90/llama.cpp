@@ -413,6 +413,11 @@ extern "C" {
     typedef bool (*ggml_backend_sched_expert_read_fn)(const struct ggml_tensor * weight, int64_t first, int64_t n, void * dst, void * user_data);
     GGML_API void                 ggml_backend_sched_set_expert_read_callback(ggml_backend_sched_t sched, ggml_backend_sched_expert_read_fn fn, void * user_data);
 
+    // pinned host bytes of experts [first, first + n) of a host weight, contiguous, ready to upload; NULL: not available, read them instead.
+    // valid until the scheduler starts the expert uploads of the layer after next
+    typedef const void * (*ggml_backend_sched_expert_src_fn)(const struct ggml_tensor * weight, int64_t first, int64_t n, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_expert_src_callback(ggml_backend_sched_t sched, ggml_backend_sched_expert_src_fn fn, void * user_data);
+
     //
     // Meta backend
     //
