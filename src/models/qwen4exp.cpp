@@ -1829,6 +1829,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
+    if (conv_kernel->type != GGML_TYPE_F32) {
+        conv_kernel = ggml_cast(ctx0, conv_kernel, GGML_TYPE_F32);
+    }
+
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
 
