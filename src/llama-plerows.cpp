@@ -13,15 +13,17 @@
 #include <cstring>
 #include <vector>
 
-// One slot holds one table row, and the row decides its slot, so a lookup is one compare.
-// The index is already a hash, so it needs no second hash and no eviction policy: a slot
-// that is taken is overwritten, which is the best a uniform spread can do.
+// 2-way set-associative host row cache for the lazy per-layer token embedding table.
+// Sets are indexed by row % n_sets; each set holds 2 ways with 1-bit pseudo-LRU.
+// Adjacent ways share the same cache line in the tag array.
 struct ple_row_cache {
     const ggml_tensor * table    = nullptr;
     int64_t             row_size = 0;
     int32_t             n_slots  = 0;
+    int32_t             n_sets   = 0;
     uint8_t *           rows     = nullptr;
     std::vector<int32_t> tag;                      // slot -> row, -1 when empty
+    std::vector<uint8_t> lru;                      // set -> next victim way (0 or 1)
     bool                prefetch = false;          // model.can_prefetch holds the table
 
     uint64_t n_hit      = 0;
@@ -48,15 +50,19 @@ void llama_ple_rows_init(const llama_model & model, int32_t n_rows) {
         return;
     }
 
-    const int32_t slots = (int32_t) std::min<int64_t>(n_rows, table->ne[1]);
-    const int64_t row_size = ggml_row_size(table->type, table->ne[0]);
+    const int32_t slots_req = (int32_t) std::min<int64_t>(n_rows, table->ne[1]);
+    const int32_t sets      = std::max<int32_t>(1, slots_req / 2);
+    const int32_t slots     = sets * 2;
+    const int64_t row_size  = ggml_row_size(table->type, table->ne[0]);
 
     g_cache = new ple_row_cache();
     g_cache->table    = table;
     g_cache->row_size = row_size;
     g_cache->n_slots  = slots;
+    g_cache->n_sets   = sets;
     g_cache->rows     = (uint8_t *) malloc((size_t) slots * row_size);
     g_cache->tag.assign(slots, -1);
+    g_cache->lru.assign(sets, 0);
     g_cache->prefetch = model.can_prefetch.count(table) > 0;
     g_cache->log_us   = ggml_time_us();
 
@@ -68,7 +74,7 @@ void llama_ple_rows_init(const llama_model & model, int32_t n_rows) {
         return;
     }
 
-    LLAMA_LOG_WARN("ple-rows: %d slots of %" PRId64 " bytes (%.0f MiB), %s pf\n", slots, row_size,
+    LLAMA_LOG_WARN("ple-rows: %d slots in %d sets (2-way, %.0f MiB), %s pf\n", slots, sets,
             (double) slots * row_size / 1024.0 / 1024.0, g_cache->prefetch ? "with" : "without");
 }
 
@@ -87,10 +93,18 @@ void llama_ple_rows_gather(const ggml_tensor * table, const int32_t * idx, int64
     // every row this ubatch reads that the cache does not hold yet
     std::vector<int32_t> miss;
     for (int64_t i = 0; i < n_rows; ++i) {
-        if (c.tag[idx[i] % c.n_slots] == idx[i]) {
+        const int32_t row   = idx[i];
+        const int32_t set   = (uint32_t) row % c.n_sets;
+        const int32_t slot0 = set * 2;
+        const int32_t slot1 = set * 2 + 1;
+        if (c.tag[slot0] == row) {
             ++c.n_hit;
+            c.lru[set] = 1;
+        } else if (c.tag[slot1] == row) {
+            ++c.n_hit;
+            c.lru[set] = 0;
         } else {
-            miss.push_back(idx[i]);
+            miss.push_back(row);
         }
     }
 
@@ -102,9 +116,23 @@ void llama_ple_rows_gather(const ggml_tensor * table, const int32_t * idx, int64
 
         const char * src0 = (const char *) table->data;
         for (int32_t row : miss) {
-            const int32_t slot = row % c.n_slots;
-            if (c.tag[slot] == row) {
+            const int32_t set   = (uint32_t) row % c.n_sets;
+            const int32_t slot0 = set * 2;
+            const int32_t slot1 = set * 2 + 1;
+            if (c.tag[slot0] == row || c.tag[slot1] == row) {
                 continue; // an earlier miss of this ubatch already filled the slot
+            }
+            int32_t slot;
+            if (c.tag[slot0] < 0) {
+                slot = slot0;
+                c.lru[set] = 1;
+            } else if (c.tag[slot1] < 0) {
+                slot = slot1;
+                c.lru[set] = 0;
+            } else {
+                const uint8_t victim = c.lru[set];
+                slot = set * 2 + victim;
+                c.lru[set] = 1 - victim;
             }
             memcpy(c.rows + (size_t) slot * c.row_size, src0 + (size_t) row * c.row_size, c.row_size);
             c.tag[slot] = row;
@@ -114,10 +142,18 @@ void llama_ple_rows_gather(const ggml_tensor * table, const int32_t * idx, int64
     }
 
     for (int64_t i = 0; i < n_rows; ++i) {
-        const int32_t row  = idx[i];
-        const int32_t slot = row % c.n_slots;
-        const char * src = c.tag[slot] == row
-                ? (const char *) c.rows + (size_t) slot * c.row_size
+        const int32_t row   = idx[i];
+        const int32_t set   = (uint32_t) row % c.n_sets;
+        const int32_t slot0 = set * 2;
+        const int32_t slot1 = set * 2 + 1;
+        int32_t hit_slot = -1;
+        if (c.tag[slot0] == row) {
+            hit_slot = slot0;
+        } else if (c.tag[slot1] == row) {
+            hit_slot = slot1;
+        }
+        const char * src = hit_slot >= 0
+                ? (const char *) c.rows + (size_t) hit_slot * c.row_size
                 : (const char *) table->data + (size_t) row * c.row_size;
         to_float(src, dst + i * nc, nc);
     }
