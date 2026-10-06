@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "llama-moecache.h"
+#include "llama-plerows.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -252,6 +253,7 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
 
     llama_moe_cache_init(model, params.n_moe_cache_slots, params.n_moe_cache_inserts, params.n_moe_host_slots);
+    llama_ple_rows_init(model, params.n_ple_host_rows);
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
@@ -4263,6 +4265,7 @@ llama_context_params llama_context_default_params() {
         /*.n_moe_cache_slots           =*/ 0,
         /*.n_moe_cache_inserts         =*/ 2,
         /*.n_moe_host_slots            =*/ 0,
+        /*.n_ple_host_rows             =*/ 0,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,

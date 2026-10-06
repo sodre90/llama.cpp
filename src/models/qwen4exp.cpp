@@ -2,6 +2,7 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "llama-plerows.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -1964,10 +1965,13 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
-        return rows->ne[0] == (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
+        return n_tokens == params.ubatch.n_tokens;
     }
 
-    ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens], the direct get_rows path
+    ggml_tensor * emb  = nullptr;   // F32 [ple_head_dim, ple_n_heads * n_tokens], the row cache path
+
+    int64_t n_tokens = 0;
 
     const llama_model & model;
 
@@ -1976,6 +1980,7 @@ public:
 
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
+    std::vector<float>       emb_buf;
 };
 
 void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
@@ -2039,13 +2044,18 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
         }
     }
 
-    {
-        ggml_tensor * ple = model.per_layer_tok_embd;
+    ggml_tensor * ple = model.per_layer_tok_embd;
 
-        const bool prefetch = model.can_prefetch.count(ple);
-        if (prefetch) {
-            llama_prefetch_rows(ple, idx.data(), idx.size());
-        }
+    if (emb != nullptr) {
+        // the row cache dequantizes here, so only a miss reads the table
+        emb_buf.resize(idx.size() * ple->ne[0]);
+        llama_ple_rows_gather(ple, idx.data(), idx.size(), emb_buf.data());
+        ggml_backend_tensor_set(emb, emb_buf.data(), 0, emb_buf.size()*sizeof(float));
+        return;
+    }
+
+    if (model.can_prefetch.count(ple)) {
+        llama_prefetch_rows(ple, idx.data(), idx.size());
     }
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
@@ -2113,15 +2123,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
 
     // the attention cells see every ubatch regardless of the layer types
     auto ple_inp = std::make_unique<llm_graph_input_qwen4exp_ple>(model, mctx_hyb->get_attn());
-
-    ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
-    ggml_set_input(ple_inp->rows);
-    ggml_tensor * rows = ple_inp->rows;
-    res->add_input(std::move(ple_inp));
+    ple_inp->n_tokens = n_tokens;
 
     // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+    ggml_tensor * emb = nullptr;
+    if (llama_ple_rows_enabled()) {
+        // the row cache gathers host-side, so its f32 result is an input, laid out as get_rows would
+        ple_inp->emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.ple_head_dim, n_heads * n_tokens);
+        ggml_set_input(ple_inp->emb);
+        emb = ple_inp->emb;
+    } else {
+        ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
+        ggml_set_input(ple_inp->rows);
+        emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, ple_inp->rows);
+    }
+
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
+    res->add_input(std::move(ple_inp));
+
     cb(emb, "ple_embd", -1);
 
     return emb;

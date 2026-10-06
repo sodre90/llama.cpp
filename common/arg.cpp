@@ -2569,6 +2569,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.n_moe_host_slots = value;
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_HOST_SLOTS"));
+    add_opt(common_arg(
+        {"--ple-host-rows"}, "N",
+        string_format("rows of the lazy per-layer token embedding table to cache in host RAM; a hit does not touch the model file (0 = off, default: %d)", params.n_ple_host_rows),
+        [](common_params & params, int value) {
+            params.n_ple_host_rows = value;
+        }
+    ).set_env("LLAMA_ARG_PLE_HOST_ROWS"));
     if (ex == LLAMA_EXAMPLE_SERVER) {
         // this is to make sure this option appears in the server-specific section of the help message
         add_opt(common_arg(

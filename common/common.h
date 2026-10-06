@@ -460,6 +460,7 @@ struct common_params {
     int32_t n_moe_cache_slots     = 0;    // GPU cache slots per host-resident MoE expert layer (0 = disabled)
     int32_t n_moe_cache_inserts   = 2;    // max expert uploads per layer per decode step
     int32_t n_moe_host_slots      = 0;    // pinned host pool slots per MoE expert layer, the other experts are read from the model file (0 = off)
+    int32_t n_ple_host_rows       = 0;    // rows of the lazy per-layer token embedding table to keep in host RAM (0 = off)
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode

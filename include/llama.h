@@ -399,6 +399,9 @@ extern "C" {
         int32_t  n_moe_cache_inserts; // max expert uploads per layer per decode step
         int32_t  n_moe_host_slots;    // pinned host pool slots per layer: the experts stay in the model file's mapping (0 = off)
 
+        // host row cache for the lazily read per-layer token embedding table [EXPERIMENTAL]
+        int32_t  n_ple_host_rows;     // rows of that table to keep in host RAM (0 = off)
+
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
 
