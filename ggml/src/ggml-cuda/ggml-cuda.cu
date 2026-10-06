@@ -3961,7 +3961,7 @@ static int ggml_cuda_hc_up_pre_index(const ggml_cgraph * cgraph, int node_idx, i
 
 // the BF16 inject MUL_MAT of qwen4exp's hc mix that the hc up+pre launch a few nodes later can compute as extra blocks; returns
 // the index of that launch's SCALE node, or -1
-static int ggml_cuda_hc_inject_scale_index(const ggml_cgraph * cgraph, int node_idx, int cc) {
+static int ggml_cuda_hc_inject_scale_index(const ggml_cgraph * cgraph, int node_idx, int cc, int warp_size) {
     const ggml_tensor * node = cgraph->nodes[node_idx];
     if (node->op != GGML_OP_MUL_MAT || ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC0_IS_HADAMARD || ggml_cuda_fusion_disabled() ||
             !ggml_cuda_hc_inject_fusion_enabled()) {
@@ -3975,7 +3975,7 @@ static int ggml_cuda_hc_inject_scale_index(const ggml_cgraph * cgraph, int node_
             src0->ne[2] != 1 || src0->ne[3] != 1 || src0->nb[0] != sizeof(nv_bfloat16) || src0->ne[0] % 2 != 0 ||
             !ggml_is_contiguous(src1) || !ggml_is_contiguous(node) || src1->ne[2] != 1 || src1->ne[3] != 1 ||
             node->ne[0] != src0->ne[1] || node->ne[1] != nt || node->ne[2] != 1 || node->ne[3] != 1 ||
-            !ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, nt) ||
+            !ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, nt) ||
             ggml_cuda_mul_mat_vec_f_block_size(src0->ne[0], src0->ne[1]) != 256) {
         return -1;
     }
@@ -4013,7 +4013,8 @@ static bool ggml_cuda_hc_inject_defer(ggml_backend_cuda_context * cuda_ctx, cons
         return false;
     }
     const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
-    const int scale_idx = ggml_cuda_hc_inject_scale_index(cgraph, node_idx, cc);
+    const int warp_size = ggml_cuda_info().devices[cuda_ctx->device].warp_size;
+    const int scale_idx = ggml_cuda_hc_inject_scale_index(cgraph, node_idx, cc, warp_size);
     if (scale_idx < 0) {
         return false;
     }
@@ -4234,7 +4235,7 @@ static int32_t ggml_cuda_graph_use_count(const ggml_cgraph * cgraph, const ggml_
 // RESHAPE, which may split the rows into channels), with nothing writing the rows or their indices in between; returns that
 // MUL_MAT, or nullptr. The matvec then dequantizes the rows in place and the F32 copy is never written - QSA scores every
 // pooled block this way, and each sequence's own blocks as one channel when it scopes them per sequence.
-static const ggml_tensor * ggml_cuda_mmvf_q8_0_rows_consumer(const ggml_cgraph * cgraph, int node_idx, int cc) {
+static const ggml_tensor * ggml_cuda_mmvf_q8_0_rows_consumer(const ggml_cgraph * cgraph, int node_idx, int cc, int warp_size) {
     if (ggml_cuda_fusion_disabled()) {
         return nullptr;
     }
@@ -4272,7 +4273,7 @@ static const ggml_tensor * ggml_cuda_mmvf_q8_0_rows_consumer(const ggml_cgraph *
                 src1->nb[2] % (2*sizeof(float)) == 0 && src1->ne[2] == read->ne[2] && src1->ne[3] == 1 &&
                 src1->ne[1] <= MMVF_MAX_BATCH_SIZE &&
                 node->type == GGML_TYPE_F32 && node->nb[0] == sizeof(float) &&
-                ggml_cuda_should_use_mmvf(GGML_TYPE_F32, cc, read->ne, read->nb, src1->ne[1]);
+                ggml_cuda_should_use_mmvf(GGML_TYPE_F32, cc, warp_size, read->ne, read->nb, src1->ne[1]);
             return ok ? node : nullptr;
         }
         if (ggml_cuda_is_view_or_noop(node)) {
@@ -4477,14 +4478,14 @@ static bool ggml_cuda_is_plain_mul_mat_vec_q(const ggml_tensor * node, const int
            src0->buffer && ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
            src1->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 && ggml_nrows(node) == node->ne[1] &&
            node->ne[1] <= max_cols && ggml_is_contiguous(node) &&
-           !ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]) &&
+           !ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1]) &&
            !ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id =*/ false) &&
            ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1]);
 }
 
 // a MUL_MAT of one token (on RDNA4 up to MMVQ_MAX_ROW_SEGMENT_COLS) on an F32 matrix that ggml_cuda_mul_mat would hand to
 // ggml_cuda_mul_mat_vec_f unfused
-static bool ggml_cuda_is_plain_mul_mat_vec_f(const ggml_tensor * node, const int cc) {
+static bool ggml_cuda_is_plain_mul_mat_vec_f(const ggml_tensor * node, const int cc, const int warp_size) {
     const ggml_tensor * src0 = node->src[0];
     const ggml_tensor * src1 = node->src[1];
     const int64_t max_cols = GGML_CUDA_CC_IS_RDNA4(cc) ? MMVQ_MAX_ROW_SEGMENT_COLS : 1;
@@ -4494,7 +4495,7 @@ static bool ggml_cuda_is_plain_mul_mat_vec_f(const ggml_tensor * node, const int
            src0->buffer && ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
            src1->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 && ggml_nrows(node) == node->ne[1] &&
            node->ne[1] <= max_cols && ggml_is_contiguous(node) &&
-           ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
+           ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1]);
 }
 
 // the elementwise tail of a row segment, when the graph continues with it right after the matvecs:
@@ -4569,12 +4570,12 @@ static int ggml_cuda_match_mul_mat_vec_row_segments(const ggml_cgraph * cgraph, 
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
 
     ggml_tensor * first = cgraph->nodes[i];
-    const bool is_f = ggml_cuda_is_plain_mul_mat_vec_f(first, cc);
+    const bool is_f = ggml_cuda_is_plain_mul_mat_vec_f(first, cc, warp_size);
     if (!is_f && !ggml_cuda_is_plain_mul_mat_vec_q(first, cc, warp_size)) {
         return 0;
     }
     const auto is_plain = [&](const ggml_tensor * node) {
-        return is_f ? ggml_cuda_is_plain_mul_mat_vec_f(node, cc) &&
+        return is_f ? ggml_cuda_is_plain_mul_mat_vec_f(node, cc, warp_size) &&
                       ggml_cuda_mul_mat_vec_f_block_size(node->src[0]->ne[0], node->ne[0]) ==
                       ggml_cuda_mul_mat_vec_f_block_size(first->src[0]->ne[0], first->ne[0])
                     : ggml_cuda_is_plain_mul_mat_vec_q(node, cc, warp_size);
@@ -6074,7 +6075,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 if (cuda_ctx->mmvf_q8_0_consumer == nullptr && stream_ctx.concurrent_events.empty()) {
-                    const ggml_tensor * consumer = ggml_cuda_mmvf_q8_0_rows_consumer(cgraph, i, ggml_cuda_info().devices[cuda_ctx->device].cc);
+                    const ggml_tensor * consumer = ggml_cuda_mmvf_q8_0_rows_consumer(cgraph, i, ggml_cuda_info().devices[cuda_ctx->device].cc, ggml_cuda_info().devices[cuda_ctx->device].warp_size);
                     if (consumer != nullptr) {
                         cuda_ctx->mmvf_q8_0_gather   = node;
                         cuda_ctx->mmvf_q8_0_consumer = consumer;
@@ -6486,10 +6487,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
         // the fused hc up+pre reads the down projection and the normed streams when it runs, so its output must not take over their memory
         const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        const int warp_size = ggml_cuda_info().devices[cuda_ctx->device].warp_size;
         int n_hc_up_pre = 0;
         int n_hc_inject = 0;
         for (int i = 0; i < cgraph->n_nodes; ++i) {
-            n_hc_inject += ggml_cuda_hc_inject_scale_index(cgraph, i, cc) >= 0;
+            n_hc_inject += ggml_cuda_hc_inject_scale_index(cgraph, i, cc, warp_size) >= 0;
             const int pre_idx = ggml_cuda_hc_up_pre_index(cgraph, i, cc);
             if (pre_idx < 0) {
                 continue;
