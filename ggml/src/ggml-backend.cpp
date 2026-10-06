@@ -2411,12 +2411,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     }
 
-    if (sched->expert_copy_stats && stat_tensors > 0) {
-        GGML_LOG_WARN("sched expert upload: %d weight tensors, %.1f%% of experts used, %.1f%% of the used rows device-filled, %.1f MiB over the host link, %.1f MiB from the host pool, %.1f MiB read through the read callback in %.1f ms, %.1f MiB from the lookahead buffers in %.1f ms\n",
-                stat_tensors, 100.0*stat_used/stat_experts, stat_used > 0 ? 100.0*stat_resident/stat_used : 0.0, stat_bytes_host/1024.0/1024.0, stat_bytes_pool/1024.0/1024.0,
-                stat_bytes_read/1024.0/1024.0, stat_read_us/1000.0, stat_bytes_ahead/1024.0/1024.0, stat_ahead_us/1000.0);
-    }
-
     if (sched->split_profile) {
         ggml_backend_sched_split_profile_add(sched, prof_t_inputs, prof_t_compute);
     }

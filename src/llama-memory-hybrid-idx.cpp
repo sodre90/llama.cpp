@@ -2455,24 +2455,11 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     }
     GGML_ASSERT(ip == st.is_new.size());
 
-    // in order mode a token's cell gives its rank, and the rank its pool: positions cannot, as an image shares one
-    const bool by_order = mem->get_kpool_by_order();
-    const auto *   sinfo = by_order ? &sinfos_kpool[i_cur] : nullptr;
-    const uint32_t n_tps = by_order ? (uint32_t) sinfo->size() : 0;
-
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
         const llama_pos p = ubatch.pos[i];
         for (int32_t k = 0; k < ubatch.n_seq_id[i]; ++k) {
             const llama_seq_id s = ubatch.seq_id[i][k];
             const auto & sq = lay.seqs[s];
-            if (by_order) {
-                const int64_t r = kpool_rank(sq.cells, p, sinfo->idxs[i / n_tps][i % n_tps]);
-                GGML_ASSERT(r >= 0);
-                if ((size_t) r / kpool < sq.pools.size()) {
-                    mark(s, (size_t) r / kpool);
-                }
-                continue;
-            }
             auto it = std::upper_bound(sq.pools.begin(), sq.pools.end(), p,
                     [&](llama_pos pos, uint32_t j) { return pos < sq.cells[j].first; });
             if (it == sq.pools.begin()) {
@@ -2565,19 +2552,6 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         auto it = std::lower_bound(sq.cells.begin(), sq.cells.end(), std::make_pair(ubatch->pos[0], 0u));
         GGML_ASSERT(it != sq.cells.end() && it->first == ubatch->pos[0]);
         dummy_cell = gcell(sq, it->second);
-    }
-
-    // in order mode a token sees the pools and the tail up to its own rank in the sequence, which its cell pins down
-    std::vector<int64_t> rank;
-    if (by_order) {
-        const auto &   sinfo = sinfos_kpool[i_cur];
-        const uint32_t n_tps = (uint32_t) sinfo.size();
-
-        rank.resize(n_tokens);
-        for (uint32_t i = 0; i < n_tokens; ++i) {
-            rank[i] = kpool_rank(lay.seqs[ubatch->seq_id[i][0]].cells, ubatch->pos[i], sinfo.idxs[i / n_tps][i % n_tps]);
-            GGML_ASSERT(rank[i] >= 0);
-        }
     }
 
     // padding and absent cells point at the n_kv sentinel row, one past the live cells
@@ -2726,11 +2700,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         for (uint32_t k = 0; k < kpool - 1; ++k) {
             int32_t cell = sentinel;
             bool    real = false;
-            if (k < n_tail && by_order) {
-                const uint32_t c = sq.cells[rank[i] - k].second;
-                cell = (int32_t) c;
-                real = true;
-            } else if (k < n_tail) {
+            if (k < n_tail) {
                 const llama_pos pt = p - (llama_pos) k;
                 auto it = std::lower_bound(sq.cells.begin(), sq.cells.end(), std::make_pair(pt, 0u));
                 if (it != sq.cells.end() && it->first == pt) {
