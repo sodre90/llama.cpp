@@ -1755,7 +1755,7 @@ json server_task_result_apply_lora::to_json() {
 namespace {
 
 constexpr uint32_t PCACHE_DISK_MAGIC   = 0x4443504c; // "LPCD"
-constexpr uint32_t PCACHE_DISK_VERSION = 1;
+constexpr uint32_t PCACHE_DISK_VERSION = 2;
 
 constexpr size_t PCACHE_DISK_CKPT_HEADER_SIZE = 8 + 3*4 + 3*8;
 
@@ -1849,6 +1849,41 @@ struct pcache_reader {
     }
 };
 
+// the size and mtime of a file, a missing file hashes as such
+uint64_t pcache_hash_file(uint64_t h, const std::string & path) {
+    std::error_code ec;
+    const uint64_t size  = std::filesystem::file_size(path, ec);
+    const int64_t  mtime = static_cast<int64_t>(std::filesystem::last_write_time(path, ec).time_since_epoch().count());
+
+    h = pcache_hash(h, path.data(), path.size());
+    h = pcache_hash(h, &size, sizeof(size));
+
+    return pcache_hash(h, &mtime, sizeof(mtime));
+}
+
+static_assert(sizeof(llama_token) == sizeof(int32_t), "the file stores the token ids as int32");
+
+llama_tokens pcache_token_ids(const server_tokens & tokens) {
+    llama_tokens ids(tokens.size());
+
+    for (size_t i = 0; i < ids.size(); ++i) {
+        ids[i] = tokens[i];
+    }
+
+    return ids;
+}
+
+// the file has no media chunks, only the placeholder tokens
+bool pcache_has_media(const server_tokens & tokens) {
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i] == LLAMA_TOKEN_NULL) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 std::string pcache_disk_path(const std::string & dir, const std::string & prefix, uint64_t id) {
     return (std::filesystem::path(dir) / (prefix + std::to_string(id) + ".pcache")).string();
 }
@@ -1870,7 +1905,7 @@ bool pcache_disk_is_own_file(const std::string & name, const std::string & prefi
 }
 
 // returns the reason on failure, empty on success
-std::string pcache_disk_write(const std::string & path, uint64_t id, const server_prompt_cache_state & state, size_t & n_bytes) {
+std::string pcache_disk_write(const std::string & path, uint64_t id, uint64_t fingerprint, const server_prompt_cache_state & state, size_t & n_bytes) {
     std::unique_ptr<FILE, decltype(&fclose)> file(fopen(path.c_str(), "wb"), fclose);
     if (!file) {
         return strerror(errno);
@@ -1880,11 +1915,15 @@ std::string pcache_disk_write(const std::string & path, uint64_t id, const serve
 
     w.put(PCACHE_DISK_MAGIC);
     w.put(PCACHE_DISK_VERSION);
+    w.put(fingerprint);
     w.put(id);
     w.put((uint64_t) state.prompt.tokens.size());
     w.put((uint64_t) state.data.main.size());
     w.put((uint64_t) state.data.drft.size());
     w.put((uint32_t) state.prompt.checkpoints.size());
+
+    const llama_tokens ids = pcache_token_ids(state.prompt.tokens);
+    w.put(ids.data(), ids.size() * sizeof(llama_token));
 
     for (const auto & ckpt : state.prompt.checkpoints) {
         w.put(ckpt.n_tokens);
@@ -1934,7 +1973,34 @@ std::string pcache_disk_write(const std::string & path, uint64_t id, const serve
     return w.err;
 }
 
-std::string pcache_disk_read(const std::string & path, uint64_t id, size_t n_tokens, server_prompt_cache_state & out, size_t & n_bytes) {
+// writes to a temporary file and renames it, so that a reader never sees a partial file
+std::string pcache_disk_store(const std::string & path, uint64_t id, uint64_t fingerprint, const server_prompt_cache_state & state, size_t & n_bytes) {
+    const std::string path_tmp = path + ".tmp";
+
+    std::string err;
+    try {
+        err = pcache_disk_write(path_tmp, id, fingerprint, state, n_bytes);
+    } catch (const std::exception & e) {
+        err = e.what();
+    }
+
+    std::error_code ec;
+    if (err.empty()) {
+        std::filesystem::rename(path_tmp, path, ec);
+        if (ec) {
+            err = ec.message();
+        }
+    }
+
+    if (!err.empty()) {
+        std::filesystem::remove(path_tmp, ec);
+    }
+
+    return err;
+}
+
+// reads the header and the token ids of a file left by a previous run, the payload stays unread
+std::string pcache_disk_peek(const std::string & path, uint64_t fingerprint, uint64_t & id, llama_tokens & tokens, size_t & n_bytes) {
     std::error_code ec;
     const uint64_t file_size = std::filesystem::file_size(path, ec);
     if (ec) {
@@ -1949,13 +2015,14 @@ std::string pcache_disk_read(const std::string & path, uint64_t id, size_t n_tok
     try {
         pcache_reader r { file.get(), file_size };
 
-        const uint32_t magic         = r.get<uint32_t>();
-        const uint32_t version       = r.get<uint32_t>();
-        const uint64_t file_id       = r.get<uint64_t>();
-        const uint64_t file_n_tokens = r.get<uint64_t>();
-        const uint64_t size_main     = r.get<uint64_t>();
-        const uint64_t size_drft     = r.get<uint64_t>();
-        const uint32_t n_checkpoints = r.get<uint32_t>();
+        const uint32_t magic            = r.get<uint32_t>();
+        const uint32_t version          = r.get<uint32_t>();
+        const uint64_t file_fingerprint = r.get<uint64_t>();
+        const uint64_t file_id          = r.get<uint64_t>();
+        const uint64_t n_tokens         = r.get<uint64_t>();
+        const uint64_t size_main        = r.get<uint64_t>();
+        const uint64_t size_drft        = r.get<uint64_t>();
+        const uint32_t n_checkpoints    = r.get<uint32_t>();
 
         if (!r.ok) {
             return "truncated header";
@@ -1965,8 +2032,83 @@ std::string pcache_disk_read(const std::string & path, uint64_t id, size_t n_tok
             return "bad magic or version";
         }
 
-        if (file_id != id || file_n_tokens != n_tokens) {
+        if (file_fingerprint != fingerprint) {
+            return "another model file or server build";
+        }
+
+        // lower bound only, the checkpoints are not walked
+        const uint64_t size_tokens = n_tokens * sizeof(llama_token);
+        const uint64_t size_rest   = n_checkpoints * PCACHE_DISK_CKPT_HEADER_SIZE + sizeof(uint64_t);
+
+        if (n_tokens == 0 || n_tokens > r.remaining / sizeof(llama_token) || !r.fits(size_tokens + size_rest, size_main, size_drft)) {
+            return "sizes in the header exceed the file size";
+        }
+
+        tokens.resize(n_tokens);
+        r.get(tokens.data(), size_tokens);
+
+        if (!r.ok) {
+            return "truncated file";
+        }
+
+        if (std::any_of(tokens.begin(), tokens.end(), [](llama_token t) { return t < 0; })) {
+            return "has media tokens";
+        }
+
+        id      = file_id;
+        n_bytes = file_size;
+    } catch (const std::exception & e) {
+        return e.what();
+    }
+
+    return "";
+}
+
+std::string pcache_disk_read(const std::string & path, uint64_t id, uint64_t fingerprint, const server_tokens & tokens, server_prompt_cache_state & out, size_t & n_bytes) {
+    std::error_code ec;
+    const uint64_t file_size = std::filesystem::file_size(path, ec);
+    if (ec) {
+        return ec.message();
+    }
+
+    std::unique_ptr<FILE, decltype(&fclose)> file(fopen(path.c_str(), "rb"), fclose);
+    if (!file) {
+        return strerror(errno);
+    }
+
+    try {
+        pcache_reader r { file.get(), file_size };
+
+        const uint32_t magic            = r.get<uint32_t>();
+        const uint32_t version          = r.get<uint32_t>();
+        const uint64_t file_fingerprint = r.get<uint64_t>();
+        const uint64_t file_id          = r.get<uint64_t>();
+        const uint64_t file_n_tokens    = r.get<uint64_t>();
+        const uint64_t size_main        = r.get<uint64_t>();
+        const uint64_t size_drft        = r.get<uint64_t>();
+        const uint32_t n_checkpoints    = r.get<uint32_t>();
+
+        if (!r.ok) {
+            return "truncated header";
+        }
+
+        if (magic != PCACHE_DISK_MAGIC || version != PCACHE_DISK_VERSION || file_fingerprint != fingerprint) {
+            return "bad magic, version or fingerprint";
+        }
+
+        if (file_id != id || file_n_tokens != tokens.size()) {
             return "header does not match the index";
+        }
+
+        llama_tokens ids(tokens.size());
+        r.get(ids.data(), ids.size() * sizeof(llama_token));
+
+        if (!r.ok) {
+            return "truncated token ids";
+        }
+
+        if (ids != pcache_token_ids(tokens)) {
+            return "token ids do not match the index";
         }
 
         if (!r.fits(size_main, size_drft) || n_checkpoints > r.remaining / PCACHE_DISK_CKPT_HEADER_SIZE) {
@@ -2020,15 +2162,52 @@ std::string pcache_disk_read(const std::string & path, uint64_t id, size_t n_tok
 
 } // namespace
 
-server_prompt_cache_disk::server_prompt_cache_disk(const std::string & dir, const std::string & prefix, size_t limit_size)
-    : dir(dir), prefix(prefix), limit_size(limit_size) {
+uint64_t server_prompt_cache_disk::make_fingerprint(const std::string & model_path) {
+    uint64_t h = pcache_hash_file(PCACHE_HASH_SEED, model_path);
+
+    const std::string commit = llama_commit();
+    h = pcache_hash(h, commit.data(), commit.size());
+
+#if defined(__linux__)
+    // the commit is "unknown" in some container builds, the binary tells the builds apart
+    h = pcache_hash_file(h, "/proc/self/exe");
+#endif
+
+    return h;
+}
+
+server_prompt_cache_disk::server_prompt_cache_disk(const std::string & dir, const std::string & prefix, size_t limit_size, uint64_t fingerprint, bool has_mtmd)
+    : dir(dir), prefix(prefix), limit_size(limit_size), fingerprint(fingerprint) {
     size_t n_removed = 0;
 
     std::error_code ec;
     std::filesystem::directory_iterator it(dir, ec);
     for (; !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+        const std::filesystem::path path = it->path();
+        if (!pcache_disk_is_own_file(path.filename().string(), prefix)) {
+            continue;
+        }
+
+        uint64_t     id = 0;
+        llama_tokens tokens;
+        size_t       n_bytes = 0;
+
+        std::string err = path.extension() == ".pcache" ? pcache_disk_peek(path.string(), fingerprint, id, tokens, n_bytes) : "unfinished write";
+
+        if (err.empty() && path.filename().string() != prefix + std::to_string(id) + ".pcache") {
+            err = "file name does not match the header";
+        }
+
+        if (err.empty()) {
+            index.push_back({ server_tokens(tokens, has_mtmd), path.string(), n_bytes, false, id });
+
+            continue;
+        }
+
+        SRV_DBG("prompt cache disk: removing %s: %s\n", path.string().c_str(), err.c_str());
+
         std::error_code ec_remove;
-        if (pcache_disk_is_own_file(it->path().filename().string(), prefix) && std::filesystem::remove(it->path(), ec_remove)) {
+        if (std::filesystem::remove(path, ec_remove)) {
             n_removed++;
         }
     }
@@ -2036,29 +2215,36 @@ server_prompt_cache_disk::server_prompt_cache_disk(const std::string & dir, cons
         throw std::runtime_error("cannot list " + dir + ": " + ec.message());
     }
 
-    SRV_INF("prompt cache disk: dir %s, limit %.0f MiB, removed %zu stale files\n",
-            dir.c_str(), limit_size / (1024.0 * 1024.0), n_removed);
+    index.sort([](const entry & a, const entry & b) { return a.id < b.id; });
+
+    // the worker has not started yet
+    next_id = index.empty() ? 0 : index.back().id + 1;
+
+    enforce_limit();
+
+    SRV_INF("prompt cache disk: dir %s, limit %.0f MiB, indexed %zu entries, %.1f MiB from a previous run, removed %zu stale files\n",
+            dir.c_str(), limit_size / (1024.0 * 1024.0), index.size(), indexed_size() / (1024.0 * 1024.0), n_removed);
 
     worker = std::thread([this] { worker_loop(); });
 }
 
 server_prompt_cache_disk::~server_prompt_cache_disk() {
+    stop_worker();
+}
+
+void server_prompt_cache_disk::stop_worker() {
     {
         std::lock_guard<std::mutex> lock(mtx);
         stop = true;
-        pending.clear();
-        pending_bytes = 0;
     }
     cv.notify_all();
-    worker.join();
+
+    if (worker.joinable()) {
+        worker.join();
+    }
 
     // the write that was running at stop lands in done
     receive();
-
-    std::error_code ec;
-    for (const auto & e : index) {
-        std::filesystem::remove(e.path, ec);
-    }
 }
 
 void server_prompt_cache_disk::worker_loop() {
@@ -2090,31 +2276,15 @@ void server_prompt_cache_disk::worker_loop() {
 
         const uint64_t id       = next_id++;
         const size_t   n_tokens = state.prompt.tokens.size();
-        const std::string path     = pcache_disk_path(dir, prefix, id);
-        const std::string path_tmp = path + ".tmp";
+        const std::string path  = pcache_disk_path(dir, prefix, id);
 
         const int64_t t_start = ggml_time_us();
 
         size_t n_bytes = 0;
-        std::string err;
-        try {
-            err = pcache_disk_write(path_tmp, id, state, n_bytes);
-        } catch (const std::exception & e) {
-            err = e.what();
-        }
-
-        std::error_code ec;
-        if (err.empty()) {
-            std::filesystem::rename(path_tmp, path, ec);
-            if (ec) {
-                err = ec.message();
-            }
-        }
+        const std::string err = pcache_disk_store(path, id, fingerprint, state, n_bytes);
 
         if (!err.empty()) {
             SRV_WRN("prompt cache disk: failed to write %zu-token entry: %s\n", n_tokens, err.c_str());
-
-            std::filesystem::remove(path_tmp, ec);
 
             continue;
         }
@@ -2193,7 +2363,7 @@ bool server_prompt_cache_disk::take(const server_tokens & tokens_new, float & f_
     const int64_t t_start = ggml_time_us();
 
     size_t n_bytes = 0;
-    const std::string err = pcache_disk_read(it_best->path, it_best->id, n_tokens, out, n_bytes);
+    const std::string err = pcache_disk_read(it_best->path, it_best->id, fingerprint, it_best->tokens, out, n_bytes);
 
     if (err.empty()) {
         out.prompt.tokens = std::move(it_best->tokens);
@@ -2264,6 +2434,88 @@ void server_prompt_cache_disk::remove_contained(const server_tokens & tokens) {
     }
 }
 
+void server_prompt_cache_disk::flush(std::list<server_prompt_cache_state> && states, int64_t deadline_ms) {
+    stop_worker();
+
+    // what the worker did not reach was evicted before everything that is in the RAM cache
+    states.splice(states.begin(), pending);
+    pending_bytes = 0;
+
+    const int64_t t_start = ggml_time_us();
+
+    // ids grow with the age of the state, the newest is written first
+    const uint64_t id_first = next_id;
+    next_id += states.size();
+
+    size_t n_written = 0;
+    size_t n_bytes_written = 0;
+    size_t n_failed = 0;
+    size_t n_media = 0;
+    size_t n_contained = 0;
+    size_t n_late = 0;
+
+    const auto is_in_longer_state = [&states](const server_tokens & tokens) {
+        return std::any_of(states.begin(), states.end(), [&tokens](const server_prompt_cache_state & other) {
+            return other.prompt.tokens.size() > tokens.size() && !pcache_has_media(other.prompt.tokens) &&
+                    other.prompt.tokens.get_common_prefix(tokens) == tokens.size();
+        });
+    };
+
+    while (!states.empty()) {
+        const uint64_t id = id_first + states.size() - 1;
+
+        server_prompt_cache_state state = std::move(states.back());
+        states.pop_back();
+
+        if (pcache_has_media(state.prompt.tokens)) {
+            n_media++;
+
+            continue;
+        }
+
+        if (is_contained(state.prompt.tokens) || is_in_longer_state(state.prompt.tokens)) {
+            n_contained++;
+
+            continue;
+        }
+
+        // assume 1 GB/s: a write that runs past the deadline can be force-killed by the router
+        if (ggml_time_ms() + (int64_t) (state.size() >> 20) > deadline_ms) {
+            n_late++;
+
+            continue;
+        }
+
+        const std::string path = pcache_disk_path(dir, prefix, id);
+
+        size_t n_bytes = 0;
+        const std::string err = pcache_disk_store(path, id, fingerprint, state, n_bytes);
+
+        if (!err.empty()) {
+            SRV_WRN("prompt cache disk: failed to write %zu-token entry: %s\n", state.prompt.tokens.size(), err.c_str());
+
+            n_failed++;
+
+            continue;
+        }
+
+        // the index stays sorted by id
+        remove_contained(state.prompt.tokens);
+        index.insert(std::find_if(index.begin(), index.end(), [id](const entry & e) { return e.id > id; }),
+                entry{ std::move(state.prompt.tokens), path, n_bytes, false, id });
+
+        n_written++;
+        n_bytes_written += n_bytes;
+    }
+
+    states.clear();
+
+    enforce_limit();
+
+    SRV_INF("prompt cache disk: exit flush wrote %zu entries, %.1f MiB in %.0f ms, skipped %zu with media, %zu contained, %zu past the deadline, %zu failed\n",
+            n_written, n_bytes_written / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0, n_media, n_contained, n_late, n_failed);
+}
+
 size_t server_prompt_cache_disk::n_entries() {
     collect();
 
@@ -2299,6 +2551,12 @@ void server_prompt_cache_disk::enforce_limit() {
 
         remove_entry(it_oldest);
     }
+}
+
+bool server_prompt_cache_disk::is_contained(const server_tokens & tokens) const {
+    return std::any_of(index.begin(), index.end(), [&tokens](const entry & e) {
+        return e.tokens.get_common_prefix(tokens) == tokens.size();
+    });
 }
 
 size_t server_prompt_cache_disk::indexed_size() const {

@@ -80,7 +80,7 @@ static std::vector<llama_token> server_accept_replay(
     return result;
 }
 
-static std::unique_ptr<server_prompt_cache_disk> server_make_prompt_cache_disk(const std::string & model_path) {
+static std::unique_ptr<server_prompt_cache_disk> server_make_prompt_cache_disk(const std::string & model_path, bool has_mtmd) {
     const char * dir = getenv("LLAMA_PROMPT_CACHE_DISK_DIR");
     if (dir == nullptr || dir[0] == '\0') {
         return nullptr;
@@ -100,7 +100,9 @@ static std::unique_ptr<server_prompt_cache_disk> server_make_prompt_cache_disk(c
 
         std::filesystem::create_directories(dir);
 
-        return std::make_unique<server_prompt_cache_disk>(dir, prefix, limit_mib*1024*1024);
+        const uint64_t fingerprint = server_prompt_cache_disk::make_fingerprint(model_path);
+
+        return std::make_unique<server_prompt_cache_disk>(dir, prefix, limit_mib*1024*1024, fingerprint, has_mtmd);
     } catch (const std::exception & e) {
         SRV_ERR("prompt cache disk: disabled, %s\n", e.what());
 
@@ -1578,7 +1580,7 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
-            prompt_cache->disk = server_make_prompt_cache_disk(params_base.model.path);
+            prompt_cache->disk = server_make_prompt_cache_disk(params_base.model.path, mctx != nullptr);
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -2022,6 +2024,55 @@ private:
         }
 
         return ret;
+    }
+
+    // writes the idle slots and the RAM prompt cache to the disk tier, so that the next run resumes from them
+    // env LLAMA_PROMPT_CACHE_DISK_EXIT_MS is the time budget, 0 disables it
+    void save_prompt_cache_on_exit() {
+        if (sleeping || ctx_tgt == nullptr || !prompt_cache || !prompt_cache->disk) {
+            return;
+        }
+
+        int64_t budget_ms = 8000;
+
+        if (const char * budget_str = getenv("LLAMA_PROMPT_CACHE_DISK_EXIT_MS")) {
+            try {
+                budget_ms = std::stoll(budget_str);
+            } catch (const std::exception &) {
+                SRV_WRN("prompt cache disk: ignoring LLAMA_PROMPT_CACHE_DISK_EXIT_MS=%s\n", budget_str);
+            }
+        }
+
+        if (budget_ms <= 0) {
+            return;
+        }
+
+        const int64_t deadline_ms = ggml_time_ms() + budget_ms;
+
+        try {
+            // no eviction from here on, the flush takes every entry
+            prompt_cache->limit_size = 0;
+            prompt_cache->release();
+
+            std::vector<server_slot *> idle_slots;
+            for (server_slot & slot : slots) {
+                if (!slot.is_processing()) {
+                    idle_slots.push_back(&slot);
+                }
+            }
+
+            // the most recently used slot is saved last, so it is the newest entry
+            std::sort(idle_slots.begin(), idle_slots.end(),
+                    [](const server_slot * a, const server_slot * b) { return a->t_last_used < b->t_last_used; });
+
+            for (server_slot * slot : idle_slots) {
+                slot->prompt_save(*prompt_cache);
+            }
+
+            prompt_cache->disk->flush(std::move(prompt_cache->states), deadline_ms);
+        } catch (const std::exception & e) {
+            SRV_ERR("prompt cache disk: exit flush failed: %s\n", e.what());
+        }
     }
 
     // return true if at least one slot has been cleared
@@ -4994,6 +5045,7 @@ bool server_context::load_model(common_params & params) {
 void server_context::start_loop() {
     auto & params = impl->params_base;
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
+    impl->save_prompt_cache_on_exit();
 }
 
 void server_context::terminate() {

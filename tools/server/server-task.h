@@ -660,9 +660,13 @@ struct server_prompt_cache_state {
 
 // disk tier of server_prompt_cache: entries evicted from RAM are written to files by a background thread
 // the index is owned by the main thread, the mutex only guards the two lists shared with the writer
+// the files outlive the instance: the constructor indexes those left by a run with the same fingerprint
 struct server_prompt_cache_disk {
-    server_prompt_cache_disk(const std::string & dir, const std::string & prefix, size_t limit_size);
+    server_prompt_cache_disk(const std::string & dir, const std::string & prefix, size_t limit_size, uint64_t fingerprint, bool has_mtmd);
     ~server_prompt_cache_disk();
+
+    // identifies the model file and the server build, a file of another fingerprint is not reused
+    static uint64_t make_fingerprint(const std::string & model_path);
 
     // hand an evicted entry to the writer, it is dropped when too much is already waiting
     void push(server_prompt_cache_state && state);
@@ -675,6 +679,10 @@ struct server_prompt_cache_disk {
     void unpin();
 
     void remove_contained(const server_tokens & tokens);
+
+    // exit only: stops the writer, then writes the states (given oldest first) and the entries the writer did not reach, newest first
+    // a state is skipped when it has media, when another entry contains it or when the deadline (ggml_time_ms) has passed
+    void flush(std::list<server_prompt_cache_state> && states, int64_t deadline_ms);
 
     size_t n_entries();
 
@@ -694,12 +702,15 @@ private:
     void receive();
     void enforce_limit();
     size_t indexed_size() const;
+    bool is_contained(const server_tokens & tokens) const;
     void remove_entry(std::list<entry>::iterator it);
+    void stop_worker();
     void worker_loop();
 
     std::string dir;
     std::string prefix;
     size_t limit_size;
+    uint64_t fingerprint;
 
     std::list<entry> index; // oldest first
 
@@ -711,7 +722,7 @@ private:
     size_t                               pending_bytes = 0;
     std::list<entry>                     done;
 
-    uint64_t next_id = 0; // worker thread only
+    uint64_t next_id = 0; // worker thread only, flush() once the worker has stopped
 
     std::thread worker;
 };
