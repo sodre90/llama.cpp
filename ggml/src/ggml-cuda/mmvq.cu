@@ -2893,8 +2893,8 @@ bool ggml_cuda_hc_up_pre_check_enabled() {
 }
 
 bool ggml_cuda_mmvq_hc_up_pre_supported(const ggml_tensor * w_up, const int64_t ncols_dst, const int cc) {
-    constexpr ggml_type type = GGML_TYPE_IQ4_NL;
-    if (!ggml_cuda_hc_up_pre_fusion() || w_up->type != type || ncols_dst < 1 || ncols_dst > 4) {
+    const ggml_type type = w_up->type;
+    if (!ggml_cuda_hc_up_pre_fusion() || (type != GGML_TYPE_IQ4_NL && type != GGML_TYPE_Q8_0) || ncols_dst < 1 || ncols_dst > 4) {
         return false;
     }
 
@@ -2906,14 +2906,8 @@ bool ggml_cuda_mmvq_hc_up_pre_supported(const ggml_tensor * w_up, const int64_t 
 
     const mmvq_parameter_table_id table_id = get_device_table_id(cc);
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
-    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
-    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = get_vdr_mmvq(type);
-    const int blocks_per_row_x      = ncols_x / qk;
-    const int blocks_per_iter_1warp = vdr * warp_size / qi;
 
-    return table_id == MMVQ_PARAMETERS_RDNA4 && warp_size == 32 && blocks_per_row_x <= blocks_per_iter_1warp &&
-        mmvq_should_use_small_k<type>(cc, table_id, blocks_per_row_x, blocks_per_iter_1warp, 1);
+    return table_id == MMVQ_PARAMETERS_RDNA4 && warp_size == 32 && mmvq_type_small_k_one_col(type, cc, table_id, (int) ncols_x, warp_size);
 }
 
 bool ggml_cuda_hc_up_pre_supported(const ggml_tensor * scale_node, const ggml_tensor * mm_node, const ggml_tensor * pre_node, const int cc) {
@@ -2931,7 +2925,7 @@ bool ggml_cuda_hc_up_pre_supported(const ggml_tensor * scale_node, const ggml_te
         mm_node->type == GGML_TYPE_F32 && ggml_is_contiguous(mm_node) && mm_node->ne[0] == n_embd*hc && mm_node->ne[1] == nt;
 }
 
-template <int c_ncols_dst>
+template <ggml_type type, int c_ncols_dst>
 static void mmvq_hc_up_pre_launch(
         const float * lo, const void * vx, const float * xn, float * dst, block_q8_1 * dst_q8_1,
         const float lo_scale, const float lo_bias, const float pre_scale,
@@ -2943,7 +2937,7 @@ static void mmvq_hc_up_pre_launch(
     const dim3 block_nums(n_embd / mmvq_hc_up_pre_outputs + n_inject_blocks, 1, 1);
     const dim3 block_dims(32, mmvq_hc_up_pre_warps, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q_hc_up_pre<GGML_TYPE_IQ4_NL, c_ncols_dst>, launch_params,
+    ggml_cuda_kernel_launch(mul_mat_vec_q_hc_up_pre<type, c_ncols_dst>, launch_params,
         lo, vx, xn, dst, dst_q8_1, lo_scale, lo_bias, pre_scale, ncols_x, n_embd, hc, stride_row_x, sx0, sx1, sx2, sd0, sd1,
         inject_x, inject_y, inject_dst, inject_nrows, inject_stride_row, inject_stride_col_y, inject_stride_col_dst, inject_ncols);
 }
@@ -3039,8 +3033,8 @@ static void mmvq_hc_up_pre_check(ggml_backend_cuda_context & ctx, const ggml_ten
     const bool first_of_ncols = n_checked_ncols[nt].fetch_add(1) == 0;
     const int64_t n_seen_inject = n_checked_inject.fetch_add(inject_node != nullptr) + (inject_node != nullptr);
     if (n_diff != 0 || n_diff_q8_1 != 0 || n_diff_inject != 0 || n_seen % 1000 == 1 || first_of_ncols) {
-        GGML_LOG_WARN("hc_up_pre_check: ncols=%d K=%d n_embd=%d %" PRId64 " values differ, %" PRId64 " q8_1 bytes differ, inject %" PRId64 " values differ (%" PRId64 " checked, %" PRId64 " with inject)\n",
-                (int) nt, (int) ncols_x, (int) n_embd, n_diff, n_diff_q8_1, n_diff_inject, n_seen, n_seen_inject);
+        GGML_LOG_WARN("hc_up_pre_check: type=%s ncols=%d K=%d n_embd=%d %" PRId64 " values differ, %" PRId64 " q8_1 bytes differ, inject %" PRId64 " values differ (%" PRId64 " checked, %" PRId64 " with inject)\n",
+                ggml_type_name(w_up->type), (int) nt, (int) ncols_x, (int) n_embd, n_diff, n_diff_q8_1, n_diff_inject, n_seen, n_seen_inject);
     }
     GGML_ASSERT(n_diff == 0 && n_diff_q8_1 == 0 && n_diff_inject == 0);
 }
@@ -3081,8 +3075,8 @@ void ggml_cuda_op_mul_mat_vec_q_hc_up_pre(ggml_backend_cuda_context & ctx,
         inject_ncols          = inject_w->ne[0];
     }
 
-    const auto launch = [&](auto ncols_tag) {
-        mmvq_hc_up_pre_launch<decltype(ncols_tag)::value>(
+    const auto launch = [&](auto type_tag, auto ncols_tag) {
+        mmvq_hc_up_pre_launch<decltype(type_tag)::value, decltype(ncols_tag)::value>(
             (const float *) lo->data, w_up->data, (const float *) xn->data, (float *) pre_node->data, dst_q8_1,
             scale[0], scale[1], pre_scale, ncols_x, n_embd, hc, w_up->nb[1] / ggml_type_size(w_up->type),
             xn->nb[0] / sizeof(float), xn->nb[1] / sizeof(float), xn->nb[2] / sizeof(float),
@@ -3090,21 +3084,35 @@ void ggml_cuda_op_mul_mat_vec_q_hc_up_pre(ggml_backend_cuda_context & ctx,
             inject_x, inject_y, inject_dst, inject_nrows, inject_stride_row, inject_stride_col_y, inject_stride_col_dst, inject_ncols, ctx.stream());
     };
 
-    switch (nt) {
-        case 1:
-            launch(std::integral_constant<int, 1>{});
+    const auto launch_ncols = [&](auto type_tag) {
+        switch (nt) {
+            case 1:
+                launch(type_tag, std::integral_constant<int, 1>{});
+                break;
+            case 2:
+                launch(type_tag, std::integral_constant<int, 2>{});
+                break;
+            case 3:
+                launch(type_tag, std::integral_constant<int, 3>{});
+                break;
+            case 4:
+                launch(type_tag, std::integral_constant<int, 4>{});
+                break;
+            default:
+                GGML_ABORT("fatal error");
+                break;
+        }
+    };
+
+    switch (w_up->type) {
+        case GGML_TYPE_IQ4_NL:
+            launch_ncols(std::integral_constant<ggml_type, GGML_TYPE_IQ4_NL>{});
             break;
-        case 2:
-            launch(std::integral_constant<int, 2>{});
-            break;
-        case 3:
-            launch(std::integral_constant<int, 3>{});
-            break;
-        case 4:
-            launch(std::integral_constant<int, 4>{});
+        case GGML_TYPE_Q8_0:
+            launch_ncols(std::integral_constant<ggml_type, GGML_TYPE_Q8_0>{});
             break;
         default:
-            GGML_ABORT("fatal error");
+            GGML_ABORT("unsupported type for hc up+pre: %s", ggml_type_name(w_up->type));
             break;
     }
 
