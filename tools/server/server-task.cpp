@@ -1755,7 +1755,7 @@ json server_task_result_apply_lora::to_json() {
 namespace {
 
 constexpr uint32_t PCACHE_DISK_MAGIC   = 0x4443504c; // "LPCD"
-constexpr uint32_t PCACHE_DISK_VERSION = 2;
+constexpr uint32_t PCACHE_DISK_VERSION = 3;
 
 constexpr size_t PCACHE_DISK_CKPT_HEADER_SIZE = 8 + 3*4 + 3*8;
 
@@ -1861,27 +1861,137 @@ uint64_t pcache_hash_file(uint64_t h, const std::string & path) {
     return pcache_hash(h, &mtime, sizeof(mtime));
 }
 
-static_assert(sizeof(llama_token) == sizeof(int32_t), "the file stores the token ids as int32");
+static_assert(sizeof(llama_token) == sizeof(int32_t), "the file stores the keys as int32");
 
-llama_tokens pcache_token_ids(const server_tokens & tokens) {
-    llama_tokens ids(tokens.size());
-
-    for (size_t i = 0; i < ids.size(); ++i) {
-        ids[i] = tokens[i];
+// the media chunk that starts at idx, nullptr if none does
+const mtmd_input_chunk * pcache_chunk_at(const server_tokens & tokens, size_t idx) {
+    try {
+        return tokens.find_chunk(idx).get();
+    } catch (const std::exception &) {
+        return nullptr;
     }
-
-    return ids;
 }
 
-// the file has no media chunks, only the placeholder tokens
-bool pcache_has_media(const server_tokens & tokens) {
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        if (tokens[i] == LLAMA_TOKEN_NULL) {
-            return true;
+// a key in [INT32_MIN + 1, -2]: neither a token id nor LLAMA_TOKEN_NULL
+llama_token pcache_media_key(uint64_t chunk_hash, uint64_t idx_in_chunk) {
+    const uint64_t h = pcache_hash(chunk_hash, &idx_in_chunk, sizeof(idx_in_chunk));
+
+    return -2 - (llama_token) ((uint32_t) (h ^ (h >> 32)) % 0x7ffffffeu);
+}
+
+// the file and the index hold keys: a text position keeps its token id, a media position gets a negative key
+// LLAMA_TOKEN_NULL marks a position without key (media chunk without id)
+llama_tokens pcache_keys(const server_tokens & tokens) {
+    llama_tokens keys(tokens.size(), LLAMA_TOKEN_NULL);
+
+    size_t n_run = 1;
+    for (size_t i = 0; i < keys.size(); i += n_run) {
+        n_run = 1;
+
+        if (tokens[i] >= 0) {
+            keys[i] = tokens[i];
+
+            continue;
+        }
+
+        const mtmd_input_chunk * chunk = pcache_chunk_at(tokens, i);
+        if (chunk == nullptr) {
+            continue;
+        }
+
+        const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+        if (n_tokens == 0 || n_tokens > keys.size() - i) {
+            continue;
+        }
+
+        n_run = n_tokens;
+
+        const char * id = mtmd_input_chunk_get_id(chunk);
+        if (id == nullptr || id[0] == '\0') {
+            continue;
+        }
+
+        const uint64_t shape[3] = { strlen(id), n_tokens, (uint64_t) mtmd_input_chunk_get_n_pos(chunk) };
+
+        uint64_t chunk_hash = pcache_hash(PCACHE_HASH_SEED, shape, sizeof(shape));
+        chunk_hash = pcache_hash(chunk_hash, id, shape[0]);
+
+        for (size_t j = 0; j < n_tokens; ++j) {
+            keys[i + j] = pcache_media_key(chunk_hash, j);
         }
     }
 
-    return false;
+    return keys;
+}
+
+bool pcache_has_unkeyable(const llama_tokens & keys) {
+    return std::find(keys.begin(), keys.end(), LLAMA_TOKEN_NULL) != keys.end();
+}
+
+bool pcache_is_media_key(llama_token key) {
+    return key < 0;
+}
+
+size_t pcache_key_prefix(const llama_tokens & a, const llama_tokens & b) {
+    return std::mismatch(a.begin(), a.end(), b.begin(), b.end()).first - a.begin();
+}
+
+// the longer entry serves every request of the shorter one only if it has no media after the shorter prefix
+bool pcache_covers(const llama_tokens & longer, const llama_tokens & shorter) {
+    return pcache_key_prefix(longer, shorter) == shorter.size() && std::none_of(longer.begin() + shorter.size(), longer.end(), pcache_is_media_key);
+}
+
+// a prefix that ends inside a media chunk of the request moves back to the start of the chunk
+size_t pcache_round_down_to_chunk_start(const server_tokens & tokens, size_t n) {
+    if (n == 0 || n >= tokens.size() || tokens[n - 1] != LLAMA_TOKEN_NULL || tokens[n] != LLAMA_TOKEN_NULL) {
+        return n;
+    }
+
+    while (n > 0 && pcache_chunk_at(tokens, n) == nullptr) {
+        n--;
+    }
+
+    return n;
+}
+
+// the prefix of the request that an entry restores, 0 = no match
+// 0 also if media is left in the entry after the prefix: the restored tokens take the chunks from the request
+size_t pcache_usable_prefix(const llama_tokens & entry_keys, const llama_tokens & keys_new, const server_tokens & tokens_new) {
+    const size_t n_match = pcache_round_down_to_chunk_start(tokens_new, pcache_key_prefix(entry_keys, keys_new));
+
+    return std::any_of(entry_keys.begin() + n_match, entry_keys.end(), pcache_is_media_key) ? 0 : n_match;
+}
+
+// the matched prefix comes from the request, the rest is the text of the entry
+// the chunks are placeholders like in a slot prompt: their KV is restored, so their data is not needed
+server_tokens pcache_restored_tokens(const llama_tokens & entry_keys, size_t n_match, const server_tokens & tokens_new) {
+    if (std::none_of(entry_keys.begin(), entry_keys.end(), pcache_is_media_key)) {
+        return server_tokens(entry_keys, tokens_new.has_mtmd);
+    }
+
+    server_tokens res;
+    res.has_mtmd = tokens_new.has_mtmd;
+
+    for (size_t i = 0; i < n_match;) {
+        if (tokens_new[i] != LLAMA_TOKEN_NULL) {
+            res.push_back(tokens_new[i++]);
+
+            continue;
+        }
+
+        const mtmd_input_chunk * chunk = pcache_chunk_at(tokens_new, i);
+        const size_t n_chunk = chunk ? mtmd_input_chunk_get_n_tokens(chunk) : 0;
+        if (n_chunk == 0 || n_chunk > n_match - i) {
+            throw std::runtime_error("prefix does not end at a media chunk boundary");
+        }
+
+        res.push_back_placeholder(chunk);
+        i += n_chunk;
+    }
+
+    res.insert(llama_tokens(entry_keys.begin() + n_match, entry_keys.end()));
+
+    return res;
 }
 
 std::string pcache_disk_path(const std::string & dir, const std::string & prefix, uint64_t id) {
@@ -1905,7 +2015,7 @@ bool pcache_disk_is_own_file(const std::string & name, const std::string & prefi
 }
 
 // returns the reason on failure, empty on success
-std::string pcache_disk_write(const std::string & path, uint64_t id, uint64_t fingerprint, const server_prompt_cache_state & state, size_t & n_bytes) {
+std::string pcache_disk_write(const std::string & path, uint64_t id, uint64_t fingerprint, const llama_tokens & keys, const server_prompt_cache_state & state, size_t & n_bytes) {
     std::unique_ptr<FILE, decltype(&fclose)> file(fopen(path.c_str(), "wb"), fclose);
     if (!file) {
         return strerror(errno);
@@ -1917,13 +2027,12 @@ std::string pcache_disk_write(const std::string & path, uint64_t id, uint64_t fi
     w.put(PCACHE_DISK_VERSION);
     w.put(fingerprint);
     w.put(id);
-    w.put((uint64_t) state.prompt.tokens.size());
+    w.put((uint64_t) keys.size());
     w.put((uint64_t) state.data.main.size());
     w.put((uint64_t) state.data.drft.size());
     w.put((uint32_t) state.prompt.checkpoints.size());
 
-    const llama_tokens ids = pcache_token_ids(state.prompt.tokens);
-    w.put(ids.data(), ids.size() * sizeof(llama_token));
+    w.put(keys.data(), keys.size() * sizeof(llama_token));
 
     for (const auto & ckpt : state.prompt.checkpoints) {
         w.put(ckpt.n_tokens);
@@ -1974,12 +2083,12 @@ std::string pcache_disk_write(const std::string & path, uint64_t id, uint64_t fi
 }
 
 // writes to a temporary file and renames it, so that a reader never sees a partial file
-std::string pcache_disk_store(const std::string & path, uint64_t id, uint64_t fingerprint, const server_prompt_cache_state & state, size_t & n_bytes) {
+std::string pcache_disk_store(const std::string & path, uint64_t id, uint64_t fingerprint, const llama_tokens & keys, const server_prompt_cache_state & state, size_t & n_bytes) {
     const std::string path_tmp = path + ".tmp";
 
     std::string err;
     try {
-        err = pcache_disk_write(path_tmp, id, fingerprint, state, n_bytes);
+        err = pcache_disk_write(path_tmp, id, fingerprint, keys, state, n_bytes);
     } catch (const std::exception & e) {
         err = e.what();
     }
@@ -1999,8 +2108,8 @@ std::string pcache_disk_store(const std::string & path, uint64_t id, uint64_t fi
     return err;
 }
 
-// reads the header and the token ids of a file left by a previous run, the payload stays unread
-std::string pcache_disk_peek(const std::string & path, uint64_t fingerprint, uint64_t & id, llama_tokens & tokens, size_t & n_bytes) {
+// reads the header and the keys of a file left by a previous run, the payload stays unread
+std::string pcache_disk_peek(const std::string & path, uint64_t fingerprint, uint64_t & id, llama_tokens & keys, size_t & n_bytes) {
     std::error_code ec;
     const uint64_t file_size = std::filesystem::file_size(path, ec);
     if (ec) {
@@ -2044,15 +2153,15 @@ std::string pcache_disk_peek(const std::string & path, uint64_t fingerprint, uin
             return "sizes in the header exceed the file size";
         }
 
-        tokens.resize(n_tokens);
-        r.get(tokens.data(), size_tokens);
+        keys.resize(n_tokens);
+        r.get(keys.data(), size_tokens);
 
         if (!r.ok) {
             return "truncated file";
         }
 
-        if (std::any_of(tokens.begin(), tokens.end(), [](llama_token t) { return t < 0; })) {
-            return "has media tokens";
+        if (pcache_has_unkeyable(keys)) {
+            return "has media without key";
         }
 
         id      = file_id;
@@ -2064,7 +2173,7 @@ std::string pcache_disk_peek(const std::string & path, uint64_t fingerprint, uin
     return "";
 }
 
-std::string pcache_disk_read(const std::string & path, uint64_t id, uint64_t fingerprint, const server_tokens & tokens, server_prompt_cache_state & out, size_t & n_bytes) {
+std::string pcache_disk_read(const std::string & path, uint64_t id, uint64_t fingerprint, const llama_tokens & keys, server_prompt_cache_state & out, size_t & n_bytes) {
     std::error_code ec;
     const uint64_t file_size = std::filesystem::file_size(path, ec);
     if (ec) {
@@ -2096,19 +2205,19 @@ std::string pcache_disk_read(const std::string & path, uint64_t id, uint64_t fin
             return "bad magic, version or fingerprint";
         }
 
-        if (file_id != id || file_n_tokens != tokens.size()) {
+        if (file_id != id || file_n_tokens != keys.size()) {
             return "header does not match the index";
         }
 
-        llama_tokens ids(tokens.size());
-        r.get(ids.data(), ids.size() * sizeof(llama_token));
+        llama_tokens file_keys(keys.size());
+        r.get(file_keys.data(), file_keys.size() * sizeof(llama_token));
 
         if (!r.ok) {
-            return "truncated token ids";
+            return "truncated keys";
         }
 
-        if (ids != pcache_token_ids(tokens)) {
-            return "token ids do not match the index";
+        if (file_keys != keys) {
+            return "keys do not match the index";
         }
 
         if (!r.fits(size_main, size_drft) || n_checkpoints > r.remaining / PCACHE_DISK_CKPT_HEADER_SIZE) {
@@ -2162,8 +2271,13 @@ std::string pcache_disk_read(const std::string & path, uint64_t id, uint64_t fin
 
 } // namespace
 
-uint64_t server_prompt_cache_disk::make_fingerprint(const std::string & model_path) {
+uint64_t server_prompt_cache_disk::make_fingerprint(const std::string & model_path, const std::string & mmproj_path) {
     uint64_t h = pcache_hash_file(PCACHE_HASH_SEED, model_path);
+
+    // the KV of an image depends on the projector
+    if (!mmproj_path.empty()) {
+        h = pcache_hash_file(h, mmproj_path);
+    }
 
     const std::string commit = llama_commit();
     h = pcache_hash(h, commit.data(), commit.size());
@@ -2176,7 +2290,7 @@ uint64_t server_prompt_cache_disk::make_fingerprint(const std::string & model_pa
     return h;
 }
 
-server_prompt_cache_disk::server_prompt_cache_disk(const std::string & dir, const std::string & prefix, size_t limit_size, uint64_t fingerprint, bool has_mtmd)
+server_prompt_cache_disk::server_prompt_cache_disk(const std::string & dir, const std::string & prefix, size_t limit_size, uint64_t fingerprint)
     : dir(dir), prefix(prefix), limit_size(limit_size), fingerprint(fingerprint) {
     size_t n_removed = 0;
 
@@ -2189,17 +2303,17 @@ server_prompt_cache_disk::server_prompt_cache_disk(const std::string & dir, cons
         }
 
         uint64_t     id = 0;
-        llama_tokens tokens;
+        llama_tokens keys;
         size_t       n_bytes = 0;
 
-        std::string err = path.extension() == ".pcache" ? pcache_disk_peek(path.string(), fingerprint, id, tokens, n_bytes) : "unfinished write";
+        std::string err = path.extension() == ".pcache" ? pcache_disk_peek(path.string(), fingerprint, id, keys, n_bytes) : "unfinished write";
 
         if (err.empty() && path.filename().string() != prefix + std::to_string(id) + ".pcache") {
             err = "file name does not match the header";
         }
 
         if (err.empty()) {
-            index.push_back({ server_tokens(tokens, has_mtmd), path.string(), n_bytes, false, id });
+            index.push_back({ std::move(keys), path.string(), n_bytes, false, id });
 
             continue;
         }
@@ -2259,7 +2373,7 @@ void server_prompt_cache_disk::worker_loop() {
 #endif
 
     while (true) {
-        server_prompt_cache_state state;
+        pending_state item;
 
         {
             std::unique_lock<std::mutex> lock(mtx);
@@ -2269,19 +2383,19 @@ void server_prompt_cache_disk::worker_loop() {
                 return;
             }
 
-            state = std::move(pending.front());
+            item = std::move(pending.front());
             pending.pop_front();
-            pending_bytes -= state.size();
+            pending_bytes -= item.state.size();
         }
 
         const uint64_t id       = next_id++;
-        const size_t   n_tokens = state.prompt.tokens.size();
+        const size_t   n_tokens = item.keys.size();
         const std::string path  = pcache_disk_path(dir, prefix, id);
 
         const int64_t t_start = ggml_time_us();
 
         size_t n_bytes = 0;
-        const std::string err = pcache_disk_store(path, id, fingerprint, state, n_bytes);
+        const std::string err = pcache_disk_store(path, id, fingerprint, item.keys, item.state, n_bytes);
 
         if (!err.empty()) {
             SRV_WRN("prompt cache disk: failed to write %zu-token entry: %s\n", n_tokens, err.c_str());
@@ -2295,14 +2409,27 @@ void server_prompt_cache_disk::worker_loop() {
                 n_tokens, n_bytes / (1024.0 * 1024.0), t_ms, n_bytes / 1e3 / t_ms);
 
         std::lock_guard<std::mutex> lock(mtx);
-        done.push_back({ std::move(state.prompt.tokens), path, n_bytes, false, id });
+        done.push_back({ std::move(item.keys), path, n_bytes, false, id });
     }
 }
 
 void server_prompt_cache_disk::push(server_prompt_cache_state && state) {
     collect();
 
-    const size_t n_bytes = state.size();
+    // the keys are made here, the writer never sees the media chunks
+    pending_state item;
+    item.keys = pcache_keys(state.prompt.tokens);
+
+    if (pcache_has_unkeyable(item.keys)) {
+        SRV_INF("prompt cache disk: not keeping evicted %zu-token entry, it has media without id\n", item.keys.size());
+
+        return;
+    }
+
+    state.prompt.tokens.clear();
+    item.state = std::move(state);
+
+    const size_t n_bytes = item.state.size();
 
     size_t n_waiting = 0;
     bool   accepted  = false;
@@ -2315,7 +2442,7 @@ void server_prompt_cache_disk::push(server_prompt_cache_state && state) {
 
         if (accepted) {
             pending_bytes += n_bytes;
-            pending.push_back(std::move(state));
+            pending.push_back(std::move(item));
         }
     }
 
@@ -2323,22 +2450,25 @@ void server_prompt_cache_disk::push(server_prompt_cache_state && state) {
         cv.notify_one();
     } else {
         SRV_WRN("prompt cache disk: dropping evicted %zu-token entry, %.1f MiB, %.1f MiB already waiting\n",
-                state.prompt.tokens.size(), n_bytes / (1024.0 * 1024.0), n_waiting / (1024.0 * 1024.0));
+                item.keys.size(), n_bytes / (1024.0 * 1024.0), n_waiting / (1024.0 * 1024.0));
     }
 }
 
 bool server_prompt_cache_disk::take(const server_tokens & tokens_new, float & f_keep_best, float & f_sim_best, server_prompt_cache_state & out, int32_t id_slot) {
     collect();
 
+    const llama_tokens keys_new = pcache_keys(tokens_new);
+
     float f_keep_win = f_keep_best;
     float f_sim_win  = f_sim_best;
 
-    auto it_best = index.end();
+    auto   it_best = index.end();
+    size_t lcp_win = 0;
 
     for (auto it = index.begin(); it != index.end(); ++it) {
-        const int lcp_cur = it->tokens.get_common_prefix(tokens_new);
+        const size_t lcp_cur = pcache_usable_prefix(it->keys, keys_new, tokens_new);
 
-        const float f_keep_cur = float(lcp_cur) / it->tokens.size();
+        const float f_keep_cur = float(lcp_cur) / it->keys.size();
         const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
 
         // don't trash large prompts
@@ -2351,6 +2481,7 @@ bool server_prompt_cache_disk::take(const server_tokens & tokens_new, float & f_
             f_sim_win  = f_sim_cur;
 
             it_best = it;
+            lcp_win = lcp_cur;
         }
     }
 
@@ -2358,15 +2489,19 @@ bool server_prompt_cache_disk::take(const server_tokens & tokens_new, float & f_
         return false;
     }
 
-    const size_t n_tokens = it_best->tokens.size();
+    const size_t n_tokens = it_best->keys.size();
 
     const int64_t t_start = ggml_time_us();
 
     size_t n_bytes = 0;
-    const std::string err = pcache_disk_read(it_best->path, it_best->id, fingerprint, it_best->tokens, out, n_bytes);
+    std::string err = pcache_disk_read(it_best->path, it_best->id, fingerprint, it_best->keys, out, n_bytes);
 
     if (err.empty()) {
-        out.prompt.tokens = std::move(it_best->tokens);
+        try {
+            out.prompt.tokens = pcache_restored_tokens(it_best->keys, lcp_win, tokens_new);
+        } catch (const std::exception & e) {
+            err = e.what();
+        }
     }
 
     // consumed by a restore, even a failed one
@@ -2393,15 +2528,17 @@ void server_prompt_cache_disk::pin(const server_tokens & tokens_next) {
     // pin before the size limit runs, it could remove the entry otherwise
     receive();
 
-    auto it_best = index.end();
-    int lcp_best = 0;
+    const llama_tokens keys_next = pcache_keys(tokens_next);
+
+    auto   it_best  = index.end();
+    size_t lcp_best = 0;
 
     for (auto it = index.begin(); it != index.end(); ++it) {
         it->pinned = false;
 
-        const int lcp_cur = it->tokens.get_common_prefix(tokens_next);
+        const size_t lcp_cur = pcache_usable_prefix(it->keys, keys_next, tokens_next);
 
-        if (lcp_cur > lcp_best && float(lcp_cur) / it->tokens.size() >= 0.25f) {
+        if (lcp_cur > lcp_best && float(lcp_cur) / it->keys.size() >= 0.25f) {
             lcp_best = lcp_cur;
             it_best  = it;
         }
@@ -2421,13 +2558,17 @@ void server_prompt_cache_disk::unpin() {
 }
 
 void server_prompt_cache_disk::remove_contained(const server_tokens & tokens) {
+    remove_contained(pcache_keys(tokens));
+}
+
+void server_prompt_cache_disk::remove_contained(const llama_tokens & keys) {
     collect();
 
     for (auto it = index.begin(); it != index.end();) {
         const auto it_cur = it++;
 
-        if (it_cur->tokens.get_common_prefix(tokens) == it_cur->tokens.size()) {
-            SRV_TRC(" - removing obsolete disk entry with length %zu\n", it_cur->tokens.size());
+        if (pcache_covers(keys, it_cur->keys)) {
+            SRV_TRC(" - removing obsolete disk entry with length %zu\n", it_cur->keys.size());
 
             remove_entry(it_cur);
         }
@@ -2438,49 +2579,55 @@ void server_prompt_cache_disk::flush(std::list<server_prompt_cache_state> && sta
     stop_worker();
 
     // what the worker did not reach was evicted before everything that is in the RAM cache
-    states.splice(states.begin(), pending);
+    std::list<pending_state> queue;
+    queue.swap(pending);
     pending_bytes = 0;
+
+    for (auto & state : states) {
+        queue.push_back({ pcache_keys(state.prompt.tokens), std::move(state) });
+    }
+
+    states.clear();
 
     const int64_t t_start = ggml_time_us();
 
     // ids grow with the age of the state, the newest is written first
     const uint64_t id_first = next_id;
-    next_id += states.size();
+    next_id += queue.size();
 
     size_t n_written = 0;
     size_t n_bytes_written = 0;
     size_t n_failed = 0;
-    size_t n_media = 0;
+    size_t n_unkeyable = 0;
     size_t n_contained = 0;
     size_t n_late = 0;
 
-    const auto is_in_longer_state = [&states](const server_tokens & tokens) {
-        return std::any_of(states.begin(), states.end(), [&tokens](const server_prompt_cache_state & other) {
-            return other.prompt.tokens.size() > tokens.size() && !pcache_has_media(other.prompt.tokens) &&
-                    other.prompt.tokens.get_common_prefix(tokens) == tokens.size();
+    const auto is_in_longer_state = [&queue](const llama_tokens & keys) {
+        return std::any_of(queue.begin(), queue.end(), [&keys](const pending_state & other) {
+            return other.keys.size() > keys.size() && pcache_covers(other.keys, keys) && !pcache_has_unkeyable(other.keys);
         });
     };
 
-    while (!states.empty()) {
-        const uint64_t id = id_first + states.size() - 1;
+    while (!queue.empty()) {
+        const uint64_t id = id_first + queue.size() - 1;
 
-        server_prompt_cache_state state = std::move(states.back());
-        states.pop_back();
+        pending_state item = std::move(queue.back());
+        queue.pop_back();
 
-        if (pcache_has_media(state.prompt.tokens)) {
-            n_media++;
+        if (pcache_has_unkeyable(item.keys)) {
+            n_unkeyable++;
 
             continue;
         }
 
-        if (is_contained(state.prompt.tokens) || is_in_longer_state(state.prompt.tokens)) {
+        if (is_contained(item.keys) || is_in_longer_state(item.keys)) {
             n_contained++;
 
             continue;
         }
 
         // assume 1 GB/s: a write that runs past the deadline can be force-killed by the router
-        if (ggml_time_ms() + (int64_t) (state.size() >> 20) > deadline_ms) {
+        if (ggml_time_ms() + (int64_t) (item.state.size() >> 20) > deadline_ms) {
             n_late++;
 
             continue;
@@ -2489,10 +2636,10 @@ void server_prompt_cache_disk::flush(std::list<server_prompt_cache_state> && sta
         const std::string path = pcache_disk_path(dir, prefix, id);
 
         size_t n_bytes = 0;
-        const std::string err = pcache_disk_store(path, id, fingerprint, state, n_bytes);
+        const std::string err = pcache_disk_store(path, id, fingerprint, item.keys, item.state, n_bytes);
 
         if (!err.empty()) {
-            SRV_WRN("prompt cache disk: failed to write %zu-token entry: %s\n", state.prompt.tokens.size(), err.c_str());
+            SRV_WRN("prompt cache disk: failed to write %zu-token entry: %s\n", item.keys.size(), err.c_str());
 
             n_failed++;
 
@@ -2500,20 +2647,18 @@ void server_prompt_cache_disk::flush(std::list<server_prompt_cache_state> && sta
         }
 
         // the index stays sorted by id
-        remove_contained(state.prompt.tokens);
+        remove_contained(item.keys);
         index.insert(std::find_if(index.begin(), index.end(), [id](const entry & e) { return e.id > id; }),
-                entry{ std::move(state.prompt.tokens), path, n_bytes, false, id });
+                entry{ std::move(item.keys), path, n_bytes, false, id });
 
         n_written++;
         n_bytes_written += n_bytes;
     }
 
-    states.clear();
-
     enforce_limit();
 
-    SRV_INF("prompt cache disk: exit flush wrote %zu entries, %.1f MiB in %.0f ms, skipped %zu with media, %zu contained, %zu past the deadline, %zu failed\n",
-            n_written, n_bytes_written / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0, n_media, n_contained, n_late, n_failed);
+    SRV_INF("prompt cache disk: exit flush wrote %zu entries, %.1f MiB in %.0f ms, skipped %zu with media without id, %zu contained, %zu past the deadline, %zu failed\n",
+            n_written, n_bytes_written / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0, n_unkeyable, n_contained, n_late, n_failed);
 }
 
 size_t server_prompt_cache_disk::n_entries() {
@@ -2547,15 +2692,15 @@ void server_prompt_cache_disk::enforce_limit() {
         }
 
         SRV_INF("prompt cache disk: removing oldest entry (%zu tokens, %.1f MiB)\n",
-                it_oldest->tokens.size(), it_oldest->size / (1024.0 * 1024.0));
+                it_oldest->keys.size(), it_oldest->size / (1024.0 * 1024.0));
 
         remove_entry(it_oldest);
     }
 }
 
-bool server_prompt_cache_disk::is_contained(const server_tokens & tokens) const {
-    return std::any_of(index.begin(), index.end(), [&tokens](const entry & e) {
-        return e.tokens.get_common_prefix(tokens) == tokens.size();
+bool server_prompt_cache_disk::is_contained(const llama_tokens & keys) const {
+    return std::any_of(index.begin(), index.end(), [&keys](const entry & e) {
+        return pcache_covers(e.keys, keys);
     });
 }
 

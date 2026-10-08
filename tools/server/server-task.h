@@ -662,16 +662,17 @@ struct server_prompt_cache_state {
 // the index is owned by the main thread, the mutex only guards the two lists shared with the writer
 // the files outlive the instance: the constructor indexes those left by a run with the same fingerprint
 struct server_prompt_cache_disk {
-    server_prompt_cache_disk(const std::string & dir, const std::string & prefix, size_t limit_size, uint64_t fingerprint, bool has_mtmd);
+    server_prompt_cache_disk(const std::string & dir, const std::string & prefix, size_t limit_size, uint64_t fingerprint);
     ~server_prompt_cache_disk();
 
-    // identifies the model file and the server build, a file of another fingerprint is not reused
-    static uint64_t make_fingerprint(const std::string & model_path);
+    // identifies the model file, the multimodal projector (empty path = none) and the server build, a file of another fingerprint is not reused
+    static uint64_t make_fingerprint(const std::string & model_path, const std::string & mmproj_path);
 
     // hand an evicted entry to the writer, it is dropped when too much is already waiting
     void push(server_prompt_cache_state && state);
 
     // same search rule as the RAM entries in server_prompt_cache::load()
+    // the files hold keys, not the media chunks: an entry with media is used only if the media is all in the part that matches
     bool take(const server_tokens & tokens_new, float & f_keep_best, float & f_sim_best, server_prompt_cache_state & out, int32_t id_slot);
 
     // keep the entry that load(tokens_next) would pick from being removed by the size limit
@@ -681,7 +682,7 @@ struct server_prompt_cache_disk {
     void remove_contained(const server_tokens & tokens);
 
     // exit only: stops the writer, then writes the states (given oldest first) and the entries the writer did not reach, newest first
-    // a state is skipped when it has media, when another entry contains it or when the deadline (ggml_time_ms) has passed
+    // a state is skipped when a media chunk has no id, when another entry contains it or when the deadline (ggml_time_ms) has passed
     void flush(std::list<server_prompt_cache_state> && states, int64_t deadline_ms);
 
     size_t n_entries();
@@ -690,19 +691,26 @@ struct server_prompt_cache_disk {
     size_t size();
 
 private:
+    // a text position holds its token id, a media position a negative key made from the chunk
     struct entry {
-        server_tokens tokens;
-        std::string   path;
-        size_t        size;
-        bool          pinned = false;
-        uint64_t      id;
+        llama_tokens keys;
+        std::string  path;
+        size_t       size;
+        bool         pinned = false;
+        uint64_t     id;
+    };
+
+    struct pending_state {
+        llama_tokens              keys;
+        server_prompt_cache_state state;
     };
 
     void collect();
     void receive();
     void enforce_limit();
     size_t indexed_size() const;
-    bool is_contained(const server_tokens & tokens) const;
+    void remove_contained(const llama_tokens & keys);
+    bool is_contained(const llama_tokens & keys) const;
     void remove_entry(std::list<entry>::iterator it);
     void stop_worker();
     void worker_loop();
@@ -718,9 +726,9 @@ private:
     std::condition_variable cv;
     bool                    stop = false;
 
-    std::list<server_prompt_cache_state> pending;
-    size_t                               pending_bytes = 0;
-    std::list<entry>                     done;
+    std::list<pending_state> pending;
+    size_t                   pending_bytes = 0;
+    std::list<entry>         done;
 
     uint64_t next_id = 0; // worker thread only, flush() once the worker has stopped
 

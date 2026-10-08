@@ -80,7 +80,7 @@ static std::vector<llama_token> server_accept_replay(
     return result;
 }
 
-static std::unique_ptr<server_prompt_cache_disk> server_make_prompt_cache_disk(const std::string & model_path, bool has_mtmd) {
+static std::unique_ptr<server_prompt_cache_disk> server_make_prompt_cache_disk(const std::string & model_path, const std::string & mmproj_path) {
     const char * dir = getenv("LLAMA_PROMPT_CACHE_DISK_DIR");
     if (dir == nullptr || dir[0] == '\0') {
         return nullptr;
@@ -100,9 +100,9 @@ static std::unique_ptr<server_prompt_cache_disk> server_make_prompt_cache_disk(c
 
         std::filesystem::create_directories(dir);
 
-        const uint64_t fingerprint = server_prompt_cache_disk::make_fingerprint(model_path);
+        const uint64_t fingerprint = server_prompt_cache_disk::make_fingerprint(model_path, mmproj_path);
 
-        return std::make_unique<server_prompt_cache_disk>(dir, prefix, limit_mib*1024*1024, fingerprint, has_mtmd);
+        return std::make_unique<server_prompt_cache_disk>(dir, prefix, limit_mib*1024*1024, fingerprint);
     } catch (const std::exception & e) {
         SRV_ERR("prompt cache disk: disabled, %s\n", e.what());
 
@@ -1580,7 +1580,7 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
-            prompt_cache->disk = server_make_prompt_cache_disk(params_base.model.path, mctx != nullptr);
+            prompt_cache->disk = server_make_prompt_cache_disk(params_base.model.path, mctx != nullptr ? params_base.mmproj.path : std::string());
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
