@@ -911,10 +911,49 @@ static __global__ void mul_mat_vec_q(
     const uint32_t y_stride_col = quant_prologue ? ncols_x / QK8_1 : stride_col_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_w*stride_channel_x + row0*stride_row_x;
 
+    const int kbx_first = tid / (qi/vdr);
+    bool unrolled_trips_done = false;
+    if constexpr (type == GGML_TYPE_Q8_0 && ncols_dst == 1 && !small_k && !quant_prologue && !row_segments &&
+            rows_per_cuda_block == 1 && table_id == MMVQ_PARAMETERS_RDNA4) {
+        // Q8_0 with 3 K trips: no branch between the trips, so their loads can go out together
+        if (blocks_per_row_x > 2*blocks_per_iter && blocks_per_row_x <= 3*blocks_per_iter) {
+            const int kqs_first = vdr * (tid % (qi/vdr));
+            const int kbx0 = kbx_first;
+            const int kbx1 = kbx_first + blocks_per_iter;
+            const int kbx2 = kbx_first + 2*blocks_per_iter;
+            const int kbx2_clamped = min(kbx2, blocks_per_row_x - 1);
+            const bool valid2 = kbx2 < blocks_per_row_x;
+            const float d0 = vec_dot_q_cuda(vx, &y[kbx0 * (qk/QK8_1)], kbx_offset + kbx0, kqs_first);
+            const float d1 = vec_dot_q_cuda(vx, &y[kbx1 * (qk/QK8_1)], kbx_offset + kbx1, kqs_first);
+            const float d2 = vec_dot_q_cuda(vx, &y[kbx2_clamped * (qk/QK8_1)], kbx_offset + kbx2_clamped, kqs_first);
+            [[maybe_unused]] float g0 = 0.0f;
+            [[maybe_unused]] float g1 = 0.0f;
+            [[maybe_unused]] float g2 = 0.0f;
+            if constexpr (has_fusion) {
+                if (use_gate) {
+                    g0 = vec_dot_q_cuda(vgate, &y[kbx0 * (qk/QK8_1)], kbx_offset + kbx0, kqs_first);
+                    g1 = vec_dot_q_cuda(vgate, &y[kbx1 * (qk/QK8_1)], kbx_offset + kbx1, kqs_first);
+                    g2 = vec_dot_q_cuda(vgate, &y[kbx2_clamped * (qk/QK8_1)], kbx_offset + kbx2_clamped, kqs_first);
+                }
+            }
+            tmp[0][0] += d0;
+            tmp[0][0] += d1;
+            tmp[0][0] = valid2 ? tmp[0][0] + d2 : tmp[0][0];
+            if constexpr (has_fusion) {
+                if (use_gate) {
+                    tmp_gate[0][0] += g0;
+                    tmp_gate[0][0] += g1;
+                    tmp_gate[0][0] = valid2 ? tmp_gate[0][0] + g2 : tmp_gate[0][0];
+                }
+            }
+            unrolled_trips_done = true;
+        }
+    }
+
     // small-K rows take only a few K steps per thread, unrolling them is slower
     constexpr int kbx_unroll = small_k ? 1 : 2;
 #pragma unroll kbx_unroll
-    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+    for (int kbx = unrolled_trips_done ? blocks_per_row_x : kbx_first; kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
         // x block quant index when casting the quants to int
