@@ -374,6 +374,18 @@ private:
 
     copy_experts_info copy_experts;
 
+    // pinned staging buffer for the direct expert reads, in two halves: one is read while the other is uploaded
+    // not reset with copy_experts_info. GGML_SCHED_EXPERT_READ_MB sizes it, 0 = off
+    struct expert_read_info {
+        ggml_backend_buffer_ptr buf;
+        size_t                  bytes = 0;
+        ggml_backend_t          pending[2] = {nullptr, nullptr}; // the backend still uploading from each half
+        int                     cur = 0;
+        bool                    warned = false;
+    };
+
+    expert_read_info expert_read;
+
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 

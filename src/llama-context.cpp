@@ -449,6 +449,9 @@ llama_context::llama_context(
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
         }
+
+        const char * GGML_SCHED_EXPERT_READ_MB = getenv("GGML_SCHED_EXPERT_READ_MB");
+        expert_read.bytes = (GGML_SCHED_EXPERT_READ_MB ? (size_t) std::max(atoi(GGML_SCHED_EXPERT_READ_MB), 0) : 256) << 20;
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
@@ -809,8 +812,6 @@ void llama_context::sched_reserve() {
     ggml_backend_sched_set_expert_rows_callback(sched.get(), llama_moe_cache_expert_rows, nullptr);
     ggml_backend_sched_set_expert_staged_callback(sched.get(), llama_moe_cache_warm_from_staging, nullptr);
     ggml_backend_sched_set_expert_host_callback(sched.get(), llama_moe_cache_expert_host, nullptr);
-    ggml_backend_sched_set_expert_read_callback(sched.get(), llama_moe_cache_direct_reads() ? llama_moe_cache_expert_read : nullptr, nullptr);
-    ggml_backend_sched_set_expert_src_callback(sched.get(), llama_moe_cache_direct_reads() ? llama_moe_cache_expert_src : nullptr, nullptr);
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -855,8 +856,6 @@ void llama_context::sched_reserve() {
                 ggml_backend_sched_set_expert_rows_callback(sched.get(), llama_moe_cache_expert_rows, nullptr);
                 ggml_backend_sched_set_expert_staged_callback(sched.get(), llama_moe_cache_warm_from_staging, nullptr);
                 ggml_backend_sched_set_expert_host_callback(sched.get(), llama_moe_cache_expert_host, nullptr);
-                ggml_backend_sched_set_expert_read_callback(sched.get(), llama_moe_cache_direct_reads() ? llama_moe_cache_expert_read : nullptr, nullptr);
-                ggml_backend_sched_set_expert_src_callback(sched.get(), llama_moe_cache_direct_reads() ? llama_moe_cache_expert_src : nullptr, nullptr);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -991,6 +990,8 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+    expert_read.pending[0] = nullptr;
+    expert_read.pending[1] = nullptr;
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -2884,6 +2885,7 @@ ggml_status llama_context::graph_compute(
 
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto & st = static_cast<llama_context *>(user_data)->copy_experts;
+    auto & rd = static_cast<llama_context *>(user_data)->expert_read;
 
     // the ids must be computed before the split starts, so only the first node of the split is considered
     if (ggml_graph_n_nodes(graph) == 0) {
@@ -2930,6 +2932,8 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         cache_rows->nb[1] == src->nb[1] && cache_rows->nb[2] == expert_size && cache_rows->ne[2] >= n_cache_slots;
 
     const size_t padding = std::min<size_t>(expert_size, 512);
+    static const uint8_t zero_padding[512] = {0};
+    const bool direct_reads = llama_moe_cache_direct_reads();
 
     std::vector<bool> host_used = st.used;
     if (device_rows) {
@@ -2946,9 +2950,10 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
                 continue;
             }
             host_used[id] = false;
+            // zeros when the experts are read directly, so the weight's pages are not touched
             if (id + 1 < n_expert && !st.used[id + 1]) {
-                ggml_backend_tensor_set_async(backend, dst,
-                    (const uint8_t *) src->data + (size_t) (id + 1)*expert_size, (size_t) (id + 1)*expert_size, padding);
+                const uint8_t * next_bytes = direct_reads ? zero_padding : (const uint8_t *) src->data + (size_t) (id + 1)*expert_size;
+                ggml_backend_tensor_set_async(backend, dst, next_bytes, (size_t) (id + 1)*expert_size, padding);
             }
         }
     }
@@ -2969,7 +2974,6 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         host_pool->nb[1] == src->nb[1] && host_pool->nb[2] == expert_size && host_pool->ne[2] > n_host_slots;
 
     if (pool_rows) {
-        static const uint8_t zero_padding[512] = {0};
         for (int32_t id = 0; id < n_expert; ++id) {
             if (!host_used[id]) {
                 continue;
@@ -2991,6 +2995,73 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         }
     }
 
+    // allocates the staging buffer at first use, false when the experts are copied from the weight instead
+    const char * func = __func__;
+    auto read_buffer_ready = [&]() {
+        if (rd.bytes == 0) {
+            return false;
+        }
+        if (!rd.buf) {
+            ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
+            rd.buf.reset(buft ? ggml_backend_buft_alloc_buffer(buft, rd.bytes) : nullptr);
+            if (!rd.buf) {
+                LLAMA_LOG_WARN("%s: no pinned host buffer of %zu MiB for the expert reads, copying the experts from the weights\n", func, rd.bytes >> 20);
+                rd.bytes = 0;
+                return false;
+            }
+        }
+        if (expert_size > rd.bytes/2) {
+            if (!rd.warned) {
+                rd.warned = true;
+                LLAMA_LOG_WARN("%s: an expert of %zu bytes does not fit in half of the expert read buffer, copying the experts from the weights\n", func, expert_size);
+            }
+            return false;
+        }
+        return true;
+    };
+
+    // the lookahead may have read the run already
+    auto upload_ahead = [&](int64_t first, int64_t last) {
+        const void * ahead = llama_moe_cache_expert_src(src, first, last - first + 1, nullptr);
+        if (!ahead) {
+            return false;
+        }
+        ggml_backend_tensor_set_async(backend, dst, ahead, first*expert_size, (last - first + 1)*expert_size);
+        return true;
+    };
+
+    // read the experts of a run in pieces of one staging half, and upload each while the next is read
+    auto upload_read = [&](int64_t first, int64_t last) {
+        if (!read_buffer_ready()) {
+            return false;
+        }
+        const size_t half = rd.bytes/2;
+        uint8_t * halves[2] = {(uint8_t *) ggml_backend_buffer_get_base(rd.buf.get()), nullptr};
+        halves[1] = halves[0] + half;
+
+        const int64_t piece_experts = std::min<int64_t>(half/expert_size, n_expert);
+        for (int64_t piece_first = first; piece_first <= last; piece_first += piece_experts) {
+            const int64_t n_piece     = std::min(piece_experts, last - piece_first + 1);
+            const size_t piece_offset = piece_first*expert_size;
+            const size_t piece_size   = n_piece*expert_size;
+            const int cur = rd.cur;
+
+            if (rd.pending[cur]) {
+                ggml_backend_synchronize(rd.pending[cur]);
+                rd.pending[cur] = nullptr;
+            }
+
+            if (!llama_moe_cache_expert_read(src, piece_first, n_piece, halves[cur], nullptr)) {
+                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + piece_offset, piece_offset, piece_size);
+                continue;
+            }
+            ggml_backend_tensor_set_async(backend, dst, halves[cur], piece_offset, piece_size);
+            rd.pending[cur] = backend;
+            rd.cur = 1 - cur;
+        }
+        return true;
+    };
+
     // group consecutive experts and copy them together
     for (int64_t first = 0; first < n_expert; ) {
         if (!host_used[first]) {
@@ -3002,10 +3073,17 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
             last++;
         }
 
-        // copy a bit extra to ensure there are no NaNs in the padding of the last expert, this is necessary for MMQ in the CUDA backend
-        const size_t offset  = first*expert_size;
-        const size_t padding_end = last < n_expert - 1 ? padding : 0;
-        ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, (last - first + 1)*expert_size + padding_end);
+        if (direct_reads && (upload_ahead(first, last) || upload_read(first, last))) {
+            // zeros, not the weight: the next expert is not used, and its bytes are not read
+            if (last + 1 < n_expert && !st.used[last + 1]) {
+                ggml_backend_tensor_set_async(backend, dst, zero_padding, (size_t) (last + 1)*expert_size, padding);
+            }
+        } else {
+            // copy a bit extra to ensure there are no NaNs in the padding of the last expert, this is necessary for MMQ in the CUDA backend
+            const size_t offset  = first*expert_size;
+            const size_t padding_end = last < n_expert - 1 ? padding : 0;
+            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, (last - first + 1)*expert_size + padding_end);
+        }
 
         first = last + 1;
     }

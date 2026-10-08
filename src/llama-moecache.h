@@ -144,12 +144,12 @@ bool llama_moe_cache_expert_host(const ggml_tensor * weight, const uint32_t * us
 // true when the host tier reads the experts from the model files with O_DIRECT
 bool llama_moe_cache_direct_reads();
 
-// ggml_backend_sched_expert_read_fn over the host tier's file reader: reads the experts of an up/gate/down weight
-// into dst. False when the tier has no reader or does not know the weight.
+// reads the experts [first, first + n) of an up/gate/down weight into dst with the host tier's file reader.
+// False when the tier has no reader or does not know the weight.
 bool llama_moe_cache_expert_read(const ggml_tensor * weight, int64_t first, int64_t n, void * dst, void * user_data);
 
-// ggml_backend_sched_expert_src_fn over the lookahead buffers: the pinned bytes of experts [first, first + n) of an up/gate/down
-// weight, once the reads that fill them are done. nullptr when the run is not buffered.
+// the pinned bytes of experts [first, first + n) of an up/gate/down weight in the lookahead buffers, once the reads
+// that fill them are done. nullptr when the run is not buffered.
 const void * llama_moe_cache_expert_src(const ggml_tensor * weight, int64_t first, int64_t n, void * user_data);
 
 // ggml_backend_sched_expert_rows_fn over the cache: lets the scheduler's prefill upload of a
