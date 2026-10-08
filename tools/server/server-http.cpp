@@ -682,6 +682,8 @@ void server_http_context::get(const std::string & path, const server_http_contex
             build_query_string(req),
             req.body,
             {},
+            req.remote_addr + ":" + std::to_string(req.remote_port),
+            req.get_header_value("User-Agent"),
             req.is_connection_closed
         });
         server_http_res_ptr response = handler(*request);
@@ -733,6 +735,8 @@ void server_http_context::post(const std::string & path, const server_http_conte
             build_query_string(req),
             body,
             std::move(files),
+            req.remote_addr + ":" + std::to_string(req.remote_port),
+            req.get_header_value("User-Agent"),
             req.is_connection_closed
         });
         server_http_res_ptr response = handler(*request);
@@ -754,6 +758,8 @@ void server_http_context::del(const std::string & path, const server_http_contex
             build_query_string(req),
             req.body,
             {},
+            req.remote_addr + ":" + std::to_string(req.remote_port),
+            req.get_header_value("User-Agent"),
             req.is_connection_closed
         });
         server_http_res_ptr response = handler(*request);
@@ -913,6 +919,8 @@ void server_http_context::register_gcp_compat() const {
                         req.query_string,
                         payload.dump(),
                         {},
+                        req.remote_addr,
+                        req.user_agent,
                         req.should_stop,
                     };
 

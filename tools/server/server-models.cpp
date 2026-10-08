@@ -1647,7 +1647,7 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
         // sleep after req_count++, so the model counts as busy while we wait here
         std::this_thread::sleep_for(std::chrono::seconds(2));
     }
-    SRV_INF("proxying request to model %s on port %d\n", name.c_str(), meta->port);
+    SRV_INF("proxying %s %s from %s (%s) to model %s on port %d\n", method.c_str(), req.path.c_str(), req.remote_addr.c_str(), req.user_agent.c_str(), name.c_str(), meta->port);
     std::string proxy_path = req.path;
     if (!req.query_string.empty()) {
         proxy_path += '?' + req.query_string;
