@@ -1036,6 +1036,12 @@ struct ggml_backend_sched {
     ggml_backend_sched_expert_host_fn expert_host_fn;
     void * expert_host_user_data;
 
+    // fills the prefetch slots from somewhere else than the weight's data pointer (see ggml_backend_sched_set_expert_fill_callbacks)
+    ggml_backend_sched_expert_fill_fn expert_fill_fn;
+    ggml_backend_sched_expert_device_fill_fn expert_device_fill_fn;
+    void * expert_fill_user_data;
+    bool prefetch_slots_logged;
+
     // GGML_SCHED_SPLIT_STATS=1: per-split wall time (input copies and syncs vs compute launch),
     // accumulated over graphs with the same split count and logged every 256 of them
     struct ggml_backend_sched_split_profile * split_profile;
@@ -2019,11 +2025,13 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
         ggml_backend_dev_props props;
         ggml_backend_dev_get_props(dev, &props);
         if (!props.caps.async || !props.caps.events) {
+            GGML_LOG_WARN("%s: expert prefetch off: %s has no async copies or events\n", __func__, ggml_backend_dev_name(dev));
             sched->prefetch_experts = false;
             return false;
         }
         sched->prefetch_backend = ggml_backend_dev_init(dev, NULL);
         if (sched->prefetch_backend == NULL) {
+            GGML_LOG_WARN("%s: expert prefetch off: no copy backend on %s\n", __func__, ggml_backend_dev_name(dev));
             sched->prefetch_experts = false;
             return false;
         }
@@ -2031,6 +2039,7 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
             sched->prefetch_ready[i] = ggml_backend_event_new(dev);
             sched->prefetch_free[i]  = ggml_backend_event_new(dev);
             if (sched->prefetch_ready[i] == NULL || sched->prefetch_free[i] == NULL) {
+                GGML_LOG_WARN("%s: expert prefetch off: no events on %s\n", __func__, ggml_backend_dev_name(dev));
                 sched->prefetch_experts = false;
                 return false;
             }
@@ -2046,10 +2055,14 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
             if (new_buf == NULL) {
                 if (i >= 2 && sched->prefetch_slots[0] != NULL &&
                     ggml_backend_buffer_get_size(sched->prefetch_slots[0]) >= size) {
+                    GGML_LOG_WARN("%s: expert prefetch: no memory for slot %d of %d (%zu MiB each), using %d slots\n",
+                        __func__, i, sched->prefetch_n_slots, size >> 20, i);
                     sched->prefetch_n_slots = i;
                     sched->prefetch_cur = 0;
                     return true;
                 }
+                GGML_LOG_WARN("%s: expert prefetch off: no memory for slot %d of %d (%zu MiB each)\n",
+                    __func__, i, sched->prefetch_n_slots, size >> 20);
                 ggml_backend_sched_prefetch_disable(sched, split_backend);
                 return false;
             }
@@ -2062,7 +2075,37 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
             sched->prefetch_used[i] = false;
         }
     }
+    if (!sched->prefetch_slots_logged) {
+        sched->prefetch_slots_logged = true;
+        GGML_LOG_WARN("%s: expert prefetch: %d slots of %zu MiB\n", __func__, sched->prefetch_n_slots, size >> 20);
+    }
     return true;
+}
+
+// uploads the weight into its prefetch slot on the copy stream; true when the fill callback did it, so the split needs the device fill
+static bool ggml_backend_sched_prefetch_upload(ggml_backend_sched_t sched, const struct ggml_tensor * input, struct ggml_tensor * input_cpy) {
+    if (sched->expert_fill_fn && sched->expert_fill_fn(sched->prefetch_backend, input, input_cpy, sched->expert_fill_user_data)) {
+        // a smaller weight leaves the bytes of an earlier one in the tail past its end, which MMQ may read
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(input_cpy->buffer);
+        const size_t tail_size = ggml_backend_buft_get_alloc_size(buft, input_cpy) - ggml_nbytes(input_cpy);
+        if (tail_size > 0) {
+            static const uint8_t zeros[4096] = {0};
+            struct ggml_tensor tail = *input_cpy;
+            tail.type = GGML_TYPE_I8;
+            tail.ne[0] = tail_size;
+            tail.ne[1] = tail.ne[2] = tail.ne[3] = 1;
+            tail.nb[0] = 1;
+            tail.nb[1] = tail.nb[2] = tail.nb[3] = tail_size;
+            tail.view_src = NULL;
+            tail.data = (char *) input_cpy->data + ggml_nbytes(input_cpy);
+            for (size_t offset = 0; offset < tail_size; offset += sizeof(zeros)) {
+                ggml_backend_tensor_set_async(sched->prefetch_backend, &tail, zeros, offset, std::min(sizeof(zeros), tail_size - offset));
+            }
+        }
+        return true;
+    }
+    ggml_backend_tensor_set_async(sched->prefetch_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+    return false;
 }
 
 static std::string ggml_backend_sched_split_label(ggml_backend_sched_t sched, const struct ggml_backend_sched_split * split) {
@@ -2132,6 +2175,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // split's per-split wait the upload is already done and the wait is a no-op.
     struct prefetch_pending {
         int slot = -1;
+        bool filled = false; // the fill callback uploaded the slot, so the split runs the device fill
+        ggml_tensor * input = NULL;
         ggml_tensor * input_cpy = NULL;
         ggml_backend_buffer_t saved_buffer = NULL;
         void * saved_data = NULL;
@@ -2171,12 +2216,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_event_wait(sched->prefetch_backend, sched->prefetch_free[slot]);
         }
         lookahead[target_id].slot = slot;
+        lookahead[target_id].input = input;
         lookahead[target_id].input_cpy = input_cpy;
         lookahead[target_id].saved_buffer = input_cpy->buffer;
         lookahead[target_id].saved_data = input_cpy->data;
         input_cpy->buffer = sched->prefetch_slots[slot];
         input_cpy->data = ggml_backend_buffer_get_base(sched->prefetch_slots[slot]);
-        ggml_backend_tensor_set_async(sched->prefetch_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+        lookahead[target_id].filled = ggml_backend_sched_prefetch_upload(sched, input, input_cpy);
         ggml_backend_event_record(sched->prefetch_ready[slot], sched->prefetch_backend);
     };
 
@@ -2203,12 +2249,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // mindcontrol-port: per-split prefetch state, consumed when this split was the
         // target of a lookahead fire
         int split_prefetch_slot = -1;
+        bool prefetch_filled = false;
+        ggml_tensor * prefetch_input = NULL;
         ggml_tensor * prefetch_input_cpy = NULL;
         ggml_backend_buffer_t prefetch_saved_buffer = NULL;
         void * prefetch_saved_data = NULL;
         int lookahead_input_id = -1;
         if (lookahead[split_id].slot != -1) {
             split_prefetch_slot   = lookahead[split_id].slot;
+            prefetch_filled       = lookahead[split_id].filled;
+            prefetch_input        = lookahead[split_id].input;
             prefetch_input_cpy    = lookahead[split_id].input_cpy;
             prefetch_saved_buffer = lookahead[split_id].saved_buffer;
             prefetch_saved_data   = lookahead[split_id].saved_data;
@@ -2257,12 +2307,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             if (sched->prefetch_used[slot]) {
                                 ggml_backend_event_wait(sched->prefetch_backend, sched->prefetch_free[slot]);
                             }
+                            prefetch_input        = input;
                             prefetch_input_cpy    = input_cpy;
                             prefetch_saved_buffer = input_cpy->buffer;
                             prefetch_saved_data   = input_cpy->data;
                             input_cpy->buffer = sched->prefetch_slots[slot];
                             input_cpy->data   = ggml_backend_buffer_get_base(sched->prefetch_slots[slot]);
-                            ggml_backend_tensor_set_async(sched->prefetch_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                            prefetch_filled = ggml_backend_sched_prefetch_upload(sched, input, input_cpy);
                             ggml_backend_event_record(sched->prefetch_ready[slot], sched->prefetch_backend);
                             split_prefetch_slot = slot;
                             continue;
@@ -2294,6 +2345,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 } else if (prefetch_wait_mode >= 2) {
                     pending_prefetch_slots.push_back(split_prefetch_slot);
                     last_prefetch_split_backend = split_backend;
+                }
+                if (prefetch_filled && sched->expert_device_fill_fn) {
+                    sched->expert_device_fill_fn(split_backend, prefetch_input, prefetch_input_cpy, sched->expert_fill_user_data);
                 }
             }
             const int64_t prof_t1 = sched->split_profile ? ggml_time_us() : 0;
@@ -2422,6 +2476,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->expert_staged_user_data = NULL;
     sched->expert_host_fn        = NULL;
     sched->expert_host_user_data = NULL;
+    sched->expert_fill_fn        = NULL;
+    sched->expert_device_fill_fn = NULL;
+    sched->expert_fill_user_data = NULL;
+    sched->prefetch_slots_logged = false;
     const char * GGML_SCHED_EXPERT_CACHE_D2D = getenv("GGML_SCHED_EXPERT_CACHE_D2D");
     sched->expert_rows_d2d = GGML_SCHED_EXPERT_CACHE_D2D ? atoi(GGML_SCHED_EXPERT_CACHE_D2D) != 0 : true;
     const char * GGML_SCHED_EXPERT_COPY_STATS = getenv("GGML_SCHED_EXPERT_COPY_STATS");
@@ -2509,6 +2567,13 @@ void ggml_backend_sched_set_expert_host_callback(ggml_backend_sched_t sched, ggm
     GGML_ASSERT(sched);
     sched->expert_host_fn        = fn;
     sched->expert_host_user_data = user_data;
+}
+
+void ggml_backend_sched_set_expert_fill_callbacks(ggml_backend_sched_t sched, ggml_backend_sched_expert_fill_fn fill, ggml_backend_sched_expert_device_fill_fn device_fill, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->expert_fill_fn        = fill;
+    sched->expert_device_fill_fn = device_fill;
+    sched->expert_fill_user_data = user_data;
 }
 
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {

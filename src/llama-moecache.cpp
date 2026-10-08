@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -353,6 +354,8 @@ struct lookahead_buffer {
     int32_t               count = 0;   // experts per matrix in the buffer
     std::vector<int32_t>  position;    // expert id -> index among the buffered experts, -1 when not buffered
     expert_reader::ticket reads;       // the reads that fill the buffer
+    ggml_backend_event_t  consumed = nullptr; // recorded after the last upload that read the buffer
+    bool                  consumed_pending = false; // consumed was recorded since the buffer was last filled
 };
 
 struct guess_stats {
@@ -473,6 +476,11 @@ struct moe_cache {
     int64_t      audit_reports  = 0;
     int64_t      audit_mid_mirrors = 0; // mirrors before a staging ubatch of the same decode
     int64_t      audit_mid_stale   = 0; // host table entries those mirrors corrected
+    int64_t      audit_fill_compared = 0; // experts of pipelined fills compared with the weight
+    int64_t      audit_fill_differ   = 0;
+
+    llama_moe_cache_fill_counts fill_counts;
+    uint64_t                    last_log_fills = 0;
 
     FILE * trace = nullptr; // LLAMA_MOE_CACHE_TRACE=<path>: routed ids, one line per layer and token
 
@@ -1106,6 +1114,7 @@ guess_stats settle_guess(host_guess & guess, const layer_state & ls, const std::
 }
 
 std::vector<int32_t> experts_outside_pool_and_vram(const layer_state & ls);
+bool alloc_lookahead_buffers(moe_cache & mc);
 
 // the experts the guess names that the layer holds in neither its pool nor its device cache: token 0 first, at most max_experts
 std::vector<int32_t> guessed_misses(const layer_state & ls, const ggml_tensor * guess, size_t max_experts) {
@@ -1234,6 +1243,19 @@ std::string guess_window_info(moe_cache & mc) {
             total.read, total.used, percent(total.used, total.wanted), total.used, total.wanted, total.wait_us/1e6);
 }
 
+// the pipelined prefill fills so far; "fills=0" tells a gate that the scheduler's prefetch never took the host tier's uploads
+std::string fill_stats_info(const moe_cache & mc) {
+    const llama_moe_cache_fill_counts & fc = mc.fill_counts;
+    const auto mib = [&fc](llama_moe_cache_source source) { return fc.bytes[source]/1024.0/1024.0; };
+    std::string info = format(" fills=%" PRIu64 " fill_MiB[vram=%.1f pool=%.1f lookahead=%.1f demand=%.1f late=%.1f] fill_late_experts=%" PRIu64 " fill_wait=%.2f s",
+            fc.fills, mib(LLAMA_MOE_SOURCE_VRAM), mib(LLAMA_MOE_SOURCE_POOL), mib(LLAMA_MOE_SOURCE_LOOKAHEAD), mib(LLAMA_MOE_SOURCE_DEMAND),
+            mib(LLAMA_MOE_SOURCE_LATE), fc.late_experts, fc.wait_us/1e6);
+    if (mc.audit > 0) {
+        info += format(" audit_fill_compared=%" PRId64 " audit_fill_differ=%" PRId64, mc.audit_fill_compared, mc.audit_fill_differ);
+    }
+    return info;
+}
+
 // the host tier numbers since the previous log line
 void log_host_tier_window(moe_cache & mc) {
     uint64_t hits   = 0;
@@ -1258,7 +1280,7 @@ void log_host_tier_window(moe_cache & mc) {
     LLAMA_LOG_WARN("moe-cache: host tier slots=%d win_hit=%.1f%% (%" PRIu64 "/%" PRIu64 ") total_hit=%.1f%% (%" PRIu64 "/%" PRIu64 ") win_copied=%.1f MiB in %.1f ms total_copied=%.2f GiB in %.1f s%s\n",
             mc.host_slots, win_hits + win_misses > 0 ? 100.0 * win_hits / (win_hits + win_misses) : 0.0, win_hits, win_hits + win_misses,
             hits + misses > 0 ? 100.0 * hits / (hits + misses) : 0.0, hits, hits + misses,
-            win_bytes/1024.0/1024.0, win_us/1000.0, bytes/1024.0/1024.0/1024.0, us/1e6, guess_window_info(mc).c_str());
+            win_bytes/1024.0/1024.0, win_us/1000.0, bytes/1024.0/1024.0/1024.0, us/1e6, (guess_window_info(mc) + fill_stats_info(mc)).c_str());
 }
 
 struct layer_window_rate {
@@ -1435,10 +1457,22 @@ bool alloc_host_pools(moe_cache & mc, ggml_backend_buffer_type_t host_buft) {
     return true;
 }
 
+// the uploads that last read the buffer must have run before new reads overwrite it or it is freed
+void wait_lookahead_consumed(lookahead_buffer & la) {
+    if (la.consumed_pending) {
+        ggml_backend_event_synchronize(la.consumed);
+        la.consumed_pending = false;
+    }
+}
+
 void free_lookahead_buffers(moe_cache & mc) {
     for (auto & la : mc.lookahead_bufs) {
+        wait_lookahead_consumed(la);
         if (la.buf) {
             ggml_backend_buffer_free(la.buf);
+        }
+        if (la.consumed) {
+            ggml_backend_event_free(la.consumed);
         }
         la = {};
     }
@@ -1593,6 +1627,10 @@ std::string setup_host_tier(moe_cache & mc, const llama_model & model, int32_t n
         if (const char * env = getenv("LLAMA_MOE_HOST_LOOKAHEAD_MIN_USED")) {
             mc.lookahead_min_used = std::clamp((float) atof(env), 0.0f, 1.0f);
         }
+        if (mc.lookahead && !alloc_lookahead_buffers(mc)) {
+            LLAMA_LOG_WARN("moe-cache: no pinned host memory for the lookahead buffers, lookahead off\n");
+            mc.lookahead = false;
+        }
         LLAMA_LOG_WARN("moe-cache: host tier reads the model files with O_DIRECT: %zu files, %zu threads, %zu KiB chunks, %zu byte alignment, lookahead %s\n",
                 mc.host_reader->fds.size(), mc.host_reader->threads.size(), mc.host_reader->chunk_bytes/1024, mc.host_reader->alignment, mc.lookahead ? "on" : "off");
     } else {
@@ -1714,6 +1752,7 @@ void lookahead_read_layer(moe_cache & mc, size_t layer_idx) {
         mc.host_reader->wait(la.reads);
         la.reads.reset();
     }
+    wait_lookahead_consumed(la);
     la.layer = -1;
 
     const std::vector<int32_t> experts = experts_outside_pool_and_vram(ls);
@@ -2509,6 +2548,99 @@ const void * llama_moe_cache_expert_src(const ggml_tensor * weight, int64_t firs
     return (const char *) ggml_backend_buffer_get_base(la.buf) + lookahead_section_offset(ls, matrix, la.count) + (size_t) *run*weight->nb[2];
 }
 
+bool llama_moe_cache_host_pool(const ggml_tensor * weight, const ggml_tensor ** pool, const int32_t ** host_slot, int32_t * n_slots) {
+    moe_cache * mc = g_cache;
+    if (!mc || mc->host_slots <= 0) {
+        return false;
+    }
+    auto it = mc->by_src.find(weight);
+    if (it == mc->by_src.end()) {
+        return false;
+    }
+    const layer_state & ls = mc->layers[it->second.layer_idx];
+    *pool      = host_pool_of(ls.pub, weight);
+    *host_slot = ls.host_slot.data();
+    *n_slots   = ls.pub.n_host_slots;
+    return *pool != nullptr;
+}
+
+void llama_moe_cache_lookahead_consumed(const ggml_tensor * weight, ggml_backend_t backend) {
+    moe_cache * mc = g_cache;
+    if (!mc) {
+        return;
+    }
+    auto it = mc->by_src.find(weight);
+    if (it == mc->by_src.end()) {
+        return;
+    }
+    lookahead_buffer & la = mc->lookahead_bufs[it->second.layer_idx % 2];
+    if (!la.consumed) {
+        la.consumed = ggml_backend_event_new(ggml_backend_get_device(backend));
+    }
+    if (!la.consumed) {
+        ggml_backend_synchronize(backend);
+        return;
+    }
+    ggml_backend_event_record(la.consumed, backend);
+    la.consumed_pending = true;
+}
+
+void llama_moe_cache_count_fill(const llama_moe_cache_fill_counts & counts) {
+    moe_cache * mc = g_cache;
+    if (!mc) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mc->mtx);
+    llama_moe_cache_fill_counts & total = mc->fill_counts;
+    total.fills        += counts.fills;
+    total.late_experts += counts.late_experts;
+    total.wait_us      += counts.wait_us;
+    for (int source = 0; source < LLAMA_MOE_SOURCE_COUNT; ++source) {
+        total.bytes[source] += counts.bytes[source];
+    }
+}
+
+bool llama_moe_cache_audit_fills() {
+    return g_cache && g_cache->audit > 0;
+}
+
+void llama_moe_cache_audit_fill(const ggml_tensor * weight, const ggml_tensor * filled, const uint8_t * source_of, ggml_backend_t backend) {
+    static const char * const source_names[] = {"none", "vram", "pool", "lookahead", "demand", "late"};
+    static_assert(sizeof(source_names)/sizeof(source_names[0]) == LLAMA_MOE_SOURCE_COUNT, "a source without a name");
+
+    moe_cache * mc = g_cache;
+    if (!mc || mc->audit <= 0) {
+        return;
+    }
+    ggml_backend_synchronize(backend);
+
+    const int64_t n_expert = weight->ne[2];
+    const size_t expert_size = weight->nb[2];
+    std::vector<int32_t> experts(n_expert);
+    std::iota(experts.begin(), experts.end(), 0);
+
+    std::lock_guard<std::mutex> lock(mc->mtx);
+    if (mc->audit < n_expert) {
+        std::shuffle(experts.begin(), experts.end(), mc->audit_rng);
+        experts.resize(mc->audit);
+    }
+    std::vector<char> bytes(expert_size);
+    for (const int32_t expert : experts) {
+        ggml_backend_tensor_get(filled, bytes.data(), (size_t) expert*expert_size, expert_size);
+        const char * want = (const char *) weight->data + (size_t) expert*expert_size;
+        mc->audit_fill_compared++;
+        if (memcmp(bytes.data(), want, expert_size) == 0) {
+            continue;
+        }
+        mc->audit_fill_differ++;
+        if (audit_report_allowed(*mc)) {
+            const size_t n_diff = std::inner_product(bytes.begin(), bytes.end(), want, (size_t) 0, std::plus<size_t>(), std::not_equal_to<char>());
+            LLAMA_LOG_WARN("moe-cache audit: pipelined fill of %s differs at expert %d, taken from %s: %zu of %zu bytes\n",
+                    weight->name, expert, source_names[source_of[expert]], n_diff, expert_size);
+        }
+    }
+}
+
 bool llama_moe_cache_expert_rows(const ggml_tensor * weight, const ggml_tensor ** rows, const int32_t ** expert_slot, int32_t * n_slots, void * /*user_data*/) {
     moe_cache * mc = g_cache;
     if (!mc) {
@@ -2635,6 +2767,10 @@ void llama_moe_cache_step(ggml_backend_sched_t sched) {
         if (mc->audit > 0) {
             audit_tables(*mc);
             audit_slot_bytes(*mc);
+        }
+        if (mc->host_slots > 0 && mc->fill_counts.fills != mc->last_log_fills) {
+            mc->last_log_fills = mc->fill_counts.fills;
+            LLAMA_LOG_WARN("moe-cache: host tier prefill fills:%s\n", fill_stats_info(*mc).c_str());
         }
         mc->n_steps++;
         if (mc->n_steps % 128 == 0) {

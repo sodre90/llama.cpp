@@ -16,6 +16,7 @@
 #include <vector>
 
 struct llama_model;
+struct llama_moe_cache_fill_counts;
 class llama_batch_allocr;
 
 class llama_io_read_i;
@@ -274,6 +275,12 @@ private:
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
 
+    // ggml_backend_sched expert fill callbacks: the host tier's pipelined prefill upload of a whole weight into a prefetch slot
+    static bool sched_fill_experts(ggml_backend_t copy_backend, const ggml_tensor * src, ggml_tensor * dst, void * user_data);
+    static void sched_device_fill_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, void * user_data);
+    static void upload_host_experts(llama_context & ctx, ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst,
+            std::vector<uint8_t> & source_of, bool late, llama_moe_cache_fill_counts & counts);
+
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
@@ -382,9 +389,25 @@ private:
         ggml_backend_t          pending[2] = {nullptr, nullptr}; // the backend still uploading from each half
         int                     cur = 0;
         bool                    warned = false;
+
+        // the pipelined fill does not wait for its uploads with a backend sync: an event follows the last upload from each half
+        ggml_backend_event_t    half_free[2] = {nullptr, nullptr};
+        bool                    half_busy[2] = {false, false};
+
+        expert_read_info() = default;
+        expert_read_info(const expert_read_info &) = delete;
+        expert_read_info & operator=(const expert_read_info &) = delete;
+        ~expert_read_info();
+
+        bool buffer_ready(ggml_backend_t backend, size_t expert_size, const char * func);
+        void wait_half(int half);
+        bool upload_pieces(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, int64_t first, int64_t last, uint64_t & wait_us);
     };
 
     expert_read_info expert_read;
+
+    // per weight, where the last pipelined fill took each expert from (llama_moe_cache_source); the device fill of the split reads it
+    std::map<const ggml_tensor *, std::vector<uint8_t>> expert_fills;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

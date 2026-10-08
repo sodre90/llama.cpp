@@ -44,6 +44,9 @@
 // With the reader, a prefill ubatch reads the next layer's experts that are in neither the pool nor the device cache
 // into one of two pinned lookahead buffers while the current layer computes (LLAMA_MOE_HOST_LOOKAHEAD, default 1, 0 = off;
 // LLAMA_MOE_HOST_LOOKAHEAD_MIN_USED, default 0.9: the fraction of a layer's experts the ubatch must use for that).
+// With the reader and --prefetch-experts-slots, the scheduler's prefetch uploads a prefill weight on its copy stream from the pool, the
+// lookahead buffers and file reads, without reading the routing (llama_context::sched_fill_experts); the device cache rows are copied
+// on the compute stream. The stats line then shows fills=N and the bytes by source. LLAMA_MOE_CACHE_AUDIT=N compares N experts per fill.
 // LLAMA_MOE_HOST_PREDICT=1 (needs the reader) makes a decode ubatch guess the next cache layer's routing by running that
 // layer's router on this layer's router input, and read the guessed experts that the next layer's pool lacks into the pool
 // while this layer computes (LLAMA_MOE_HOST_PREDICT_K guessed experts per token, default n_expert_used;
@@ -157,6 +160,41 @@ bool llama_moe_cache_expert_read(const ggml_tensor * weight, int64_t first, int6
 // the pinned bytes of experts [first, first + n) of an up/gate/down weight in the lookahead buffers, once the reads
 // that fill them are done. nullptr when the run is not buffered.
 const void * llama_moe_cache_expert_src(const ggml_tensor * weight, int64_t first, int64_t n, void * user_data);
+
+// like llama_moe_cache_expert_host, but only looks the pool up: no layer entry, no waits. False when the weight has no pool.
+bool llama_moe_cache_host_pool(const ggml_tensor * weight, const ggml_tensor ** pool, const int32_t ** host_slot, int32_t * n_slots);
+
+// the uploads that read the lookahead buffer of the weight's layer are queued on backend: the buffer may be read over
+// only after they ran. Call it after the last upload of a matrix that took its experts from llama_moe_cache_expert_src.
+void llama_moe_cache_lookahead_consumed(const ggml_tensor * weight, ggml_backend_t backend);
+
+// where a pipelined prefill upload took an expert from (see ggml_backend_sched_set_expert_fill_callbacks)
+enum llama_moe_cache_source : uint8_t {
+    LLAMA_MOE_SOURCE_NONE,      // not decided yet
+    LLAMA_MOE_SOURCE_VRAM,      // the device cache rows, copied by the device fill
+    LLAMA_MOE_SOURCE_POOL,      // the pinned host pool
+    LLAMA_MOE_SOURCE_LOOKAHEAD, // a pinned lookahead buffer
+    LLAMA_MOE_SOURCE_DEMAND,    // a read of the model file into a staging half
+    LLAMA_MOE_SOURCE_LATE,      // uploaded by the device fill, the expert had left the device cache since the fill
+    LLAMA_MOE_SOURCE_COUNT,
+};
+
+struct llama_moe_cache_fill_counts {
+    uint64_t fills        = 0; // matrices uploaded by the fill callback
+    uint64_t late_experts = 0; // experts the device fill had to upload
+    uint64_t wait_us      = 0; // time spent waiting for file reads
+    uint64_t bytes[LLAMA_MOE_SOURCE_COUNT] = {};
+};
+
+// adds to the host tier stats
+void llama_moe_cache_count_fill(const llama_moe_cache_fill_counts & counts);
+
+// LLAMA_MOE_CACHE_AUDIT=N is set
+bool llama_moe_cache_audit_fills();
+
+// waits for backend, then compares N random experts of filled (the slot a fill and a device fill wrote) with the
+// weight's own bytes; source_of[id] is where the fill took expert id from
+void llama_moe_cache_audit_fill(const ggml_tensor * weight, const ggml_tensor * filled, const uint8_t * source_of, ggml_backend_t backend);
 
 // ggml_backend_sched_expert_rows_fn over the cache: lets the scheduler's prefill upload of a
 // host-resident up/gate/down weight fill the resident experts from their slots instead of over the

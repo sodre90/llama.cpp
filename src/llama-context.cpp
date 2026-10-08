@@ -178,17 +178,29 @@ static void report_device_budget(const llama_context & lctx, const char * label)
     }
 }
 
-// the prefetch copies a whole expert tensor from the model file, which the host tier avoids
+// the prefetch would copy a whole expert tensor from the model mapping, which the host tier avoids;
+// with direct reads the scheduler fills its slots through the expert fill callbacks instead
 static int prefetch_slots_with_host_tier(int slots) {
     if (slots <= 0 || !llama_moe_cache_host_tier()) {
         return slots;
     }
     static bool logged = false;
+    if (llama_moe_cache_direct_reads()) {
+        if (!logged) {
+            logged = true;
+            LLAMA_LOG_WARN("moe-cache: host tier prefetch: %d slots, filled from the pool and the lookahead\n", slots);
+        }
+        return slots;
+    }
     if (!logged) {
         logged = true;
         LLAMA_LOG_WARN("moe-cache: the host tier turns the expert prefetch off\n");
     }
     return 0;
+}
+
+static bool host_tier_fills_prefetch_slots(int slots) {
+    return slots > 0 && llama_moe_cache_host_tier() && llama_moe_cache_direct_reads();
 }
 
 struct llm_fused_op_probe {
@@ -809,6 +821,9 @@ void llama_context::sched_reserve() {
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_prefetch_experts_slots(sched.get(), prefetch_slots_with_host_tier(cparams.prefetch_experts_slots));
+    if (host_tier_fills_prefetch_slots(cparams.prefetch_experts_slots)) {
+        ggml_backend_sched_set_expert_fill_callbacks(sched.get(), sched_fill_experts, sched_device_fill_experts, this);
+    }
     ggml_backend_sched_set_expert_rows_callback(sched.get(), llama_moe_cache_expert_rows, nullptr);
     ggml_backend_sched_set_expert_staged_callback(sched.get(), llama_moe_cache_warm_from_staging, nullptr);
     ggml_backend_sched_set_expert_host_callback(sched.get(), llama_moe_cache_expert_host, nullptr);
@@ -853,6 +868,9 @@ void llama_context::sched_reserve() {
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
                 ggml_backend_sched_set_prefetch_experts_slots(sched.get(), prefetch_slots_with_host_tier(cparams.prefetch_experts_slots));
+                if (host_tier_fills_prefetch_slots(cparams.prefetch_experts_slots)) {
+                    ggml_backend_sched_set_expert_fill_callbacks(sched.get(), sched_fill_experts, sched_device_fill_experts, this);
+                }
                 ggml_backend_sched_set_expert_rows_callback(sched.get(), llama_moe_cache_expert_rows, nullptr);
                 ggml_backend_sched_set_expert_staged_callback(sched.get(), llama_moe_cache_warm_from_staging, nullptr);
                 ggml_backend_sched_set_expert_host_callback(sched.get(), llama_moe_cache_expert_host, nullptr);
@@ -2883,6 +2901,246 @@ ggml_status llama_context::graph_compute(
     return status;
 }
 
+llama_context::expert_read_info::~expert_read_info() {
+    for (ggml_backend_event_t event : half_free) {
+        if (event) {
+            ggml_backend_event_free(event);
+        }
+    }
+}
+
+// allocates the staging buffer at first use, false when the experts are copied from the weight instead
+bool llama_context::expert_read_info::buffer_ready(ggml_backend_t backend, size_t expert_size, const char * func) {
+    if (bytes == 0) {
+        return false;
+    }
+    if (!buf) {
+        ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
+        buf.reset(buft ? ggml_backend_buft_alloc_buffer(buft, bytes) : nullptr);
+        if (!buf) {
+            LLAMA_LOG_WARN("%s: no pinned host buffer of %zu MiB for the expert reads, copying the experts from the weights\n", func, bytes >> 20);
+            bytes = 0;
+            return false;
+        }
+    }
+    if (expert_size > bytes/2) {
+        if (!warned) {
+            warned = true;
+            LLAMA_LOG_WARN("%s: an expert of %zu bytes does not fit in half of the expert read buffer, copying the experts from the weights\n", func, expert_size);
+        }
+        return false;
+    }
+    return true;
+}
+
+// the CPU may fill the half again once the uploads from it have run
+void llama_context::expert_read_info::wait_half(int half) {
+    if (pending[half]) {
+        ggml_backend_synchronize(pending[half]);
+        pending[half] = nullptr;
+    }
+    if (half_busy[half]) {
+        ggml_backend_event_synchronize(half_free[half]);
+        half_busy[half] = false;
+    }
+}
+
+// like upload_read of sched_copy_experts, but waits for an event on the uploading stream and not for the whole backend
+bool llama_context::expert_read_info::upload_pieces(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, int64_t first, int64_t last, uint64_t & wait_us) {
+    const size_t expert_size = src->nb[2];
+    if (!buffer_ready(backend, expert_size, __func__)) {
+        return false;
+    }
+    const size_t half = bytes/2;
+    uint8_t * halves[2] = {(uint8_t *) ggml_backend_buffer_get_base(buf.get()), nullptr};
+    halves[1] = halves[0] + half;
+
+    const int64_t piece_experts = std::min<int64_t>(half/expert_size, src->ne[2]);
+    for (int64_t piece_first = first; piece_first <= last; piece_first += piece_experts) {
+        const int64_t n_piece     = std::min(piece_experts, last - piece_first + 1);
+        const size_t piece_offset = piece_first*expert_size;
+        const size_t piece_size   = n_piece*expert_size;
+        const int this_half = cur;
+
+        const int64_t t_start = ggml_time_us();
+        wait_half(this_half);
+        const bool read = llama_moe_cache_expert_read(src, piece_first, n_piece, halves[this_half], nullptr);
+        wait_us += ggml_time_us() - t_start;
+
+        if (!read) {
+            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + piece_offset, piece_offset, piece_size);
+            continue;
+        }
+        ggml_backend_tensor_set_async(backend, dst, halves[this_half], piece_offset, piece_size);
+        if (!half_free[this_half]) {
+            half_free[this_half] = ggml_backend_event_new(ggml_backend_get_device(backend));
+        }
+        if (half_free[this_half]) {
+            ggml_backend_event_record(half_free[this_half], backend);
+            half_busy[this_half] = true;
+        } else {
+            pending[this_half] = backend;
+        }
+        cur = 1 - this_half;
+    }
+    return true;
+}
+
+// the rows of the device expert cache that hold experts of the weight, as the upload of sched_copy_experts checks them
+static bool host_tier_vram_rows(const ggml_tensor * src, const ggml_tensor *& rows, const int32_t *& expert_slot, int32_t & n_slots) {
+    rows        = nullptr;
+    expert_slot = nullptr;
+    n_slots     = 0;
+    return llama_moe_cache_expert_rows(src, &rows, &expert_slot, &n_slots, nullptr) &&
+        rows && rows->data && expert_slot && n_slots > 0 &&
+        rows->type == src->type && rows->ne[0] == src->ne[0] && rows->ne[1] == src->ne[1] &&
+        rows->nb[1] == src->nb[1] && rows->nb[2] == src->nb[2] && rows->ne[2] >= n_slots;
+}
+
+// uploads the experts of the weight that have no source yet (LLAMA_MOE_SOURCE_NONE in source_of) and records where each came from.
+// A late upload, from the device fill, skips the lookahead buffers: they never hold an expert that was in the device cache
+void llama_context::upload_host_experts(llama_context & ctx, ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst,
+        std::vector<uint8_t> & source_of, bool late, llama_moe_cache_fill_counts & counts) {
+    const int64_t n_expert    = src->ne[2];
+    const size_t  expert_size = src->nb[2];
+
+    const ggml_tensor * host_pool    = nullptr;
+    const int32_t     * host_slot    = nullptr;
+    int32_t             n_host_slots = 0;
+    const bool pool_rows = llama_moe_cache_host_pool(src, &host_pool, &host_slot, &n_host_slots) &&
+        host_pool && host_pool->data && host_slot && n_host_slots > 0 &&
+        host_pool->type == src->type && host_pool->ne[0] == src->ne[0] && host_pool->ne[1] == src->ne[1] &&
+        host_pool->nb[1] == src->nb[1] && host_pool->nb[2] == expert_size && host_pool->ne[2] > n_host_slots;
+
+    const auto pool_slot_of = [&](int64_t id) {
+        return pool_rows && host_slot[id] >= 0 && host_slot[id] < n_host_slots ? host_slot[id] : -1;
+    };
+    const auto is_open = [&](int64_t id) {
+        return source_of[id] == LLAMA_MOE_SOURCE_NONE;
+    };
+    const auto done = [&](int64_t first, int64_t last, llama_moe_cache_source source) {
+        const llama_moe_cache_source shown = late ? LLAMA_MOE_SOURCE_LATE : source;
+        std::fill(source_of.begin() + first, source_of.begin() + last + 1, (uint8_t) shown);
+        counts.bytes[shown] += (last - first + 1)*expert_size;
+    };
+
+    bool read_lookahead = false;
+    for (int64_t first = 0; first < n_expert; ) {
+        if (!is_open(first)) {
+            first++;
+            continue;
+        }
+        int64_t last = first;
+        if (pool_slot_of(first) >= 0) {
+            while (last + 1 < n_expert && is_open(last + 1) && pool_slot_of(last + 1) == pool_slot_of(last) + 1) {
+                last++;
+            }
+            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) host_pool->data + (size_t) pool_slot_of(first)*expert_size,
+                (size_t) first*expert_size, (last - first + 1)*expert_size);
+            done(first, last, LLAMA_MOE_SOURCE_POOL);
+        } else {
+            while (last + 1 < n_expert && is_open(last + 1) && pool_slot_of(last + 1) < 0) {
+                last++;
+            }
+            const int64_t t_start = ggml_time_us();
+            const void * ahead = late ? nullptr : llama_moe_cache_expert_src(src, first, last - first + 1, nullptr);
+            counts.wait_us += ggml_time_us() - t_start;
+            if (ahead) {
+                ggml_backend_tensor_set_async(backend, dst, ahead, (size_t) first*expert_size, (last - first + 1)*expert_size);
+                read_lookahead = true;
+                done(first, last, LLAMA_MOE_SOURCE_LOOKAHEAD);
+            } else {
+                if (!ctx.expert_read.upload_pieces(backend, src, dst, first, last, counts.wait_us)) {
+                    ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + (size_t) first*expert_size,
+                        (size_t) first*expert_size, (last - first + 1)*expert_size);
+                }
+                done(first, last, LLAMA_MOE_SOURCE_DEMAND);
+            }
+        }
+        first = last + 1;
+    }
+    if (read_lookahead) {
+        llama_moe_cache_lookahead_consumed(src, backend);
+    }
+}
+
+// Fills a prefetch slot with every expert of a host tier weight on the copy stream, without the router ids.
+// sched_device_fill_experts copies the experts in the device cache; the scheduler zeroes the slot tail.
+bool llama_context::sched_fill_experts(ggml_backend_t copy_backend, const ggml_tensor * src, ggml_tensor * dst, void * user_data) {
+    auto & ctx = *static_cast<llama_context *>(user_data);
+
+    const int64_t n_expert = src->ne[2];
+    const std::vector<uint32_t> all_used((n_expert + 31)/32, ~0u);
+    const ggml_tensor * pool      = nullptr;
+    const int32_t     * pool_slot = nullptr;
+    int32_t             n_pool    = 0;
+    if (!llama_moe_cache_expert_host(src, all_used.data(), &pool, &pool_slot, &n_pool, nullptr)) {
+        return false;
+    }
+
+    std::vector<uint8_t> & source_of = ctx.expert_fills[src];
+    source_of.assign(n_expert, LLAMA_MOE_SOURCE_NONE);
+
+    const ggml_tensor * cache_rows    = nullptr;
+    const int32_t     * expert_slot   = nullptr;
+    int32_t             n_cache_slots = 0;
+    if (host_tier_vram_rows(src, cache_rows, expert_slot, n_cache_slots)) {
+        for (int64_t id = 0; id < n_expert; ++id) {
+            if (expert_slot[id] >= 0 && expert_slot[id] < n_cache_slots) {
+                source_of[id] = LLAMA_MOE_SOURCE_VRAM;
+            }
+        }
+    }
+
+    llama_moe_cache_fill_counts counts;
+    counts.fills = 1;
+    upload_host_experts(ctx, copy_backend, src, dst, source_of, false, counts);
+    llama_moe_cache_count_fill(counts);
+    return true;
+}
+
+// On the compute stream, after the split waited for its slot: copies the experts the fill left to the device cache from their rows.
+// The cache table changes only between graphs (llama_moe_cache_step, llama_moe_cache_ubatch_begin), so the late upload should not run.
+void llama_context::sched_device_fill_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, void * user_data) {
+    auto & ctx = *static_cast<llama_context *>(user_data);
+    const auto fill = ctx.expert_fills.find(src);
+    if (fill == ctx.expert_fills.end()) {
+        return;
+    }
+    std::vector<uint8_t> & source_of = fill->second;
+
+    const int64_t n_expert    = src->ne[2];
+    const size_t  expert_size = src->nb[2];
+
+    const ggml_tensor * cache_rows    = nullptr;
+    const int32_t     * expert_slot   = nullptr;
+    int32_t             n_cache_slots = 0;
+    const bool device_rows = host_tier_vram_rows(src, cache_rows, expert_slot, n_cache_slots);
+
+    llama_moe_cache_fill_counts counts;
+    for (int64_t id = 0; id < n_expert; ++id) {
+        if (source_of[id] != LLAMA_MOE_SOURCE_VRAM) {
+            continue;
+        }
+        const int32_t slot = device_rows ? expert_slot[id] : -1;
+        if (slot >= 0 && slot < n_cache_slots &&
+                ggml_backend_tensor_copy_range_async(backend, cache_rows, (size_t) slot*expert_size, dst, (size_t) id*expert_size, expert_size)) {
+            counts.bytes[LLAMA_MOE_SOURCE_VRAM] += expert_size;
+            continue;
+        }
+        source_of[id] = LLAMA_MOE_SOURCE_NONE;
+        counts.late_experts++;
+    }
+    if (counts.late_experts > 0) {
+        upload_host_experts(ctx, backend, src, dst, source_of, true, counts);
+    }
+    llama_moe_cache_count_fill(counts);
+
+    if (llama_moe_cache_audit_fills()) {
+        llama_moe_cache_audit_fill(src, dst, source_of.data(), backend);
+    }
+}
+
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto & st = static_cast<llama_context *>(user_data)->copy_experts;
     auto & rd = static_cast<llama_context *>(user_data)->expert_read;
@@ -2998,26 +3256,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     // allocates the staging buffer at first use, false when the experts are copied from the weight instead
     const char * func = __func__;
     auto read_buffer_ready = [&]() {
-        if (rd.bytes == 0) {
-            return false;
-        }
-        if (!rd.buf) {
-            ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
-            rd.buf.reset(buft ? ggml_backend_buft_alloc_buffer(buft, rd.bytes) : nullptr);
-            if (!rd.buf) {
-                LLAMA_LOG_WARN("%s: no pinned host buffer of %zu MiB for the expert reads, copying the experts from the weights\n", func, rd.bytes >> 20);
-                rd.bytes = 0;
-                return false;
-            }
-        }
-        if (expert_size > rd.bytes/2) {
-            if (!rd.warned) {
-                rd.warned = true;
-                LLAMA_LOG_WARN("%s: an expert of %zu bytes does not fit in half of the expert read buffer, copying the experts from the weights\n", func, expert_size);
-            }
-            return false;
-        }
-        return true;
+        return rd.buffer_ready(backend, expert_size, func);
     };
 
     // the lookahead may have read the run already
@@ -3046,10 +3285,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
             const size_t piece_size   = n_piece*expert_size;
             const int cur = rd.cur;
 
-            if (rd.pending[cur]) {
-                ggml_backend_synchronize(rd.pending[cur]);
-                rd.pending[cur] = nullptr;
-            }
+            rd.wait_half(cur);
 
             if (!llama_moe_cache_expert_read(src, piece_first, n_piece, halves[cur], nullptr)) {
                 ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + piece_offset, piece_offset, piece_size);

@@ -409,6 +409,15 @@ extern "C" {
         const struct ggml_tensor ** pool, const int32_t ** host_slot, int32_t * n_slots, void * user_data);
     GGML_API void                 ggml_backend_sched_set_expert_host_callback(ggml_backend_sched_t sched, ggml_backend_sched_expert_host_fn fn, void * user_data);
 
+    // Source of the prefetch slots for a host-resident MUL_MAT_ID weight, instead of its data pointer (a mapping the prefetch
+    // would read cold). `fill` runs on the copy stream, with `dst` already pointing at the slot: it uploads every expert of
+    // `src` into `dst` except those it leaves to `device_fill`, and returns true; false makes the scheduler copy src->data.
+    // `device_fill` runs on the split backend after the split has waited for the slot and before it computes, only for a
+    // split whose slot `fill` filled. The two callbacks must not touch the scheduler.
+    typedef bool (*ggml_backend_sched_expert_fill_fn)(ggml_backend_t copy_backend, const struct ggml_tensor * src, struct ggml_tensor * dst, void * user_data);
+    typedef void (*ggml_backend_sched_expert_device_fill_fn)(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_expert_fill_callbacks(ggml_backend_sched_t sched, ggml_backend_sched_expert_fill_fn fill, ggml_backend_sched_expert_device_fill_fn device_fill, void * user_data);
+
     //
     // Meta backend
     //
