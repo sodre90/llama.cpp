@@ -155,6 +155,7 @@ struct expert_reader {
         void *       dst;
         size_t       len;
         const void * mapped; // the same bytes in the mapping, copied when the read fails
+        int32_t *    done_flag = nullptr; // when set, stored 0 once every byte of the job is in dst
     };
 
     // demand reads are taken before speculative ones
@@ -162,13 +163,16 @@ struct expert_reader {
 
     // the chunks of one submit that are not done yet
     struct batch {
-        size_t pending = 0;
+        size_t  pending     = 0;
+        int64_t t_submit_us = 0;
+        int64_t t_done_us   = 0; // when pending reached 0
     };
     using ticket = std::shared_ptr<batch>;
 
     struct queued_chunk {
         job    part;
         ticket owner;
+        std::shared_ptr<std::atomic<size_t>> job_chunks_left; // the chunks of the job of part that are not done, null without done_flag
     };
 
     std::vector<int>         fds;
@@ -185,6 +189,7 @@ struct expert_reader {
     bool                     stop = false;
 
     std::atomic<bool> warned{false};
+    std::atomic<int>  failed_errno{0}; // the first read error a worker saw
 
     ~expert_reader() {
         {
@@ -194,6 +199,9 @@ struct expert_reader {
         work_cv.notify_all();
         for (auto & thread : threads) {
             thread.join();
+        }
+        for (const std::deque<queued_chunk> * queue : {&high, &low}) {
+            std::for_each(queue->begin(), queue->end(), finish_job_chunk);
         }
         for (void * bounce : bounces) {
             free(bounce);
@@ -220,12 +228,20 @@ struct expert_reader {
 
     // queues the jobs and returns at once; wait(ticket) returns when every byte of every job is in its dst
     ticket submit(const std::vector<job> & jobs, priority prio) {
+        report_failure();
         auto t = std::make_shared<batch>();
+        t->t_submit_us = t->t_done_us = ggml_time_us();
         std::lock_guard<std::mutex> lock(mtx);
         std::deque<queued_chunk> & queue = prio == priority::high ? high : low;
         for (const job & j : jobs) {
+            std::shared_ptr<std::atomic<size_t>> chunks_left;
+            if (j.done_flag && j.len == 0) {
+                __atomic_store_n(j.done_flag, 0, __ATOMIC_RELEASE);
+            } else if (j.done_flag) {
+                chunks_left = std::make_shared<std::atomic<size_t>>((j.len + chunk_bytes - 1)/chunk_bytes);
+            }
             for (size_t done = 0; done < j.len; done += chunk_bytes) {
-                queue.push_back({{j.fd, j.offset + done, (char *) j.dst + done, std::min(chunk_bytes, j.len - done), (const char *) j.mapped + done}, t});
+                queue.push_back({{j.fd, j.offset + done, (char *) j.dst + done, std::min(chunk_bytes, j.len - done), (const char *) j.mapped + done, j.done_flag}, t, chunks_left});
                 t->pending++;
             }
         }
@@ -234,8 +250,11 @@ struct expert_reader {
     }
 
     void wait(const ticket & t) {
-        std::unique_lock<std::mutex> lock(mtx);
-        done_cv.wait(lock, [&t]() { return t->pending == 0; });
+        {
+            std::unique_lock<std::mutex> lock(mtx);
+            done_cv.wait(lock, [&t]() { return t->pending == 0; });
+        }
+        report_failure();
     }
 
     // the chunks of t that no worker has started are taken before every speculative one
@@ -268,10 +287,24 @@ struct expert_reader {
             if (const int err = read_chunk(next.part, bounce); err != 0) {
                 copy_from_mapping(next.part, err);
             }
+            finish_job_chunk(next);
             lock.lock();
             if (--next.owner->pending == 0) {
+                next.owner->t_done_us = ggml_time_us();
                 done_cv.notify_all();
             }
+        }
+    }
+
+    // The thread that ends the last chunk of a job clears its flag, which a device kernel may wait on. It takes no lock and calls no backend:
+    // the main thread can hold any lock while it waits for that kernel.
+    static void finish_job_chunk(const queued_chunk & chunk) {
+        if (!chunk.job_chunks_left) {
+            return;
+        }
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (chunk.job_chunks_left->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            __atomic_store_n(chunk.part.done_flag, 0, __ATOMIC_RELEASE);
         }
     }
 
@@ -298,11 +331,17 @@ struct expert_reader {
         return 0;
     }
 
+    // no logging here, see finish_job_chunk
     void copy_from_mapping(const job & chunk, int err) {
-        if (!warned.exchange(true)) {
+        int no_error = 0;
+        failed_errno.compare_exchange_strong(no_error, err);
+        memcpy(chunk.dst, chunk.mapped, chunk.len);
+    }
+
+    void report_failure() {
+        if (const int err = failed_errno.load(); err != 0 && !warned.exchange(true)) {
             LLAMA_LOG_WARN("moe-cache: direct read of the model file failed (%s), copying from the mapping\n", strerror(err));
         }
-        memcpy(chunk.dst, chunk.mapped, chunk.len);
     }
 };
 
@@ -380,6 +419,12 @@ struct moe_cache {
     std::vector<ggml_backend_buffer_t>  host_bufs;
     std::unique_ptr<expert_reader>      host_reader; // nullptr: the tier copies from the mapping
     ggml_backend_buffer_type_t          host_buft = nullptr; // where the pools and lookahead buffers live
+
+    // host_map_op queues the reads of a ubatch's missing experts and returns; the device kernels wait for them (LLAMA_MOE_HOST_OVERLAP)
+    bool                                host_overlap = false;
+    std::string                         host_overlap_state = "off";
+    ggml_backend_buffer_t               host_pending_buf = nullptr; // the read flags of every layer, see llama_moe_cache_layer::host_pending
+    std::vector<expert_reader::ticket>  demand_reads;      // per layer, parallel to layers: the reads host_map_op left running, nullptr: none
 
     // a prefill ubatch reads the next layer's experts ahead into one of two buffers, by layer parity (LLAMA_MOE_HOST_LOOKAHEAD)
     bool                                lookahead = false;
@@ -882,6 +927,16 @@ const ggml_tensor * host_pool_of(const llama_moe_cache_layer & pub, const ggml_t
     return src == pub.up_src ? pub.up_h : src == pub.gate_src ? pub.gate_h : pub.down_h;
 }
 
+size_t host_matrix_index_of(const llama_moe_cache_layer & pub, const ggml_tensor * src) {
+    GGML_ASSERT(src == pub.up_src || src == pub.gate_src || src == pub.down_src);
+    return src == pub.up_src ? 0 : src == pub.gate_src ? 1 : 2;
+}
+
+// the read flags of one matrix: a word per pool slot, then the number of reads queued for the step
+int32_t * host_pending_row(const llama_moe_cache_layer & pub, size_t matrix) {
+    return pub.host_pending + matrix*(size_t) (pub.n_host_slots + 2);
+}
+
 // the read of n_experts experts from first_expert of the layer's matrix (0: up, 1: gate, 2: down) into dst
 expert_reader::job host_read_job(const layer_state & ls, size_t matrix, int64_t first_expert, int64_t n_experts, void * dst) {
     const ggml_tensor * src = host_matrices_of(ls.pub)[matrix].src;
@@ -933,16 +988,46 @@ std::vector<host_copy> assign_host_slots(const moe_cache & mc, layer_state & ls,
     return copies;
 }
 
-// the reads that fill the pool slots of the copies
-std::vector<expert_reader::job> host_copy_jobs(const layer_state & ls, const std::vector<host_copy> & copies) {
+// the reads that fill the pool slots of the copies; overlapped: up first, then gate, then down (the order the device uses them), each with its flag
+std::vector<expert_reader::job> host_copy_jobs(const layer_state & ls, const std::vector<host_copy> & copies, bool overlapped = false) {
     const auto matrices = host_matrices_of(ls.pub);
     std::vector<expert_reader::job> jobs;
-    for (const host_copy & c : copies) {
+    const auto add = [&](const host_copy & c, size_t k) {
+        jobs.push_back(host_read_job(ls, k, c.expert, 1, (char *) matrices[k].pool->data + (size_t) c.slot*matrices[k].pool->nb[2]));
+        if (overlapped) {
+            jobs.back().done_flag = host_pending_row(ls.pub, k) + c.slot;
+        }
+    };
+    if (overlapped) {
         for (size_t k = 0; k < matrices.size(); ++k) {
-            jobs.push_back(host_read_job(ls, k, c.expert, 1, (char *) matrices[k].pool->data + (size_t) c.slot*matrices[k].pool->nb[2]));
+            for (const host_copy & c : copies) {
+                add(c, k);
+            }
+        }
+    } else {
+        for (const host_copy & c : copies) {
+            for (size_t k = 0; k < matrices.size(); ++k) {
+                add(c, k);
+            }
         }
     }
     return jobs;
+}
+
+// flags first, so that a device wait never sees a slot as ready before its read is queued
+expert_reader::ticket submit_overlapped_reads(moe_cache & mc, const layer_state & ls, const std::vector<host_copy> & copies) {
+    for (size_t k = 0; k < 3; ++k) {
+        int32_t * row = host_pending_row(ls.pub, k);
+        for (const host_copy & c : copies) {
+            __atomic_store_n(row + c.slot, 1, __ATOMIC_RELAXED);
+        }
+        __atomic_store_n(row + ls.pub.n_host_slots + 1, (int32_t) copies.size(), __ATOMIC_RELAXED);
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (copies.empty()) {
+        return nullptr;
+    }
+    return mc.host_reader->submit(host_copy_jobs(ls, copies, true), expert_reader::priority::high);
 }
 
 // with a reader the reads are only queued, and the caller waits for the returned ticket; without one the copies are done on return
@@ -970,6 +1055,18 @@ size_t host_expert_bytes(const llama_moe_cache_layer & pub) {
 
 size_t layer_index(const moe_cache & mc, const layer_state & ls) {
     return &ls - mc.layers.data();
+}
+
+// the reads host_map_op left running must land before the CPU uses the layer's pool or gives its slots away again;
+// the device kernels of the step wait for the ones they need, so this finds them done
+void retire_demand_reads(moe_cache & mc, size_t layer_idx) {
+    if (!mc.host_overlap || !mc.demand_reads[layer_idx]) {
+        return;
+    }
+    const expert_reader::ticket reads = std::move(mc.demand_reads[layer_idx]);
+    mc.host_reader->wait(reads);
+    std::lock_guard<std::mutex> lock(mc.mtx);
+    mc.layers[layer_idx].host_read_us += reads->t_done_us - reads->t_submit_us;
 }
 
 // the reads of an earlier guess must land before the layer's pool is used or its slots are given away again;
@@ -1030,6 +1127,7 @@ size_t admit_guess(moe_cache & mc, size_t layer_idx, const ggml_tensor * guessed
     layer_state & ls   = mc.layers[layer_idx];
     host_guess & guess = mc.host_guesses[layer_idx];
     wait_guess_reads(mc, layer_idx);
+    retire_demand_reads(mc, layer_idx);
 
     const std::vector<int32_t> missed = guessed_misses(ls, guessed_ids, std::min<size_t>(mc.predict_max, ls.pub.n_host_slots));
     const std::vector<int32_t> slot_expert_before = ls.host_slot_expert;
@@ -1062,6 +1160,7 @@ void host_map_op(ggml_tensor * dst, int ith, int /*nth*/, void * userdata) {
     const int32_t n_expert  = (int32_t) ls.host_slot.size();
     const size_t layer_idx  = layer_index(mc, ls);
     const int64_t guess_wait_us = wait_guess_reads(mc, layer_idx);
+    retire_demand_reads(mc, layer_idx);
     const uint32_t now      = ++ls.host_clock;
 
     std::vector<int32_t> routed;
@@ -1084,15 +1183,23 @@ void host_map_op(ggml_tensor * dst, int ith, int /*nth*/, void * userdata) {
     const guess_stats outcome = mc.predict ? settle_guess(mc.host_guesses[layer_idx], ls, routed) : guess_stats();
 
     const int64_t t_start = ggml_time_us();
-    const expert_reader::ticket miss_reads = copy_into_host_pool(mc, ls, assign_host_slots(mc, ls, missed, now));
+    const std::vector<host_copy> copies = assign_host_slots(mc, ls, missed, now);
+    const expert_reader::ticket miss_reads = mc.host_overlap ? submit_overlapped_reads(mc, ls, copies) : copy_into_host_pool(mc, ls, copies);
     const size_t n_admitted = dst->src[1] ? admit_guess(mc, layer_idx + 1, dst->src[1]) : 0;
-    if (miss_reads) {
+    if (mc.host_overlap) {
+        mc.demand_reads[layer_idx] = miss_reads;
+    } else if (miss_reads) {
         mc.host_reader->wait(miss_reads);
     }
-    const int64_t t_us = ggml_time_us() - t_start;
+    const int64_t t_us = mc.host_overlap ? 0 : ggml_time_us() - t_start;
 
     std::for_each(routed.begin(), routed.end(), [&ls](int32_t e) { ls.host_routed[e] = 0; });
     memcpy(dst->data, ls.host_slot.data(), n_expert*sizeof(int32_t));
+    if (mc.host_overlap) {
+        for (const host_copy & c : copies) {
+            ((int32_t *) dst->data)[c.expert] |= GGML_MOE_CACHE_SLOT_PENDING;
+        }
+    }
 
     std::lock_guard<std::mutex> lock(mc.mtx);
     ls.n_host_hit      += routed.size() - missed.size();
@@ -1348,7 +1455,14 @@ void drop_host_tier(moe_cache & mc) {
     mc.host_bufs.clear();
     mc.host_ctxs.clear();
     mc.host_slots = 0;
+    if (mc.host_pending_buf) {
+        ggml_backend_buffer_free(mc.host_pending_buf);
+        mc.host_pending_buf = nullptr;
+    }
+    mc.host_overlap = false;
+    mc.demand_reads.clear();
     for (auto & ls : mc.layers) {
+        ls.pub.host_pending = nullptr;
         ls.pub.n_host_slots = 0;
         ls.pub.up_h   = nullptr;
         ls.pub.gate_h = nullptr;
@@ -1403,6 +1517,47 @@ std::unique_ptr<expert_reader> open_expert_reader(moe_cache & mc, const llama_mo
     return reader;
 }
 
+ggml_backend_buffer_type_t dev_mapped_buffer_type(ggml_backend_dev_t dev) {
+    using mapped_buffer_type_fn = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t);
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    auto * fn = reg ? (mapped_buffer_type_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_mapped_buffer_type") : nullptr;
+
+    return fn ? fn(dev) : nullptr;
+}
+
+// LLAMA_MOE_HOST_OVERLAP (default 1): the read flags of all layers sit in one mapped host buffer, which is fine-grained, so
+// a running kernel sees the writes of the reader threads; the pools keep their buffer. Sets host_overlap_state.
+void setup_host_overlap(moe_cache & mc, ggml_backend_dev_t dev) {
+    if (const char * env = getenv("LLAMA_MOE_HOST_OVERLAP"); env && atoi(env) == 0) {
+        mc.host_overlap_state = "off: LLAMA_MOE_HOST_OVERLAP=0";
+        return;
+    }
+    if (!mc.host_reader) {
+        mc.host_overlap_state = "off: no file reader";
+        return;
+    }
+    const ggml_backend_buffer_type_t mapped_buft = dev ? dev_mapped_buffer_type(dev) : nullptr;
+    if (!mapped_buft) {
+        mc.host_overlap_state = "off: the device has no mapped host buffer type";
+        return;
+    }
+    const size_t words_per_layer = 3*(size_t) (mc.host_slots + 2);
+    mc.host_pending_buf = ggml_backend_buft_alloc_buffer(mapped_buft, mc.layers.size()*words_per_layer*sizeof(int32_t));
+    if (!mc.host_pending_buf) {
+        mc.host_overlap_state = "off: no mapped host memory for the read flags";
+        return;
+    }
+    ggml_backend_buffer_clear(mc.host_pending_buf, 0);
+    int32_t * flags = (int32_t *) ggml_backend_buffer_get_base(mc.host_pending_buf);
+    for (auto & ls : mc.layers) {
+        ls.pub.host_pending = flags + layer_index(mc, ls)*words_per_layer;
+    }
+    mc.demand_reads.assign(mc.layers.size(), nullptr);
+    mc.host_overlap       = true;
+    mc.host_overlap_state = "on";
+}
+
 // "" when the tier is on: every layer has n_host_slots and its pools; else why it is off
 std::string setup_host_tier(moe_cache & mc, const llama_model & model, int32_t n_host_slots) {
     const ggml_backend_buffer_type_t cache_buft = ggml_backend_buffer_get_type(mc.layers.front().pub.up_c->buffer);
@@ -1443,6 +1598,7 @@ std::string setup_host_tier(moe_cache & mc, const llama_model & model, int32_t n
     } else {
         LLAMA_LOG_WARN("moe-cache: host tier reads through the model mapping: %s\n", reader_why_not.c_str());
     }
+    setup_host_overlap(mc, dev);
     return "";
 }
 
@@ -1481,8 +1637,8 @@ void populate_host_tier(moe_cache & mc) {
     }
     LLAMA_LOG_INFO("moe-cache: host tier: %d of %" PRId64 " experts per layer are pinned, the others are read from the model file on demand\n",
             mc.host_slots, mc.layers.front().pub.up_src->ne[2]);
-    LLAMA_LOG_WARN("moe-cache: host tier on: %zu layers, %d slots per layer, %.1f GiB pinned, populated in %.1f s\n",
-            mc.layers.size(), mc.host_slots, pinned_bytes/1024.0/1024.0/1024.0, (ggml_time_us() - t_start)/1e6);
+    LLAMA_LOG_WARN("moe-cache: host tier on: %zu layers, %d slots per layer, %.1f GiB pinned, populated in %.1f s, read overlap %s\n",
+            mc.layers.size(), mc.host_slots, pinned_bytes/1024.0/1024.0/1024.0, (ggml_time_us() - t_start)/1e6, mc.host_overlap_state.c_str());
 }
 
 // LLAMA_MOE_HOST_PREDICT=1: every cache layer but the last guesses the routing of the next one, see host_map_op
@@ -1769,6 +1925,9 @@ void audit_tables(moe_cache & mc) {
 
         std::vector<int32_t> table(n_expert);
         ggml_backend_tensor_get(ls.pub.dev_table, table.data(), 0, table.size()*sizeof(int32_t));
+        for (int32_t & entry : table) {
+            entry &= ~GGML_MOE_CACHE_SLOT_PENDING;
+        }
 
         const auto table_error = [&](const char * what, int64_t slot, int64_t expert) {
             mc.audit_table_errors++;
@@ -2248,10 +2407,17 @@ ggml_tensor * llama_moe_cache_mul_mat_id(ggml_context * ctx, const llama_moe_cac
     static_assert(GGML_MOE_CACHE_OP_HOST_EXPERTS*sizeof(int32_t) + sizeof(void *) <= GGML_MAX_OP_PARAMS, "MoE cache op_params overflow");
     static_assert(GGML_MOE_CACHE_OP_HOST_SLOTS*sizeof(int32_t) + sizeof(int32_t) <= GGML_MAX_OP_PARAMS, "MoE cache op_params overflow");
     static_assert(GGML_MOE_CACHE_OP_HOST_EXPERTS + 2 <= GGML_MOE_CACHE_OP_HOST_SLOTS, "MoE cache op_params overlap");
+    static_assert(GGML_MOE_CACHE_OP_HOST_PENDING*sizeof(int32_t) + sizeof(void *) <= GGML_MAX_OP_PARAMS, "MoE cache op_params overflow");
+    static_assert(GGML_MOE_CACHE_OP_HOST_PENDING + 2 <= GGML_MOE_CACHE_OP_N_SLOTS, "MoE cache op_params overlap");
+    static_assert(GGML_MOE_CACHE_OP_HOST_PENDING > 3, "MoE cache op_params overlap the ggml_prec slots");
     const ggml_tensor * host_experts = layer.n_host_slots > 0 ? host_pool_of(layer, host_src) : host_src;
     cur->op_params[GGML_MOE_CACHE_OP_N_SLOTS]    = layer.n_slots;
     cur->op_params[GGML_MOE_CACHE_OP_HOST_SLOTS] = layer.n_host_slots;
     memcpy(&cur->op_params[GGML_MOE_CACHE_OP_HOST_EXPERTS], &host_experts->data, sizeof(host_experts->data));
+    if (layer.host_pending) {
+        const int32_t * pending_row = host_pending_row(layer, host_matrix_index_of(layer, host_src));
+        memcpy(&cur->op_params[GGML_MOE_CACHE_OP_HOST_PENDING], &pending_row, sizeof(pending_row));
+    }
     return cur;
 }
 
@@ -2277,6 +2443,7 @@ bool llama_moe_cache_expert_host(const ggml_tensor * weight, const uint32_t * us
     }
     const layer_state & ls = mc->layers[it->second.layer_idx];
     wait_guess_reads(*mc, it->second.layer_idx);
+    retire_demand_reads(*mc, it->second.layer_idx);
     *pool      = host_pool_of(ls.pub, weight);
     *host_slot = ls.host_slot.data();
     *n_slots   = ls.pub.n_host_slots;

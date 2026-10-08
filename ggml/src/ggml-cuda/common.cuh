@@ -1711,6 +1711,17 @@ static const void * ggml_cuda_mmid_host_experts(const ggml_tensor * mm_id) {
     return host_experts;
 }
 
+// The flags of the reads that host_map_op left running for the host pool matrix of a MUL_MAT_ID (GGML_MOE_CACHE_OP_HOST_PENDING),
+// nullptr: the node does not wait for any read.
+static inline const int32_t * ggml_cuda_mmid_host_pending(const ggml_tensor * mm_id) {
+    if (ggml_cuda_mmid_host_experts(mm_id) == nullptr) {
+        return nullptr;
+    }
+    const int32_t * pending;
+    memcpy(&pending, &mm_id->op_params[GGML_MOE_CACHE_OP_HOST_PENDING], sizeof(pending));
+    return pending;
+}
+
 #define MMVQ_MAX_ROW_SEGMENTS 4
 // tokens a row segment launch takes: on RDNA4 each column then gets the same bits as a single-token launch
 #define MMVQ_MAX_ROW_SEGMENT_COLS 4
@@ -1748,6 +1759,12 @@ struct ggml_cuda_mm_fusion_args_host {
     ggml_cuda_mmvq_row_segment row_segments[MMVQ_MAX_ROW_SEGMENTS] = {};
     int                        n_row_segments                      = 0;
 };
+enum mmvq_pending_mode : int32_t {
+    MMVQ_PENDING_ALL  = 0, // every expert
+    MMVQ_PENDING_SKIP = 1, // only the experts whose pool read was done when host_map_op returned
+    MMVQ_PENDING_ONLY = 2, // only the other experts
+};
+
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
     const void * gate = nullptr;
@@ -1774,6 +1791,8 @@ struct ggml_cuda_mm_fusion_args_device {
     uint32_t        fill_pairs_per_token = 0;
     // expert -> cache slot its fill goes to (-1: none), replaces the pair index channel
     const int32_t * fill_slot            = nullptr;
+    // host pool reads still running: a launch leaves out the experts the other launch of its node does, see mmvq_expert_deferred
+    int32_t         pending_mode         = 0;
 };
 
 struct ggml_cuda_kernel_launch_params {

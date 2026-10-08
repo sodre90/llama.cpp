@@ -363,9 +363,14 @@ extern "C" {
 
     // op_params of a MUL_MAT_ID over the llama MoE expert cache (src[3] maps expert id -> slot).
     // They sit above the ggml_prec slots (0 and 2 + src index).
+    #define GGML_MOE_CACHE_OP_HOST_PENDING  8 // pointer (2 slots): see below; null when the node waits for no reads. Slots 0 and 3 are the ggml_prec ones
     #define GGML_MOE_CACHE_OP_N_SLOTS      10 // i32: slot count; a table value not below it marks an expert without a slot
     #define GGML_MOE_CACHE_OP_HOST_EXPERTS 12 // pointer (2 slots): the full expert tensor in pinned host memory
     #define GGML_MOE_CACHE_OP_HOST_SLOTS   14 // i32: host pool slots; 0: the host tensor holds every expert, read by expert id
+    // HOST_PENDING points at the node's row of the layer's read flags: int32 [n_host_slots + 2]. Word s (s <= n_host_slots) is 1 while
+    // the read into pool slot s runs, else 0. The last word counts the experts whose reads host_map_op queued for the step.
+    // A table value with this bit set names a pool slot whose read was queued by host_map_op, the rest of the value is as without it.
+    #define GGML_MOE_CACHE_SLOT_PENDING    0x40000000
 
     GGML_NORETURN GGML_ATTRIBUTE_FORMAT(3, 4)
     GGML_API void ggml_abort(const char * file, int line, const char * fmt, ...);

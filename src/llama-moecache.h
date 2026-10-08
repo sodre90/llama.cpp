@@ -39,6 +39,8 @@
 // Needs the device policy (LLAMA_MOE_CACHE_DEVICE=1).
 // The tier reads the experts from the model files with parallel O_DIRECT preads when it can, else from the mapping
 // (LLAMA_MOE_HOST_IO_THREADS, default 16, 0 = mapping; LLAMA_MOE_HOST_IO_CHUNK_KB, default 512).
+// With the reader, a decode ubatch's host_map_op does not wait for the reads of the experts missing from the pool (LLAMA_MOE_HOST_OVERLAP, default 1,
+// 0 = wait): the device kernels wait for the reads of each matrix, see GGML_MOE_CACHE_OP_HOST_PENDING.
 // With the reader, a prefill ubatch reads the next layer's experts that are in neither the pool nor the device cache
 // into one of two pinned lookahead buffers while the current layer computes (LLAMA_MOE_HOST_LOOKAHEAD, default 1, 0 = off;
 // LLAMA_MOE_HOST_LOOKAHEAD_MIN_USED, default 0.9: the fraction of a layer's experts the ubatch must use for that).
@@ -113,6 +115,10 @@ struct llama_moe_cache_layer {
     ggml_tensor * up_h   = nullptr;
     ggml_tensor * gate_h = nullptr;
     ggml_tensor * down_h = nullptr;
+
+    // host tier read overlap: int32 [3][n_host_slots + 2] in mapped host memory, a row per matrix (up, gate, down); layout in
+    // ggml.h at GGML_MOE_CACHE_OP_HOST_PENDING. nullptr: host_map_op waits for the reads, so the device never waits for them
+    int32_t *     host_pending = nullptr;
 };
 
 // build the cache for every host-resident expert layer of the model; n_host_slots > 0 asks for the host tier.

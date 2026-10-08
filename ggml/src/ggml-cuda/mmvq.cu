@@ -621,13 +621,22 @@ static __device__ __forceinline__ uint32_t mmvq_expert_channel(
     if (fusion.expert_slot == nullptr) {
         return expert;
     }
-    const int32_t slot = fusion.expert_slot[expert];
+    const int32_t slot = fusion.expert_slot[expert] & ~GGML_MOE_CACHE_SLOT_PENDING;
     if (slot < fusion.n_expert_slots) {
         return slot;
     }
     x    = fusion.x_host;
     gate = fusion.gate_host;
     return fusion.n_host_slots > 0 ? (uint32_t) (slot - fusion.n_expert_slots) : expert;
+}
+
+// true: the other launch of the node computes this expert (see mmvq_pending_mode). Only whole blocks or warps of one expert may exit on it
+static __device__ __forceinline__ bool mmvq_expert_deferred(const ggml_cuda_mm_fusion_args_device & fusion, const uint32_t expert) {
+    if (fusion.pending_mode == MMVQ_PENDING_ALL) {
+        return false;
+    }
+    const bool pending = (fusion.expert_slot[expert] & GGML_MOE_CACHE_SLOT_PENDING) != 0;
+    return pending == (fusion.pending_mode == MMVQ_PENDING_SKIP);
 }
 
 static __device__ __forceinline__ bool mmvq_expert_missed(const ggml_cuda_mm_fusion_args_device & fusion, const void * x_weights) {
@@ -783,6 +792,10 @@ static __global__ void mul_mat_vec_q(
 
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
+
+    if (ncols_dst == 1 && ids && mmvq_expert_deferred(fusion, channel_x)) {
+        return;
+    }
 
     if constexpr (quant_prologue) {
         __shared__ __align__(16) char y_lds_bytes[ncols_dst*(mmvq_quant_prologue_max_k/QK8_1)*sizeof(block_q8_1)];
@@ -1167,6 +1180,10 @@ static __global__ void mul_mat_vec_q_moe(
     ggml_cuda_pdl_sync();
     const uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
+
+    if (mmvq_expert_deferred(fusion, channel_x)) {
+        return;
+    }
 
     const void * x_weights = vx_ptr;
     uint32_t channel_w = mmvq_expert_channel(fusion, channel_x, x_weights, vgate);
@@ -2373,7 +2390,7 @@ static void mmvq_moe_fill_diag(cudaStream_t stream, const ggml_tensor * src0, co
         }
         if (entry.token >= 0) {
             entry.expert = ids_host[entry.channel + entry.token*ids_stride];
-            entry.table  = fusion.expert_slot != nullptr ? mmvq_copy_int_to_host(fusion.expert_slot, entry.expert) : -1;
+            entry.table  = fusion.expert_slot != nullptr ? mmvq_copy_int_to_host(fusion.expert_slot, entry.expert) & ~GGML_MOE_CACHE_SLOT_PENDING : -1;
             entry.fill   = device_fill ? mmvq_copy_int_to_host(fusion.fill_slot, entry.expert) : entry.channel + entry.token*(int) fusion.fill_pairs_per_token;
         }
         entries.push_back(entry);
@@ -2586,6 +2603,69 @@ static void mmvq_quant_prologue_check(ggml_backend_cuda_context & ctx, const ggm
     const int64_t n_diff_fused2 = count_differing_vs_dst(launch_fused);
     GGML_LOG_WARN("%s diag: type=%s ncols=%d ids=%d: reference rerun differs from the first fused result in %" PRId64 " values, fused rerun in %" PRId64 "\n",
             __func__, ggml_type_name(src0->type), (int) ncols_dst, ids != nullptr, n_diff_ref2, n_diff_fused2);
+}
+
+static constexpr int64_t mmvq_host_wait_max_polls = 5000000;
+
+static __device__ __forceinline__ int32_t mmvq_load_host_flag(const int32_t * flag) {
+#ifdef GGML_USE_HIP
+    return __hip_atomic_load(flag, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+    return *(const volatile int32_t *) flag;
+#endif // GGML_USE_HIP
+}
+
+static __device__ __forceinline__ void mmvq_host_wait_sleep() {
+#ifdef GGML_USE_HIP
+    __builtin_amdgcn_s_sleep(40); // about 1 us
+#elif !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    __nanosleep(1000);
+#endif // GGML_USE_HIP
+}
+
+// One block of one warp, polls the read flags of a host pool matrix (and the gate matrix of a fused node) until all are 0.
+// A flag row is n_flags words and then the number of reads queued for the step. Flags only go 1 -> 0 while the kernel runs.
+// The loads come from the lanes of one warp, so a pass over the row is one round trip. The fence at the end orders the pool data
+// the reader threads wrote before they cleared the flags.
+static __global__ void mmvq_wait_host_reads(const int32_t * flags, const int32_t * gate_flags, const int32_t n_flags) {
+    if (mmvq_load_host_flag(flags + n_flags) == 0) {
+        return;
+    }
+    for (int64_t polls = 0;; ++polls) {
+        int32_t busy = 0;
+        for (int32_t i = threadIdx.x; i < n_flags; i += blockDim.x) {
+            busy |= mmvq_load_host_flag(flags + i);
+            if (gate_flags != nullptr) {
+                busy |= mmvq_load_host_flag(gate_flags + i);
+            }
+        }
+        if (!__syncthreads_or(busy != 0)) {
+            break;
+        }
+        if (polls == mmvq_host_wait_max_polls) {
+            if (threadIdx.x == 0) {
+                printf("mmvq_wait_host_reads: host pool reads did not finish\n");
+            }
+#ifdef GGML_USE_HIP
+            __builtin_trap();
+#else
+            __trap();
+#endif // GGML_USE_HIP
+        }
+        mmvq_host_wait_sleep();
+    }
+    __threadfence_system();
+}
+
+// the launches of a node whose host pool reads may still run: the experts that were not pending when host_map_op returned,
+// the wait for the reads, the pending experts. Both launches have the same grid, a block of an expert of the other launch exits at once
+static bool mmvq_host_reads_may_run(cudaStream_t stream, const int32_t * flags, const int32_t n_flags) {
+    cudaStreamCaptureStatus capture_status;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+    if (capture_status != cudaStreamCaptureStatusNone) {
+        return true;
+    }
+    return __atomic_load_n(flags + n_flags, __ATOMIC_ACQUIRE) != 0;
 }
 
 void ggml_cuda_mul_mat_vec_q(
@@ -2832,13 +2912,32 @@ void ggml_cuda_mul_mat_vec_q(
         return;
     }
 
+    const int32_t * pending_x    = ids ? ggml_cuda_mmid_host_pending(x_node) : nullptr;
+    const int32_t * pending_gate = pending_x && fusion_local.gate_host ? ggml_cuda_mmid_host_pending(gate_node) : nullptr;
+    GGML_ASSERT(!pending_x || (fusion_local.n_host_slots > 0 && !fusion_local.shared_up && (pending_gate != nullptr) == (fusion_local.gate_host != nullptr)));
+    const int32_t n_pending_flags = fusion_local.n_host_slots + 1;
+    const bool two_launches = pending_x && mmvq_host_reads_may_run(stream, pending_x, n_pending_flags);
+
     const auto launch_matvec = [&](const ggml_cuda_mm_fusion_args_device & launch_fusion, const void * vy, const int64_t col_y,
             const int64_t channel_y, const int64_t sample_y, float * dst_launch, const bool prologue) {
-        mul_mat_vec_q_switch_type(
-            src0->data, src0->type, vy, ids_d, launch_fusion, dst_launch, ne00,
-            ne01,              ncols_dst,     s01, col_y,     stride_col_dst,
-            ne02, nchannels_y, nchannels_dst, s02, channel_y, stride_channel_dst,
-            ne03,              ne3,           s03, sample_y,  s3,               ids_stride, stream, prologue);
+        const auto launch_once = [&](const ggml_cuda_mm_fusion_args_device & fusion_once) {
+            mul_mat_vec_q_switch_type(
+                src0->data, src0->type, vy, ids_d, fusion_once, dst_launch, ne00,
+                ne01,              ncols_dst,     s01, col_y,     stride_col_dst,
+                ne02, nchannels_y, nchannels_dst, s02, channel_y, stride_channel_dst,
+                ne03,              ne3,           s03, sample_y,  s3,               ids_stride, stream, prologue);
+        };
+        if (!two_launches) {
+            launch_once(launch_fusion);
+            return;
+        }
+        ggml_cuda_mm_fusion_args_device staged = launch_fusion;
+        staged.pending_mode = MMVQ_PENDING_SKIP;
+        launch_once(staged);
+        mmvq_wait_host_reads<<<1, ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size, 0, stream>>>(pending_x, pending_gate, n_pending_flags);
+        CUDA_CHECK(cudaGetLastError());
+        staged.pending_mode = MMVQ_PENDING_ONLY;
+        launch_once(staged);
     };
     const bool fill_check = fusion_local.fill_x != nullptr && ggml_cuda_moe_fill_check_enabled();
 
