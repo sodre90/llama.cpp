@@ -523,6 +523,22 @@ static std::vector<std::string> get_environment() {
     return env;
 }
 
+static void apply_preset_env(std::vector<std::string> & env, const std::string & value, const std::string & model_name) {
+    for (const auto & item : string_split<std::string>(value, ',')) {
+        const size_t eq = item.find('=');
+        if (eq == std::string::npos || eq == 0) {
+            SRV_WRN("skipping malformed env item '%s' for model '%s', expected KEY=VALUE\n", item.c_str(), model_name.c_str());
+            continue;
+        }
+        // getenv returns the first match, so drop the inherited entries first
+        const std::string prefix = item.substr(0, eq + 1);
+        env.erase(std::remove_if(env.begin(), env.end(), [&](const std::string & entry) {
+            return string_starts_with(entry, prefix);
+        }), env.end());
+        env.push_back(item);
+    }
+}
+
 void server_model_meta::update_args(common_preset_context & ctx_preset, std::string bin_path) {
     // update params
     unset_reserved_args(preset, false);
@@ -1204,6 +1220,11 @@ void server_models::load(const std::string & name, const load_options & opts) {
             inst.meta.status = SERVER_MODEL_STATUS_DOWNLOADING;
             child_env.push_back("LLAMA_SERVER_CHILD_MODE=download");
             child_env.push_back("LLAMA_ARG_HF_REPO=" + name);
+        }
+
+        std::string preset_env;
+        if (inst.meta.preset.get_option(COMMON_ARG_PRESET_ENV, preset_env)) {
+            apply_preset_env(child_env, preset_env, name);
         }
 
         SRV_INF("%s", "spawning server instance with args:\n");
